@@ -1,0 +1,19 @@
+# Internal background material — not for public distribution
+local_only/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+*.egg-info/
+
+# Raw chart downloads / working data (large, re-downloadable, not committed)
+data/raw/
+data/cache/
+*.sqlite
+*.sqlite.gz
+!test/fixtures/*.sqlite
+
+# OS / editor
+.DS_Store
+.vscode/
