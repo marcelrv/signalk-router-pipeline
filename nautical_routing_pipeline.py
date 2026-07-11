@@ -16,7 +16,7 @@ import pandas as pd
 import geopandas as gpd
 import networkx as nx
 import shapely
-from shapely.geometry import Point, LineString, Polygon, MultiPoint, MultiLineString, MultiPolygon
+from shapely.geometry import Point, LineString, Polygon, MultiPoint, MultiLineString, MultiPolygon, mapping
 from shapely.ops import triangulate, unary_union
 from pyproj import Geod
 
@@ -24,6 +24,8 @@ from pyproj import Geod
 from skimage.morphology import medial_axis
 from rasterio.features import rasterize as _rio_rasterize
 from rasterio.transform import from_origin as _rio_from_origin
+# Phase 1 navmesh-region triangulation (Step B2). Hard dep per requirements.txt.
+import triangle as _triangle
 
 def _is_valid(val):
     if val is None:
@@ -228,6 +230,9 @@ NODE_KIND_POINT = 0
 NODE_KIND_NAVMESH_VERTEX = 1
 NODE_KIND_SUPERNODE = 2
 DEFAULT_SOURCE_TIER = 1  # 1 = official hydrographic authority (ENC/IENC)
+NAVMESH_TARGET_EDGE_M = 650.0  # target interior triangle edge length (spec's 500-800m band)
+NAVMESH_PSLG_BUDGET = 20_000    # max len(vertices)+len(segments) fed into triangle's PSLG mode
+NAVMESH_MAX_TRIANGLES = 200_000 # sanity cap on triangulate() output; retry coarser above this
 
 
 @dataclass
@@ -327,7 +332,7 @@ class NauticalRoutingPipeline:
                  country: str = "", region_name: str = "", description: str = "",
                  tags: Optional[str] = None, contributor: str = "", url: str = "",
                  license: str = "", copyright: str = "",
-                 architecture: str = "navmesh-hybrid-phase0",
+                 architecture: str = "navmesh-hybrid-phase1",
                  dataset_version: str = "", depth_ceiling: float = 6.0):
         self.data_paths = data_paths
         self.db_path = db_path
@@ -347,12 +352,14 @@ class NauticalRoutingPipeline:
         self.CRS_METRIC = "EPSG:3857"
         self.gdfs = {}
         self.graph = nx.DiGraph()
+        self.navmesh_region_rows = []
         
     def run_pipeline(self):
         self.parse_shapefiles()
         self.build_network()
         self._add_opening_bridge_edges()
         self._sanity_check_no_land_crossings()
+        self._ensure_coastal_connectivity()
         self.calculate_edge_attributes()
         for u, v, data in self.graph.edges(data=True):
             if data.get("is_opening_bridge_edge"):
@@ -437,26 +444,65 @@ class NauticalRoutingPipeline:
         if "inland_waterways" in self.gdfs and not self.gdfs["inland_waterways"].empty:
             self._build_inland_network()
 
-        # Coastal water: split into connected components, classify each, dispatch to
-        # skeleton (narrow channels) or the temporary Delaunay placeholder (open water).
+        # Coastal water: split each connected component by local width, classify each
+        # sub-piece, dispatch to skeleton (narrow channels) or a real navmesh_regions
+        # triangulation (open water).
         coastal_gdf = self.gdfs.get("coastal_water")
         if coastal_gdf is not None and not coastal_gdf.empty:
             polygons = self._connected_water_polygons(coastal_gdf)
             depth_gdf = self.gdfs.get("depth_areas", gpd.GeoDataFrame())
             fairway_gdf = self.gdfs.get("fairways", gpd.GeoDataFrame())
             src_id = self.layer_source_ids.get("coastal_water") if hasattr(self, "layer_source_ids") else None
-            counts = {"skeleton": 0, "laned": 0, "navmesh_placeholder": 0}
-            for poly in polygons:
-                kind = self.classify_water_body(poly, depth_gdf, fairway_gdf,
-                                                self.classification_config)
-                counts[kind] += 1
-                if kind in ("skeleton", "laned"):
-                    self.build_skeleton_network(poly, DEFAULT_SOURCE_TIER, src_id)
-                else:
-                    self.build_navmesh_placeholder(poly, DEFAULT_SOURCE_TIER, src_id)
-            logger.info(f"Coastal water: {len(polygons)} components classified "
-                        f"(skeleton={counts['skeleton']}, laned={counts['laned']}, "
-                        f"placeholder={counts['navmesh_placeholder']}).")
+            cfg = self.classification_config
+            counts = {"skeleton": 0, "laned": 0, "navmesh": 0}
+
+            for polygon in polygons:
+                utm = self._local_utm_crs(polygon)
+                poly_m = gpd.GeoSeries([polygon], crs=self.CRS_WGS84).to_crs(utm).iloc[0]
+                wide_m, narrow_m, seam_m = self._split_wide_narrow(poly_m, cfg.min_navmesh_radius_m)
+                seam_coords = self._seam_coord_set(seam_m)
+
+                skeleton_pieces = []             # WGS84 polygons for build_skeleton_network
+                navmesh_pieces = []              # (poly_m, utm, seam_coord_set) for build_navmesh_region
+
+                # Narrow channels: keep this component's WHOLE narrow part as one piece,
+                # even if it's a MultiPolygon of several disjoint-looking channel
+                # fragments -- build_skeleton_network rasterizes it as one mask (rasterio
+                # rasterize natively handles MultiPolygon), so fragments that are
+                # geometrically close/touching stay topologically connected through the
+                # medial-axis pass, same as Phase 0's one-skeleton-per-whole-component.
+                # Exploding this into separate per-fragment build_skeleton_network calls
+                # was tried first and fragmented real channel networks into hundreds of
+                # disconnected pieces, since raster-derived medial-axis endpoints don't
+                # land on the exact seam coordinate the fragments were cut at.
+                if not narrow_m.is_empty:
+                    narrow_wgs84 = gpd.GeoSeries([narrow_m], crs=utm).to_crs(self.CRS_WGS84).iloc[0]
+                    kind = self.classify_water_body(narrow_wgs84, False, depth_gdf, fairway_gdf, cfg)
+                    counts[kind] += len(self._explode_polygonal(narrow_m))
+                    skeleton_pieces.append(narrow_wgs84)
+
+                # Wide (navmesh-eligible) pieces DO need to stay exploded into individual
+                # simple polygons: `triangle`'s PSLG triangulation takes one exterior ring
+                # (+ holes) per call, not a MultiPolygon of disjoint areas.
+                for piece_m in self._explode_polygonal(wide_m):
+                    piece_wgs84 = gpd.GeoSeries([piece_m], crs=utm).to_crs(self.CRS_WGS84).iloc[0]
+                    kind = self.classify_water_body(piece_wgs84, True, depth_gdf, fairway_gdf, cfg)
+                    counts[kind] += 1
+                    if kind == "navmesh":
+                        navmesh_pieces.append((piece_m, utm, seam_coords))
+                    else:
+                        skeleton_pieces.append(piece_wgs84)
+
+                # Build skeleton pieces before navmesh pieces so navmesh seam nodes can
+                # coordinate-snap onto already-created skeleton endpoint nodes.
+                for piece_wgs84 in skeleton_pieces:
+                    self.build_skeleton_network(piece_wgs84, DEFAULT_SOURCE_TIER, src_id)
+                for piece_m, piece_utm, piece_seam_coords in navmesh_pieces:
+                    self.build_navmesh_region(piece_m, piece_utm, piece_seam_coords, DEFAULT_SOURCE_TIER, src_id)
+
+            logger.info(f"Coastal water: {len(polygons)} connected components split into "
+                        f"skeleton={counts['skeleton']}, laned={counts['laned']}, "
+                        f"navmesh={counts['navmesh']} pieces.")
         logger.info(f"Network built with {self.graph.number_of_nodes()} nodes and {self.graph.number_of_edges()} edges.")
 
     # ------------------------------------------------------------------
@@ -467,44 +513,82 @@ class NauticalRoutingPipeline:
         """Pick a metre-based local UTM CRS for a WGS84 geometry (avoids Web Mercator distortion)."""
         return gpd.GeoSeries([geom_wgs84], crs="EPSG:4326").estimate_utm_crs()
 
+    @staticmethod
+    def _explode_polygonal(geom) -> List[Polygon]:
+        """Explode a Polygon/MultiPolygon/GeometryCollection into single Polygons."""
+        if geom is None or geom.is_empty:
+            return []
+        if isinstance(geom, Polygon):
+            return [geom]
+        if isinstance(geom, MultiPolygon):
+            return list(geom.geoms)
+        # GeometryCollection fallback: keep polygonal parts only
+        return [g for g in getattr(geom, "geoms", []) if isinstance(g, Polygon) and not g.is_empty]
+
     def _connected_water_polygons(self, coastal_gdf) -> List[Polygon]:
         """unary_union the water areas and explode into connected single polygons."""
         geoms = [g for g in coastal_gdf.geometry if g is not None and not g.is_empty]
         if not geoms:
             return []
-        merged = unary_union(geoms)
-        if isinstance(merged, Polygon):
-            return [merged]
-        if isinstance(merged, MultiPolygon):
-            return list(merged.geoms)
-        # GeometryCollection fallback: keep polygonal parts only
-        return [g for g in getattr(merged, "geoms", []) if isinstance(g, Polygon)]
+        return self._explode_polygonal(unary_union(geoms))
 
-    def classify_water_body(self, polygon, depth_gdf, fairway_gdf,
-                            config) -> Literal["navmesh_placeholder", "skeleton", "laned"]:
-        """Two-stage classifier.
+    def _split_wide_narrow(self, poly_m, radius_m: float, simplify_tol_m: float = 1.0):
+        """Split a metric-CRS polygon into a wide (navmesh-eligible) part and a
+        narrow (channel) part by local width, plus the seam where they meet.
 
-        Stage 1 (cheap erosion): a body wide enough to contain a disk of
-        min_navmesh_radius_m is open water -> placeholder (unless it is wide but
-        too shallow to be genuinely navigable, which falls back to skeleton).
-        Narrow bodies (erosion empty) are channel candidates and skip straight to
-        stage 2 without any raster work.
-
-        Stage 2 (channel candidates only): a channel that overlaps a regulated
-        fairway is 'laned' (directional treatment attempted in Step D); otherwise
-        it is a plain 'skeleton' centerline.
+        A naive buffer(-R).buffer(+R) can bulge back out past the original
+        boundary on convex banks, corrupting the subsequent difference() --
+        re-intersecting with the cleaned input after re-dilation avoids that.
+        The seam is computed once here so both sides get bit-identical
+        coordinates (avoids precision drift if recomputed independently later).
         """
-        utm = self._local_utm_crs(polygon)
-        poly_m = gpd.GeoSeries([polygon], crs="EPSG:4326").to_crs(utm).iloc[0]
-        eroded = poly_m.buffer(-config.min_navmesh_radius_m)
+        cleaned = poly_m.buffer(0).simplify(simplify_tol_m)
+        eroded = cleaned.buffer(-radius_m, quad_segs=16)
+        wide = eroded.buffer(radius_m, quad_segs=16).buffer(0).intersection(cleaned)
+        narrow = cleaned.difference(wide).buffer(0)
+        wide, narrow = self._clean_polygonal(wide), self._clean_polygonal(narrow)
+        seam = wide.boundary.intersection(narrow.boundary)
+        return wide, narrow, seam
 
-        if not eroded.is_empty:
-            # Wide body. Open water unless it is entirely shallower than the depth ceiling.
-            if self._has_navigable_depth(polygon, depth_gdf, config.depth_ceiling_m):
-                return "navmesh_placeholder"
-            # wide but shallow -> treat as skeleton (not navmesh-eligible)
+    def _clean_polygonal(self, geom) -> Polygon:
+        """Keep only a geometry's polygonal parts, re-unioned into one clean
+        Polygon/MultiPolygon. GEOS boundary ops (buffer/intersection/difference)
+        on complex real-world coastline geometry can degrade to a
+        GeometryCollection mixing points/lines/polygons -- whose `.boundary` is
+        `None`, which breaks the seam computation above.
+        """
+        pieces = self._explode_polygonal(geom)
+        if not pieces:
+            return Polygon()
+        return unary_union(pieces)
 
-        # Narrow (or wide-but-shallow) channel candidate.
+    @staticmethod
+    def _seam_coord_set(seam_geom, precision: int = 3) -> set:
+        """All vertex coordinates of a seam geometry (Point/LineString/GeometryCollection,
+        in metric CRS), rounded for exact-match lookup against exploded sub-polygon rings."""
+        if seam_geom is None or seam_geom.is_empty:
+            return set()
+        return {(round(x, precision), round(y, precision))
+                for x, y in shapely.get_coordinates(seam_geom)}
+
+    def classify_water_body(self, polygon, is_wide: bool, depth_gdf, fairway_gdf,
+                            config) -> Literal["navmesh", "skeleton", "laned"]:
+        """Classify one already width-split water sub-polygon.
+
+        `is_wide` is computed once per sub-polygon by `_split_wide_narrow`, not
+        by eroding this function's own whole-polygon input. Real hydrography
+        merges wide bays and narrow channels into one connected polygon, so
+        eroding the whole thing here (the Phase 0 approach) always finds the
+        bay and misclassifies the narrow channel bundled together with it.
+
+        A wide piece is 'navmesh' unless it's entirely shallower than the
+        depth ceiling, in which case it falls back to the narrow-piece logic:
+        a channel that overlaps a regulated fairway is 'laned' (directional
+        treatment attempted in Step D); otherwise it's a plain 'skeleton'
+        centerline.
+        """
+        if is_wide and self._has_navigable_depth(polygon, depth_gdf, config.depth_ceiling_m):
+            return "navmesh"
         if self._has_regulatory_structure(polygon, fairway_gdf):
             return "laned"
         return "skeleton"
@@ -698,6 +782,338 @@ class NauticalRoutingPipeline:
                 self.graph.add_edge(u, v, **attrs)
                 self.graph.add_edge(v, u, **attrs)
                 added += 2
+
+    # ------------------------------------------------------------------
+    # Step B2 (Phase 1) — real navmesh_regions via constrained triangulation
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _polygon_to_pslg(poly_m):
+        """Build a `triangle`-library PSLG dict (vertices/segments/holes) from a
+        shapely polygon-with-holes, in metric CRS. Returns (pslg_dict, ring_ranges)
+        where ring_ranges is [(start_index, vertex_count), ...], one entry per ring
+        (exterior first, then each interior), so callers can walk a single ring's
+        own vertex-adjacency without touching `triangle`'s input dict (it rejects
+        unrecognized keys).
+
+        Exterior ring vertices come first (indices 0..n-1), each interior ring
+        is appended after. `triangle`'s PSLG mode preserves this input vertex
+        order exactly in its output (verified: output_vertices[0:N] ==
+        input_vertices, even after quality/area refinement inserts interior
+        Steiner points), so seam/boundary node identity can be tracked by
+        index alone -- no need for the `-Y` switch, which silently suppresses
+        all refinement in this binding despite its docs.
+        """
+        def _ring_coords(ring):
+            coords = list(ring.coords)
+            if len(coords) > 1 and coords[0] == coords[-1]:
+                coords = coords[:-1]
+            return coords
+
+        vertices: List[Tuple[float, float]] = []
+        segments: List[Tuple[int, int]] = []
+        ring_ranges: List[Tuple[int, int]] = []  # (start_index, vertex_count) per ring
+
+        def _add_ring(ring):
+            coords = _ring_coords(ring)
+            start = len(vertices)
+            n = len(coords)
+            vertices.extend(coords)
+            segments.extend((start + i, start + (i + 1) % n) for i in range(n))
+            ring_ranges.append((start, n))
+
+        _add_ring(poly_m.exterior)
+        holes: List[Tuple[float, float]] = []
+        for interior in poly_m.interiors:
+            _add_ring(interior)
+            holes.append(tuple(Polygon(list(interior.coords)).representative_point().coords[0]))
+
+        data = {"vertices": np.array(vertices, dtype=float),
+                "segments": np.array(segments, dtype=np.int32)}
+        if holes:
+            data["holes"] = np.array(holes, dtype=float)
+        return data, ring_ranges
+
+    def build_navmesh_region(self, poly_m, utm_crs, seam_coord_set,
+                             source_tier=DEFAULT_SOURCE_TIER, source_id=None):
+        """Triangulate one wide, navmesh-eligible water sub-polygon (already in
+        metric CRS) and stage a `navmesh_regions` row for export. Registers EVERY
+        vertex of the region's own perimeter (exterior + interior/island rings) as
+        a literal graph node, connected in ring order (format spec §6's
+        minimum-viable fallback) -- this guarantees the region's whole perimeter is
+        one connected cycle, correctly, with no land-crossing risk, since it's
+        tracing the polygon's own boundary rather than guessing straight-line
+        shortcuts between boundary points. (A first version tried k-NN shortcuts
+        plus radius-based stitching between just the seam vertices; that failed to
+        fully connect large, non-convex regions, since a straight line between two
+        boundary points on opposite sides of a headland or peninsula exits the
+        polygon -- exactly the case the land-crossing containment check is
+        supposed to catch, so it correctly rejected those chords, leaving the
+        region internally fragmented no matter how large the search radius.)
+        The subset of perimeter vertices that lie on the seam with a bordering
+        skeleton piece is tracked separately as `boundary_node_ids`, used by
+        `build_network`'s cross-piece `_stitch_component_pieces` call to connect
+        this region into the rest of its original connected water body.
+        """
+        # PSLG segment count is unbounded (it's the region's own perimeter, including
+        # every island ring) and becomes a hard constraint for triangle's quality
+        # refinement -- an insufficiently-simplified real-world coastline boundary is
+        # a known way to trigger a combinatorial blow-up in output triangle/Steiner
+        # count. Mirror _rasterize_water_polygon's MAX_RASTER_PIXELS pattern: shrink
+        # the input (via increasing simplify tolerance) until it fits a fixed budget,
+        # rather than letting triangulate() run unbounded.
+        simplify_tol = 1.0
+        for attempt in range(6):
+            pslg, ring_ranges = self._polygon_to_pslg(poly_m)
+            budget_used = len(pslg["vertices"]) + len(pslg["segments"])
+            if budget_used <= NAVMESH_PSLG_BUDGET or attempt == 5:
+                break
+            simplify_tol *= 2
+            simplified = self._clean_polygonal(poly_m.buffer(0).simplify(simplify_tol))
+            pieces = self._explode_polygonal(simplified)
+            if not pieces:
+                break
+            poly_m = max(pieces, key=lambda p: p.area)
+            logger.info(f"  Navmesh region PSLG too large ({budget_used} verts+segs > "
+                        f"{NAVMESH_PSLG_BUDGET}); retrying with simplify tolerance "
+                        f"{simplify_tol:.1f}m.")
+
+        max_area = (NAVMESH_TARGET_EDGE_M ** 2) * 0.433
+        try:
+            result = _triangle.triangulate(pslg, f"pq28a{max_area:.1f}n")
+        except Exception as exc:
+            logger.warning(f"  Navmesh triangulation failed on a polygon ({exc}); skipping region.")
+            return
+        if "triangles" not in result or len(result["triangles"]) == 0:
+            logger.warning("  Navmesh triangulation produced no triangles; skipping region.")
+            return
+        if len(result["triangles"]) > NAVMESH_MAX_TRIANGLES:
+            logger.warning(f"  Navmesh triangulation produced {len(result['triangles'])} triangles "
+                            f"(> {NAVMESH_MAX_TRIANGLES}); retrying once with a coarser mesh.")
+            coarse_area = max_area * 4
+            try:
+                retry = _triangle.triangulate(pslg, f"pq20a{coarse_area:.1f}n")
+            except Exception as exc:
+                logger.warning(f"  Coarser navmesh retry failed ({exc}); skipping region.")
+                return
+            if "triangles" not in retry or len(retry["triangles"]) == 0:
+                logger.warning("  Coarser navmesh retry produced no triangles; skipping region.")
+                return
+            result = retry
+
+        out_vertices = result["vertices"]
+        out_triangles = result["triangles"]
+        out_neighbors = result["neighbors"]
+        n_input = len(pslg["vertices"])
+
+        pts_wgs84 = gpd.GeoSeries(gpd.points_from_xy(out_vertices[:, 0], out_vertices[:, 1]),
+                                  crs=utm_crs).to_crs(self.CRS_WGS84)
+        lons, lats = pts_wgs84.x.to_numpy(), pts_wgs84.y.to_numpy()
+
+        perimeter_node_ids = [None] * n_input
+        boundary_node_ids = []
+        for start, count in ring_ranges:
+            for k in range(count):
+                i = start + k
+                node_id = self._get_or_create_node(float(lons[i]), float(lats[i]), "coastal")
+                self._stamp_node(node_id, NODE_KIND_NAVMESH_VERTEX, source_tier, source_id)
+                perimeter_node_ids[i] = node_id
+                x, y = pslg["vertices"][i]
+                if (round(x, 3), round(y, 3)) in seam_coord_set:
+                    boundary_node_ids.append(node_id)
+            attrs = dict(edge_type="coastal", edge_kind_id=EDGE_KIND_NAVMESH_BOUNDARY,
+                         source_tier=source_tier, source_id=source_id)
+            for k in range(count):
+                u = perimeter_node_ids[start + k]
+                v = perimeter_node_ids[start + (k + 1) % count]
+                if u != v and not self.graph.has_edge(u, v):
+                    self.graph.add_edge(u, v, **attrs)
+                    self.graph.add_edge(v, u, **attrs)
+
+        boundary_geom_wgs84 = gpd.GeoSeries([poly_m], crs=utm_crs).to_crs(self.CRS_WGS84).iloc[0]
+        self.navmesh_region_rows.append({
+            "boundary_geometry": json.dumps(mapping(boundary_geom_wgs84)),
+            "vertices": json.dumps([[float(lat), float(lon)] for lat, lon in zip(lats, lons)]),
+            "triangles": json.dumps(out_triangles.tolist()),
+            "triangle_adjacency": json.dumps(out_neighbors.tolist()),
+            "boundary_node_ids": json.dumps(boundary_node_ids),
+            "depth_ceiling_m": self.classification_config.depth_ceiling_m,
+            "source_tier": source_tier,
+            "source_id": source_id,
+        })
+
+    def _crosses_land(self, line_wgs84) -> bool:
+        """True if a WGS84 LineString genuinely intersects the separate `land` layer.
+
+        `land` is digitized independently from `coastal_water`, so the two don't
+        always agree at the vertex level -- `_sanity_check_no_land_crossings` strips
+        any edge that intersects `land_gdf` regardless of what a caller's own
+        containment check against a water polygon concluded, so callers that
+        generate connectivity-critical edges (ring-perimeter, stitching) should
+        pre-check against this same layer to avoid building an edge only to have it
+        stripped later, re-fragmenting whatever it was bridging.
+        """
+        land_gdf = self.gdfs.get("land", gpd.GeoDataFrame())
+        if land_gdf is None or land_gdf.empty:
+            return False
+        try:
+            return len(land_gdf.sindex.query(line_wgs84, predicate="intersects")) > 0
+        except Exception:
+            return bool(land_gdf.intersects(line_wgs84).any())
+
+    def _stitch_component_pieces(self, node_ids, component_polygon_wgs84, snap_radius_m: float = 500.0) -> int:
+        """Reconnect nodes from independently-built skeleton/navmesh pieces that were
+        all exploded from the SAME original connected water body (see build_network).
+
+        Exact-coordinate seam matching (`_seam_coord_set`) only reconnects a narrow
+        piece to a WIDE piece it borders, and only via the wide piece's raw polygon
+        boundary vertices. Skeleton medial-axis endpoints are derived from raster
+        pruning instead, so they don't land on identical coordinates even where two
+        pieces of the same original water body are genuinely adjacent (narrow-to-
+        narrow, or narrow-to-wide when the raster endpoint falls short of the exact
+        boundary). Left unfixed, the width-based split fragments one connected water
+        body into many disconnected graph components -- this stitches nearby nodes
+        back together, scoped to this one component's own node set, and only where
+        the straight connector stays inside this component's own polygon (never
+        bridging to a merely-nearby, unrelated water body across a spit of land).
+
+        Default radius is set above `min_navmesh_radius_m` (300m): the wide/narrow
+        seam is reconstructed from an eroded-then-dilated buffer, which rounds off
+        sharp channel-mouth corners, so the seam can sit up to roughly one erosion
+        radius away from where the (un-eroded) skeleton's medial axis actually
+        terminates -- a smaller radius left most real seams unbridged in testing.
+        """
+        ids = list(node_ids)
+        if len(ids) < 2:
+            return 0
+
+        # Union-find seeded from these nodes' EXISTING edges (skeleton chains, navmesh
+        # fallback edges already built) -- only pairs still in different groups after
+        # that need stitching. Without this, a radius-based pass reconnects thousands of
+        # already-connected same-chain neighbors too (any point along a winding skeleton
+        # has plenty of other chain points within the snap radius), which both wastes
+        # work and creates spurious chords that cut across land on a tight bend --
+        # exactly what drove the land-crossing strip rate up when this was tried without
+        # the union-find guard.
+        parent = {n: n for n in ids}
+
+        def find(x):
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+
+        def union(a, b) -> bool:
+            ra, rb = find(a), find(b)
+            if ra == rb:
+                return False
+            parent[ra] = rb
+            return True
+
+        id_set = set(ids)
+        for n in ids:
+            for nbr in self.graph.neighbors(n):
+                if nbr in id_set:
+                    union(n, nbr)
+
+        if len({find(n) for n in ids}) <= 1:
+            return 0  # already one connected piece
+
+        coords_wgs84 = np.array([(self.graph.nodes[n]["lon"], self.graph.nodes[n]["lat"]) for n in ids])
+        utm = self._local_utm_crs(component_polygon_wgs84)
+        pts_m = gpd.GeoSeries(gpd.points_from_xy(coords_wgs84[:, 0], coords_wgs84[:, 1]),
+                              crs=self.CRS_WGS84).to_crs(utm)
+        coords_m = np.column_stack([pts_m.x.to_numpy(), pts_m.y.to_numpy()])
+        poly_m = gpd.GeoSeries([component_polygon_wgs84], crs=self.CRS_WGS84).to_crs(utm).iloc[0].buffer(2.0)
+
+        added = 0
+
+        def try_add(i: int, j: int) -> bool:
+            nonlocal added
+            u, v = ids[i], ids[j]
+            if find(u) == find(v):
+                return False
+            candidate_m = LineString([coords_m[i], coords_m[j]])
+            if not candidate_m.within(poly_m):
+                return False
+            if self._crosses_land(LineString([coords_wgs84[i], coords_wgs84[j]])):
+                return False
+            attrs = dict(edge_type="coastal", edge_kind_id=EDGE_KIND_NAVMESH_BOUNDARY,
+                         source_tier=DEFAULT_SOURCE_TIER, source_id=None)
+            self.graph.add_edge(u, v, **attrs)
+            self.graph.add_edge(v, u, **attrs)
+            union(u, v)
+            added += 2
+            return True
+
+        # Pass 1: cheap radius-limited KD-tree pass, handles the common case of a
+        # small local gap between two adjacent pieces. SKIPPED for large node counts:
+        # `tree.query_pairs()` materializes EVERY pair within radius before anything
+        # can be capped -- at full-dataset scale (tens of thousands of densely-spaced
+        # coastal nodes in one call from `_ensure_coastal_connectivity`) that pair set
+        # itself reached tens of millions of Python tuples and exhausted 15GB of RAM,
+        # confirmed against the real machine, not just a slow-code guess. Pass 2 below
+        # is bounded by component *count* via MAX_TOTAL_SAMPLES regardless of total
+        # node count, so it alone carries the load at that scale.
+        MAX_IDS_FOR_PASS1 = 4000
+        if len(ids) <= MAX_IDS_FOR_PASS1:
+            from scipy.spatial import cKDTree
+            tree = cKDTree(coords_m)
+            for i, j in tree.query_pairs(snap_radius_m):
+                try_add(i, j)
+
+        # Pass 2: guarantee, one merge round at a time. A region's exterior ring and
+        # each interior (island) ring are separate cycles after ring-adjacency edges
+        # alone (build_navmesh_region) -- they don't share vertices, so a region with
+        # many islands starts as that many separate components here, and a boundary
+        # that loops back close to itself (e.g. around a peninsula) can *also* leave
+        # locally-dense clusters more than snap_radius_m apart along the direct path
+        # between them. Repeatedly merge the two components with the globally nearest
+        # valid (in-polygon) connector -- sorting ALL sample pairs (not just each
+        # sample's own k-nearest) greedily merges the single best pair first each
+        # round, which reconnects far more of the graph per round than a per-sample
+        # k-nearest-neighbor query does. A full pairwise distance matrix is only safe
+        # because MAX_TOTAL_SAMPLES bounds it to a fixed, small size regardless of how
+        # many components exist -- an earlier version capped only *per group*, so
+        # hundreds of components (real multi-island Zeeland regions) still produced a
+        # tens-of-thousands-squared matrix (gigabytes) that ran for 15+ minutes and
+        # got OOM-killed at full-dataset scale.
+        MAX_TOTAL_SAMPLES = 1500
+        MAX_ROUNDS = 30
+        from scipy.spatial.distance import cdist
+        for _round in range(MAX_ROUNDS):
+            groups: Dict[Any, List[int]] = {}
+            for idx, node in enumerate(ids):
+                groups.setdefault(find(node), []).append(idx)
+            if len(groups) <= 1:
+                break
+            per_group_cap = max(1, MAX_TOTAL_SAMPLES // len(groups))
+            sample_idxs: List[int] = []
+            for member_idxs in groups.values():
+                step = max(1, len(member_idxs) // per_group_cap)
+                sample_idxs.extend(member_idxs[::step][:per_group_cap])
+            sample_coords = coords_m[sample_idxs]
+            n_samples = len(sample_idxs)
+            dmat = cdist(sample_coords, sample_coords)
+            np.fill_diagonal(dmat, np.inf)
+            merged_this_round = 0
+            # Walk the FULL sorted candidate list once, merging every valid pair found
+            # (not just the first) -- `find()` inside try_add skips pairs that have
+            # already been merged earlier in this same pass, so one sort serves many
+            # merges instead of recomputing groups/samples/distances per merge.
+            for flat_idx in np.argsort(dmat, axis=None):
+                si, sj = divmod(int(flat_idx), n_samples)
+                if si >= sj:
+                    continue
+                if try_add(sample_idxs[si], sample_idxs[sj]):
+                    merged_this_round += 1
+            if merged_this_round == 0:
+                remaining = len({find(n) for n in ids})
+                if remaining > 1:
+                    logger.warning(f"  Stitch guarantee pass could not find a valid in-polygon "
+                                   f"connector among sampled candidates; {remaining} components "
+                                   f"left unmerged.")
+                break
+        return added
 
     # ------------------------------------------------------------------
     # Step C — skeleton (medial-axis centerline) extraction
@@ -995,6 +1411,13 @@ class NauticalRoutingPipeline:
         merely asserting >0.5%. Real pilot data shows the placeholder path crosses
         land at ~2.5%, so stripping is retained for placeholder edges until Phase 1
         replaces them with constrained-Delaunay navmesh_regions.
+
+        Phase 1: `build_navmesh_placeholder` is no longer called, so the
+        `placeholder` bucket below is always empty in practice -- kept rather
+        than removed since it's harmless (guarded division) and the function
+        it detects remains in the file, unreferenced. Navmesh fallback edges
+        (edge_kind_id=EDGE_KIND_NAVMESH_BOUNDARY) don't set `is_placeholder`,
+        so they fall into the lenient `skeleton` bucket below by construction.
         """
         coastal_gdf = self.gdfs.get("coastal_water", gpd.GeoDataFrame())
         land_gdf = self.gdfs.get("land", gpd.GeoDataFrame())
@@ -1063,6 +1486,50 @@ class NauticalRoutingPipeline:
             if data.get("edge_type") == "coastal":
                 self.graph.edges[u, v]["crosses_land"] = 0
         logger.info("Land-crossing sanity check complete.")
+
+    def _ensure_coastal_connectivity(self):
+        """Final connectivity guarantee, run once, after all other edge construction
+        and stripping is done for this run.
+
+        Splitting each connected water body by width (build_network) and then
+        stripping any edge that genuinely crosses land (_sanity_check_no_land_crossings,
+        just above) are each individually necessary, but doing a per-piece stitch
+        *during* construction (tried first) wastes the effort: edges added mid-build
+        can still get stripped by the land-crossing check that runs afterward,
+        re-fragmenting whatever they'd bridged. Running the connectivity guarantee
+        here instead -- after stripping, once, over the whole graph -- means nothing
+        it adds can be invalidated by a later step in this same run.
+        """
+        coastal_gdf = self.gdfs.get("coastal_water")
+        if coastal_gdf is None or coastal_gdf.empty:
+            return
+        coastal_nodes = [n for n, d in self.graph.nodes(data=True) if d.get("node_type") != "inland"]
+        if len(coastal_nodes) < 2:
+            return
+
+        # Scope the stitch pass to each ORIGINAL connected water body separately,
+        # rather than unioning/buffering the whole dataset's coastal water in one
+        # call: _stitch_component_pieces' own docstring says it only ever reconnects
+        # pieces exploded from the same original component, so doing this per
+        # component both bounds the per-call union/buffer cost (cheap at Zeeland-
+        # pilot scale, a real cost at full-country scale) and makes that same-body-
+        # only intent structurally enforced rather than incidentally true.
+        components = self._connected_water_polygons(coastal_gdf)
+        node_points = gpd.GeoSeries(
+            [Point(self.graph.nodes[n]["lon"], self.graph.nodes[n]["lat"]) for n in coastal_nodes],
+            index=coastal_nodes, crs=self.CRS_WGS84)
+        sindex = node_points.sindex
+
+        total_added = 0
+        for component in components:
+            probe = component.buffer(0.001)  # ~100m in degrees; generous spatial pre-filter only
+            candidates = node_points.index[sindex.query(probe, predicate="intersects")]
+            if len(candidates) < 2:
+                continue
+            total_added += self._stitch_component_pieces(list(candidates), component, snap_radius_m=500.0)
+
+        logger.info(f"Final coastal connectivity pass: added {total_added} stitching edges "
+                    f"across {len(components)} components.")
 
     def _compute_node_depths(self):
         depare_gdf = self.gdfs.get("depth_areas", gpd.GeoDataFrame())
@@ -1381,7 +1848,18 @@ class NauticalRoutingPipeline:
                 (source, target, distance, min_depth, drval1, max_air_draft, min_width, cost_factor, distance_to_land, edge_type_id, traffic_mode, crosses_land, crosses_obstacle, edge_kind_id, source_tier, source_id, width_profile)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, edges_data)
-            
+
+            navmesh_regions_data = [(
+                region_id,
+                r["boundary_geometry"], r["vertices"], r["triangles"], r["triangle_adjacency"],
+                r["boundary_node_ids"], r["depth_ceiling_m"], r["source_tier"], r["source_id"]
+            ) for r in self.navmesh_region_rows]
+            cursor.executemany("""
+                INSERT INTO navmesh_regions
+                (region_id, boundary_geometry, vertices, triangles, triangle_adjacency, boundary_node_ids, depth_ceiling_m, source_tier, source_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, navmesh_regions_data)
+
             def _poi_name(row) -> str:
                 for col in ("OBJNAM", "NOBJNM", "name"):
                     val = row.get(col)
@@ -1487,7 +1965,7 @@ if __name__ == "__main__":
                         help="License string for the dataset (metadata.license)")
     parser.add_argument("--copyright", default="",
                         help="Copyright / attribution string (metadata.copyright)")
-    parser.add_argument("--architecture", default="navmesh-hybrid-phase0",
+    parser.add_argument("--architecture", default="navmesh-hybrid-phase1",
                         help="Graph architecture label (metadata.architecture)")
     parser.add_argument("--dataset-version", default="",
                         help="Dataset version string (metadata.dataset_version)")
