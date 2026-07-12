@@ -95,7 +95,7 @@ def _edge_attr_worker(edge_chunk):
     obstacles_gdf = gdfs.get('obstacles', gpd.GeoDataFrame())
 
     results = {}
-    for u, v, u_lon, u_lat, v_lon, v_lat, edge_type, u_res, v_res in edge_chunk:
+    for u, v, u_lon, u_lat, v_lon, v_lat, edge_type, u_res, v_res, is_opening_bridge_edge in edge_chunk:
         attrs = {}
         _, _, distance = geod.inv(u_lon, u_lat, v_lon, v_lat)
         attrs['distance'] = round(distance, 2)
@@ -196,9 +196,18 @@ def _edge_attr_worker(edge_chunk):
                 closest_geom = land_metric.iloc[closest_idx].geometry
                 attrs['distance_to_land'] = round(edge_geom_metric.distance(closest_geom), 2)
 
-        # Obstacle crossing check
+        # Obstacle crossing check — skipped for opening-bridge edges (same
+        # exemption already applied to crosses_land at edge-creation time in
+        # _add_opening_bridge_edges): these are precise, deliberately-computed
+        # crossings of a bridge's actual navigable opening via fairway/
+        # waterway centerline intersection, not generic geometry. A broad
+        # obstacle polygon (e.g. a mariculture/marine-farm area) incidentally
+        # overlapping the bridge's footprint must not hard-block the one
+        # crossing point that exists specifically so vessels CAN pass through
+        # the opening — that's the confirmed cause of a real Zeelandbrug
+        # regression (opening never explored at all, not merely deprioritized).
         attrs['crosses_obstacle'] = 0
-        if not obstacles_gdf.empty:
+        if not is_opening_bridge_edge and not obstacles_gdf.empty:
             obs_candidates = _candidates_by_bounds_static(obstacles_gdf, edge_geom)
             if not obs_candidates.empty:
                 intersecting = obs_candidates[obs_candidates.intersects(edge_geom)]
@@ -405,11 +414,25 @@ class NauticalRoutingPipeline:
             hulks["_layer"] = "hulks"
             obstacle_parts.append(hulks)
 
+        # Same entry-prohibited-only filter as restricted_areas above — a
+        # mariculture/marine-farm concession (S-57 MARCUL, e.g. a mussel or
+        # oyster plot) is a fishing-rights designation, not automatically a
+        # navigational hard-stop. Blanket-blocking every mariculture polygon
+        # regardless of RESTRN was a real, confirmed bug: an unrestricted
+        # marine-farm area near Zeelandbrug happened to overlap the bridge's
+        # navigable opening corridor and silently made the entire crossing
+        # (and the boundary-ring edges leading to it) unreachable, with no
+        # warning — a plain data area, not a genuine obstruction, was hard-
+        # excluding a route that should only have been soft-penalized (if
+        # even that) via cost_factor, same as any other area vessels are
+        # merely asked to avoid absent an explicit restriction.
         marcult = self.gdfs.get("mariculture", gpd.GeoDataFrame())
         if not marcult.empty:
-            marcult = marcult.copy()
-            marcult["_layer"] = "mariculture"
-            obstacle_parts.append(marcult)
+            mc_mask = marcult.apply(_is_entry_prohibited, axis=1)
+            mc_prohibited = marcult[mc_mask].copy()
+            if not mc_prohibited.empty:
+                mc_prohibited["_layer"] = "mariculture"
+                obstacle_parts.append(mc_prohibited)
 
         # The raw obstructions_points layer is loaded under the CLI key "obstacles"
         # (obstructions_points.geojson). Read it from there — the old code read a
@@ -1601,6 +1624,7 @@ class NauticalRoutingPipeline:
                     data.get("edge_type", "coastal"),
                     u_node.get("resolution", 0.005),
                     v_node.get("resolution", 0.005),
+                    data.get("is_opening_bridge_edge", False),
                 )
 
         def chunked_iterable(iterable, size):

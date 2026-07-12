@@ -1,15 +1,20 @@
 # Next Phases — Navmesh-Hybrid Pipeline (Post Phase 0)
 
 Status: Phase 0 and Phase 1 (this repo, `signalk-router-pipeline`) are
-implemented, verified, and committed (`e6f1fc5`, `7e64df9`). Phase 2
-(funnel-algorithm consumption, in the separate `autoroute` repo) also
-turned out to already be implemented and committed (`aabc5db`). **The
-"Phase 2 Hardening — Boundary Shortcut Sparsification" fix below is now
-implemented in `autoroute`** (`selectAnchors`/anchor shortcuts in
-`navmesh.ts`/`database.ts`, composed non-live seeding in `routing.ts`,
-regression tests in `test/navmesh-integration.test.ts`) — see its own
-"Implementation status" subsection for what was verified and what remains
-genuinely open.
+implemented, verified, and committed (`e6f1fc5`, `7e64df9`, `dee556c`).
+Phase 2 (funnel-algorithm consumption, in the separate `autoroute` repo)
+also turned out to already be implemented and committed (`bfd3560`), and
+its own "Boundary Shortcut Sparsification" hardening pass is committed too
+(`ece6278`) — real, verified improvement (4,924m → 3,116m on the
+Zeelandbrug scenario after a fresh regeneration), but **not a full fix**.
+**"Phase 2 Hardening, Round 3 — Navmesh Entry/Exit Correctness" is now
+DONE — the Zeelandbrug scenario genuinely passes (`Through opening: true`,
+5,047m, zero constraint violations)**, via three independently-confirmed
+bugs (one in `autoroute`'s SSFA funnel algorithm, one in `autoroute`'s A*
+goal test, one in this repo's obstacle layer) — see that section below for
+the full root-cause writeup and a still-open follow-up (a second,
+different Zeelandbrug span exposed only at full-Zeeland scale, not yet
+investigated).
 
 **`data/zeeland.sqlite` has been regenerated with the current (Phase 1)
 pipeline** — the copy that had been sitting in `data/` was stale, still
@@ -94,21 +99,79 @@ edge-by-edge):
 - **A second, separate, and still-open issue**: even after the above fix,
   `Through opening: false` persists with the same real air-draft
   constraint warning (`11.0m < required 21m`) as the original bug report.
-  This matches the risk this document already flagged: possible
-  `_add_opening_bridge_edges` bridge-tagging failure in the pipeline (this
-  repo). A second contributing factor was also found and is **not** a
-  pipeline bug: a synthetic stress-test fixture (regular right-triangle
-  grid, `test/navmesh-integration.test.ts`) showed `navmesh.ts`'s
+  ~~This matches the risk this document already flagged: possible
+  `_add_opening_bridge_edges` bridge-tagging failure in the pipeline.~~
+  **Corrected in the follow-up session below — this lead was checked and
+  ruled out.** A synthetic stress-test fixture (regular right-triangle
+  grid, `test/navmesh-integration.test.ts`) separately showed `navmesh.ts`'s
   Simple-Stupid-Funnel-Algorithm implementation can fail to "cut corners"
   on certain corridor shapes, degenerating to keeping every portal vertex
   (see that test's comments) — while real Zeeland `triangle`-library
   output was spot-checked separately (2,852 anchor-shortcut pairs, ratio
   of funnel distance to straight-line ~1.0 for all but 34, and those only
   marginally off) and does **not** show this pathology, so it's a latent
-  corridor-search/funnel edge case, not the dominant cause of the
-  remaining Zeelandbrug gap. **Neither of these is fixed by this
+  corridor-search/funnel edge case, not confirmed as the dominant cause of
+  the remaining Zeelandbrug gap. **Neither of these is fixed by this
   session's change** — both are new, separately-scoped follow-ups, not
   part of the boundary-shortcut-sparsification fix itself.
+
+### Round 2 — Follow-up investigation (verified this session, corrects the lead above)
+
+Rebuilt `autoroute` fresh (38/38 tests still pass) and re-verified against
+a **freshly regenerated** database rather than trusting the existing
+`zeelandbrug_tight_phase1.sqlite` fixture — this mattered:
+
+- **`_add_opening_bridge_edges` bridge tagging is fine — drop that lead.**
+  Regenerated `zeelandbrug_tight` from its source GeoJSON with the current
+  pipeline (`data/zeelandbrug_tight_retest.sqlite`) and queried it directly:
+  a node at (51.62678, 3.91101) — the exact coordinate of the source
+  data's `CATBRG=5` (movable) Zeelandbrug span — has multiple edges with
+  `max_air_draft=999.0`, correctly distinguished from the flanking
+  `CATBRG=1` (fixed) spans' genuine `VERCLR=11.0` edges. The bridge
+  crossing is tagged exactly as it should be.
+- **The test fixture itself was stale, and that was a real confound.**
+  `zeelandbrug_tight_phase1.sqlite` (dated Jul 10) had **zero**
+  `resolution=0.001` bridge-marker nodes at all — it predates a pipeline
+  state where bridge edges were being generated correctly for this input.
+  Testing against a fresh regeneration of the *identical* source directory
+  gave a real, measurable improvement: **3,116m / 78 segments**, vs. the
+  stale fixture's 4,808m / 221 segments. Better, but still not fixed.
+  **Lesson for whoever picks this up: always regenerate test databases
+  fresh before drawing conclusions about a routing bug** — a stale
+  fixture can make a partially-fixed bug look completely unfixed, or vice
+  versa.
+- **The core issue survives the fresh regeneration and is now well
+  isolated**: confirmed via direct shapely inspection that the start
+  point (51.613, 3.885), end point (51.609, 3.896), and the bridge
+  opening (51.627, 3.911) are **all three inside the same connected water
+  polygon** at the source-data level (component #3, 105.7 km²) — so this
+  is not a case of the real geometry genuinely lacking a connection.
+  Despite that, and despite correct bridge tagging, the actual routed
+  path never leaves the lat 51.608–51.614 band at all — it doesn't even
+  attempt to head toward the bridge's latitude — while still zigzagging
+  finely and still crossing an 11m-clearance edge.
+- **A raw-graph bypass attempt to isolate pipeline vs. router responsibility
+  was inconclusive by design flaw, not a finding — don't repeat it.** Ran
+  a plain networkx Dijkstra directly against the exported `edges` table,
+  using naive nearest-literal-node lookup for start/end. It reported "no
+  path" from start's nearest node to the bridge — but that's not a
+  meaningful result: once a point is confirmed inside a navmesh region
+  (as start is, per earlier verification), the real engine never uses
+  "nearest literal node" to enter the graph — it enters via
+  `funnelPathFromPoint`-computed anchors. A bypass that ignores that
+  entry mechanism isn't testing the same thing the engine actually does,
+  so its "no path" result doesn't imply a real connectivity gap. Any
+  future attempt to isolate pipeline-side vs. router-side responsibility
+  needs to replicate the actual region/anchor entry logic, not substitute
+  a simpler model that happens to be wrong for this case.
+
+**Where this leaves it**: the bridge is correctly tagged, the water is
+genuinely connected in the source data, and the router still doesn't
+explore anywhere near it. That combination points at the router's
+region/anchor/candidate-selection logic (or the SSFA corner-cutting gap
+already found) rather than a pipeline data problem — but this needs
+direct instrumentation of the real engine to confirm, not more inference
+from outside it. See "Recommended next steps" below.
 
 ### What's confirmed broken (verified by actually running the scenario, not just reading code)
 
@@ -225,16 +288,14 @@ small, bounded constant regardless of coastline detail). Concretely:
 
 ### Validation
 
-1. Re-run the exact `zeelandbrug_test.ts` scenario against a freshly
-   regenerated Phase-1 database. Expect: total distance close to Phase
-   0's original result (not 4,924m for a ~900m-apart pair), no fine-grained
-   zigzag, and — **as a hypothesis to confirm, not a guarantee** — likely
-   `Through opening: true` again, since a genuine interior shortcut should
-   make the real bridge-opening route cheaper than detouring to the low
-   11m crossing. If the low-crossing warning *persists* after this fix,
-   that's evidence of a separate, second bug (possibly `_add_opening_bridge_edges`
-   failing to detect/tag the real opening bridge near this corridor) —
-   treat that as a new, separately-scoped follow-up, not part of this fix.
+1. ~~Re-run the exact `zeelandbrug_test.ts` scenario... likely `Through
+   opening: true` again...~~ **Outcome, verified**: re-run against a fresh
+   regeneration gave a real improvement (4,924m → 3,116m) but not
+   `Through opening: true` — see "Round 2 — Follow-up investigation"
+   above and "Phase 2 Hardening, Round 3" below for the corrected
+   diagnosis and concrete next steps. The bridge-tagging hypothesis this
+   item originally pointed at as the likely follow-up has been checked
+   and ruled out.
 2. **Add this exact scenario as a real automated regression test**, not
    just a manual script — the existing 35/35 passing suite did not catch
    any of this. At minimum, assert: route reaches within some tolerance
@@ -248,6 +309,139 @@ small, bounded constant regardless of coastline detail). Concretely:
    scale (the tight clip's 700+ boundary nodes, not a synthetic small
    mesh) — confirm the anchor cap actually bounds cost the way it's
    supposed to.
+
+### Phase 2 Hardening, Round 3 — Navmesh Entry/Exit Correctness (DONE)
+
+**Outcome**: the Zeelandbrug scenario now genuinely passes —
+`Through opening: true`, 5,047m (close to Phase 0's original 4,924m
+result), zero constraint warnings — verified both against a fresh
+`zeelandbrug_tight` regeneration and live against a full-scale
+`data/zeeland.sqlite` through the running plugin's HTTP API. Three
+independent, confirmed bugs were found and fixed, spanning both repos —
+the direct instrumentation approach this section originally specified
+(live logging in `astarSearch`/`seedNavmeshCandidates`, not a bypass) is
+exactly what surfaced all three:
+
+1. **`autoroute`/`navmesh.ts`: SSFA funnel algorithm had `left`/`right`
+   portal vertices swapped.** `funnel()`'s `getPortalEdge` consumption
+   built each portal as `{ left: vertices[edge.b], right: vertices[edge.a]
+   }` — backwards. Confirmed by reproducing the exact failure on a
+   synthetic diagonal-split grid (corner-to-corner straight line, tested
+   directly via `navmesh.ts`'s exported functions): the buggy algorithm
+   returned a 19-point, 36%-inflated staircase where the true taut path is
+   a straight 2-point line fully contained in the search corridor (proven
+   by inspecting the corridor's triangle chain directly — every unit
+   diagonal segment lies within one of the selected triangles, so a
+   correct funnel algorithm *must* find the straight line). Swapping to
+   `{ left: vertices[edge.a], right: vertices[edge.b] }` fixed the
+   synthetic case exactly (1572.5m funnel distance vs. 1574.3m true
+   straight-line) and cut the real Zeelandbrug funnel-prefix cost from
+   4,211m to 2,209m for the same start-to-anchor leg (straight-line is
+   2,082m) — this alone dropped the scenario's total route distance from
+   3,115m to 1,231m. This was **not** the same defect as the earlier
+   "SSFA fails to cut corners on certain corridor shapes" gap found via
+   the right-triangle-grid regression test — that one is a genuine,
+   separate, narrower funnel-tightening edge case (still covered by its
+   own test); this one was a wrong-on-every-call sign/orientation bug.
+   `test/navmesh-integration.test.ts`'s L-shaped-region fast-path test
+   had its `totalCoords > 4` assertion tightened to an exact `=== 4` (the
+   provably-minimal taut path around the region's one reflex corner) plus
+   a direct distance check against the two-segment sum — the old,
+   looser assertion had been accidentally passing *because* of the bug
+   (extra zigzag points inflated the count past its threshold either
+   way), so it wouldn't have caught a regression.
+2. **`autoroute`/`routing.ts`: `astarSearch`'s goal test ignored the
+   funnel "suffix" cost.** When a navmesh region resolves multiple
+   boundary-node candidates (`seedNavmeshCandidates`), each candidate's
+   own precomputed cost back to the literal destination point (its
+   "suffix") is real remaining cost — but the search declared victory the
+   instant it popped *any* node that was a member of `endCandidates`,
+   comparing only the graph-side cost to reach that node, never adding the
+   suffix before deciding. Confirmed via direct instrumentation
+   (temporarily watching specific node IDs through the live search): a
+   boundary node ~700m from the literal destination, reached only by
+   crossing a genuinely low fixed bridge span (soft-constraint penalized
+   at +1,000,000), got accepted as the goal while a bridge-adjacent
+   boundary node with a clean, only slightly more expensive path sat
+   unpopped in the open set. Fixed by tracking the best true total cost
+   (`graph cost + suffix`) across all candidates seen, with the search
+   only stopping once the open set's best remaining `f` (an admissible
+   lower bound) can no longer beat the best total found — the same
+   "seed multiple starts, let real cost comparison pick the cheapest"
+   design the code already used for `startCandidates`, now applied
+   symmetrically on exit. (`MinHeap` gained a `peek()` method to support
+   this.)
+3. **`signalk-router-pipeline`/pipeline: the obstacle layer hard-blocked
+   the bridge's own opening corridor.** Even with both `autoroute` fixes,
+   the route still couldn't reach the bridge at all — direct inspection
+   showed every one of the bridge's own 4 crossing edges, plus dozens of
+   navmesh boundary-ring edges leading to them, had `crosses_obstacle=1`,
+   which `routing.ts`'s `getEdgePenalty` treats as a **hard, unconditional
+   exclusion** (`-1`, never just a soft penalty) regardless of vessel
+   dimensions. Root cause: an unrestricted mariculture (marine-farm)
+   polygon's bounding box happened to overlap the entire bridge crossing
+   area. Two fixes, both in `_build_obstacle_layer`/`_edge_attr_worker`
+   (`nautical_routing_pipeline.py`):
+   - **Mariculture areas now go through the same `_is_entry_prohibited`
+     (S-57 `RESTRN=1`) filter `restricted_areas` already used** — a marine
+     farm concession is a fishing-rights designation, not automatically a
+     navigational hard-stop, exactly like a restricted area without an
+     explicit entry prohibition isn't one either. None of this dataset's
+     21 mariculture features had `RESTRN` set at all, so the obstacle
+     layer went from 24 features (21 mariculture + 3 genuine
+     obstructions) to just the 3 genuine ones.
+   - **Opening-bridge edges (`is_opening_bridge_edge=True`, from
+     `_add_opening_bridge_edges`) are now also exempt from the general
+     obstacle-intersection check**, mirroring the `crosses_land=0`
+     exemption those edges already got at creation time — they're
+     precise, deliberately-computed crossings of a bridge's actual
+     navigable opening via fairway/waterway-centerline intersection, not
+     generic geometry that a broad-brush polygon-overlap heuristic should
+     second-guess. Kept as defense-in-depth alongside the mariculture fix,
+     since a *genuinely* `RESTRN=1` obstacle elsewhere could still
+     otherwise block a real opening-bridge crossing.
+4. **`No route found` error message improved** (unrelated bug report from
+   the same session, `autoroute`/`routing.ts`): previously always blamed
+   vessel dimensions ("checking vessel dimensions draft=Xm...") regardless
+   of actual cause. `astarSearch` now tallies *why* edges were skipped
+   during the failed search (land, obstacle, draft, air draft, beam, coast
+   distance, bounding box) and reports the actual encountered causes, or
+   explicitly says "graph may be disconnected here" / "exceeded iteration
+   limit" when no constraint was ever hit at all.
+5. **`zeelandbrug_test.ts` converted into a real automated test**
+   (`test/zeelandbrug.test.ts`, wired into `npm test` and `npm run build`)
+   — asserts distance is bounded relative to straight-line, the route
+   passes through the opening's bounding box, no segment violates the
+   vessel's air draft, and no constraint warning fires. Uses a **real**
+   pipeline-generated database, not a synthetic fixture (committed at
+   `test/fixtures/zeelandbrug/netherlands.sqlite`, ~2MB, with a narrow
+   `.gitignore` exception) — deliberately, since all three bugs above only
+   ever surfaced on realistic region/boundary sizes; the existing small
+   synthetic navmesh fixtures passed throughout. All 39 tests pass.
+6. **Full-scale `data/zeeland.sqlite` regenerated** with both pipeline
+   fixes (344 components, 23 navmesh regions, 33,860 nodes, 55,139 edges)
+   and deployed to the local dev Signal K instance (europe.sqlite
+   disabled, zeeland.sqlite installed, plugin rebuilt, server restarted) —
+   confirmed loading cleanly and serving real routes via
+   `POST /signalk/v1/api/router/route`.
+
+**Still open, discovered at full-Zeeland scale, not yet investigated**:
+the same real-world Zeelandbrug is actually 4 separate charted segments —
+1 movable/opening span at `(51.62678, 3.91101)` and 3 fixed low
+(`VERCLR=11.0`) spans roughly 1.5–2km away along the same structure,
+including one much closer to this test's start point at
+`(51.6101, 3.88835)`. A tall-vessel (19.5m air draft) request from
+`(51.613, 3.885)` to `(51.609, 3.896)` against the *full* `zeeland.sqlite`
+picks the nearby low fixed span (soft-constraint warning, route stays
+within lat 51.609–51.620 and never approaches the real opening 1.5km+
+north) rather than detouring to the movable span — the same *symptom* as
+this round's bug, but not yet root-caused on the full dataset, and not
+necessarily the same defect (could be a genuine cost tradeoff where the
+detour is judged not worth it, or a residual instance of one of the
+above). The narrower `zeelandbrug_tight` clip used throughout this round
+doesn't include this second crossing at all, which is why it never
+surfaced until testing at full scale. Needs the same live-instrumentation
+treatment as this round, next session.
 
 ---
 
