@@ -19,3 +19,6 @@ data/cache/
 # OS / editor
 .DS_Store
 .vscode/
+
+# Local Claude Code settings (machine-specific, not for public distribution)
+.claude/settings.local.json
