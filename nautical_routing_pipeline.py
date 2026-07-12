@@ -362,6 +362,12 @@ class NauticalRoutingPipeline:
         self.gdfs = {}
         self.graph = nx.DiGraph()
         self.navmesh_region_rows = []
+        # Node ids build_navmesh_region flagged as touching a seam with a
+        # bordering piece (see build_navmesh_region's boundary_node_ids).
+        # Round 4 found these weren't actually prioritized by
+        # _stitch_component_pieces's sampling despite the intent documented
+        # there -- see that method's docstring for why this matters.
+        self.navmesh_seam_node_ids: set = set()
         
     def run_pipeline(self):
         self.parse_shapefiles()
@@ -943,6 +949,7 @@ class NauticalRoutingPipeline:
                 x, y = pslg["vertices"][i]
                 if (round(x, 3), round(y, 3)) in seam_coord_set:
                     boundary_node_ids.append(node_id)
+                    self.navmesh_seam_node_ids.add(node_id)
             attrs = dict(edge_type="coastal", edge_kind_id=EDGE_KIND_NAVMESH_BOUNDARY,
                          source_tier=source_tier, source_id=source_id)
             for k in range(count):
@@ -1067,6 +1074,47 @@ class NauticalRoutingPipeline:
             union(u, v)
             added += 2
             return True
+
+        # Pass 0: seam-focused k-nearest-neighbor pass, independent of Pass 1's
+        # MAX_IDS_FOR_PASS1 gate. That gate exists because materializing every
+        # coastal-node pair within snap_radius_m (tree.query_pairs()) blows up
+        # combinatorially over tens of thousands of densely-spaced nodes -- but
+        # navmesh_seam_node_ids (perimeter vertices tagged on a real
+        # narrow/wide seam, or dead-end skeleton chain nodes) is a much
+        # smaller, sparser subset, and a k-nearest-neighbor *query* (not an
+        # all-pairs-within-radius scan) costs O(log n) per point regardless of
+        # how many seam nodes exist in total, so it's safe to run unconditionally.
+        #
+        # Round 4 found this necessary: at full-country scale a single
+        # component split into thousands of initial union-find groups (e.g.
+        # 8440 for the Zeeland/Oosterschelde body -- one per navmesh region
+        # ring, per island ring, per skeleton chain), which floors Pass 2's
+        # per-group sample cap to 1 regardless of group size. A real, ~30m
+        # gap at the Zeelandbrug bridge opening sat in a 21-node group
+        # alongside other seam nodes; whichever single member Pass 2 happened
+        # to sample every round (the same one, all 30 rounds -- nothing
+        # rotates the pick) was never the right one, so the connector was
+        # never found despite being trivially within snap_radius_m. This pass
+        # sidesteps group sampling for seam nodes entirely: every seam node
+        # gets to look at its own nearest neighbors directly.
+        seam_idx_list = [i for i, n in enumerate(ids) if n in self.navmesh_seam_node_ids]
+        if len(seam_idx_list) >= 2:
+            from scipy.spatial import cKDTree
+            seam_coords = coords_m[seam_idx_list]
+            seam_tree = cKDTree(seam_coords)
+            k = min(6, len(seam_idx_list))
+            _, neighbor_local_idxs = seam_tree.query(seam_coords, k=k)
+            if k == 1:
+                neighbor_local_idxs = neighbor_local_idxs.reshape(-1, 1)
+            for local_i, neighbors in enumerate(neighbor_local_idxs):
+                gi = seam_idx_list[local_i]
+                for local_j in neighbors:
+                    if local_j == local_i:
+                        continue
+                    gj = seam_idx_list[int(local_j)]
+                    if np.linalg.norm(coords_m[gi] - coords_m[gj]) > snap_radius_m:
+                        continue
+                    try_add(gi, gj)
 
         # Pass 1: cheap radius-limited KD-tree pass, handles the common case of a
         # small local gap between two adjacent pieces. SKIPPED for large node counts:
@@ -1339,6 +1387,7 @@ class NauticalRoutingPipeline:
         self._prune_skeleton_spurs(G, cfg.min_spur_length_m)
 
         added = 0
+        node_occurrences: Dict[int, int] = {}
         for _, _, d in G.edges(data=True):
             for sub_pts, sub_widths in self._resample_long_skeleton_edges(
                     d["pts"], d["width_profile"], cfg.max_segment_m):
@@ -1348,6 +1397,8 @@ class NauticalRoutingPipeline:
                     continue
                 self._stamp_node(u, NODE_KIND_POINT, source_tier, source_id)
                 self._stamp_node(v, NODE_KIND_POINT, source_tier, source_id)
+                node_occurrences[u] = node_occurrences.get(u, 0) + 1
+                node_occurrences[v] = node_occurrences.get(v, 0) + 1
                 wp = json.dumps({"min_m": min(sub_widths), "samples_m": sub_widths})
                 attrs = dict(edge_type="coastal", edge_kind_id=EDGE_KIND_CENTERLINE,
                              width_profile=wp, min_width=min(sub_widths),
@@ -1356,6 +1407,14 @@ class NauticalRoutingPipeline:
                     self.graph.add_edge(u, v, **attrs)
                     self.graph.add_edge(v, u, **attrs)
                     added += 2
+        # Dead-end nodes of this skeleton piece (degree 1 within this piece's own
+        # chain set) are exactly where the raster medial axis terminates short of
+        # a bordering piece's boundary -- the candidates _stitch_component_pieces
+        # actually needs prioritized, same reasoning as navmesh_seam_node_ids
+        # above (see that set's comment and _stitch_component_pieces's docstring).
+        for node_id, occurrences in node_occurrences.items():
+            if occurrences == 1:
+                self.navmesh_seam_node_ids.add(node_id)
         logger.debug(f"  skeleton polygon -> {added} centerline edges (px={px:.1f}m)")
 
 

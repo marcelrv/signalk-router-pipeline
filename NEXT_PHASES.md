@@ -1,20 +1,55 @@
 # Next Phases — Navmesh-Hybrid Pipeline (Post Phase 0)
 
 Status: Phase 0 and Phase 1 (this repo, `signalk-router-pipeline`) are
-implemented, verified, and committed (`e6f1fc5`, `7e64df9`, `dee556c`).
-Phase 2 (funnel-algorithm consumption, in the separate `autoroute` repo)
-also turned out to already be implemented and committed (`bfd3560`), and
-its own "Boundary Shortcut Sparsification" hardening pass is committed too
-(`ece6278`) — real, verified improvement (4,924m → 3,116m on the
-Zeelandbrug scenario after a fresh regeneration), but **not a full fix**.
-**"Phase 2 Hardening, Round 3 — Navmesh Entry/Exit Correctness" is now
-DONE — the Zeelandbrug scenario genuinely passes (`Through opening: true`,
-5,047m, zero constraint violations)**, via three independently-confirmed
-bugs (one in `autoroute`'s SSFA funnel algorithm, one in `autoroute`'s A*
-goal test, one in this repo's obstacle layer) — see that section below for
-the full root-cause writeup and a still-open follow-up (a second,
-different Zeelandbrug span exposed only at full-Zeeland scale, not yet
-investigated).
+implemented, verified, and committed (`e6f1fc5`, `7e64df9`, `dee556c`,
+`3c108b1`). Phase 2 (funnel-algorithm consumption, in the separate
+`autoroute` repo) also turned out to already be implemented and committed
+(`bfd3560`), and its own "Boundary Shortcut Sparsification" hardening pass
+(`ece6278`) and "Round 3 — Navmesh Entry/Exit Correctness" pass
+(`2ebd29b`) are committed too. **Round 3 is independently re-verified this
+session**: rebuilt fresh, 39/39 tests pass (including the real, meaningful
+`test/zeelandbrug.test.ts` regression test against a committed real-data
+fixture — read its assertions directly, they check actual route shape and
+constraint compliance, not just "did it return something").
+
+**Two things confirmed this session, both needing a "Round 4" before
+Phase 3 or full scale-out — see "Phase 2 Hardening, Round 4" below:**
+
+1. The already-flagged full-scale bridge-avoidance issue is **real,
+   reproduced live** against the actual `data/zeeland.sqlite` (not
+   inferred) — the router still detours to a low fixed span of the same
+   physical Zeelandbrug structure instead of the ~1.5-2km-further real
+   opening, exactly as predicted, at a specific, now-identified edge.
+2. **New finding, not previously documented**: loading the full-scale
+   `data/zeeland.sqlite` (23 navmesh regions) into the routing engine
+   takes **~237 seconds**. Isolated by direct timing to graph *load*
+   specifically — the route calculation itself, once loaded, takes ~2.7s.
+   So this is a one-time startup/reload cost, not a per-request problem,
+   but a 4-minute plugin load is a real practical issue on its own,
+   especially since it will only grow as this scales to all of NL and
+   beyond per the roadmap.
+
+**"Phase 2 Hardening, Round 5" added — a real user bug report
+(screenshot of a bad live route) plus direct visual inspection of the
+debug graph-edges overlay, both investigated and reproduced this
+session.** Highlights: (a) an **uncommitted, in-progress fix already
+sitting in `autoroute`'s working tree** (not made this session) genuinely
+cuts load time 237s→75s (verified) but does **not** fix route quality —
+commit it, it's good, but keep debugging §4.1/§5.2; (b) the reported bad
+route (a ~5-6km unnecessary detour through Krabbenkreek/Keeten instead of
+a direct Oosterschelde crossing) is reproduced and is a bigger, clearer
+manifestation of the same still-open bridge-avoidance-class defect; (c)
+"edges crossing land" — confirmed the debug view's API genuinely omits
+`path_points` (so it can only ever draw straight chords), but **whether
+the actual returned route geometry is affected is still unverified — user
+correctly pushed back on treating this as resolved, see §5.3, do not
+downgrade this**; (d) small non-navigable retention basins
+are confirmed absurdly over-tessellated (up to 1,760 vertices for a
+34,000 m² pond) and are a real, comparatively cheap-to-fix contributor to
+both load time and visual clutter; (e) a good new architectural idea —
+deriving skeleton/lane nodes from real buoy/beacon positions instead of
+raw coastline vertices — is scoped as a future design item. See "Phase 2
+Hardening, Round 5" for details and concrete next steps on all five.
 
 **`data/zeeland.sqlite` has been regenerated with the current (Phase 1)
 pipeline** — the copy that had been sitting in `data/` was stale, still
@@ -425,23 +460,402 @@ exactly what surfaced all three:
    confirmed loading cleanly and serving real routes via
    `POST /signalk/v1/api/router/route`.
 
-**Still open, discovered at full-Zeeland scale, not yet investigated**:
-the same real-world Zeelandbrug is actually 4 separate charted segments —
-1 movable/opening span at `(51.62678, 3.91101)` and 3 fixed low
-(`VERCLR=11.0`) spans roughly 1.5–2km away along the same structure,
-including one much closer to this test's start point at
-`(51.6101, 3.88835)`. A tall-vessel (19.5m air draft) request from
-`(51.613, 3.885)` to `(51.609, 3.896)` against the *full* `zeeland.sqlite`
-picks the nearby low fixed span (soft-constraint warning, route stays
-within lat 51.609–51.620 and never approaches the real opening 1.5km+
-north) rather than detouring to the movable span — the same *symptom* as
-this round's bug, but not yet root-caused on the full dataset, and not
-necessarily the same defect (could be a genuine cost tradeoff where the
-detour is judged not worth it, or a residual instance of one of the
-above). The narrower `zeelandbrug_tight` clip used throughout this round
-doesn't include this second crossing at all, which is why it never
-surfaced until testing at full scale. Needs the same live-instrumentation
-treatment as this round, next session.
+### Phase 2 Hardening, Round 4 — Full-Scale Correctness & Load Performance (DONE)
+
+**Outcome**: both 4.1 and 4.2 fixed and independently re-verified this
+session — full-scale `loadGraph()` down from ~237s to ~76s (3.1x), and the
+Zeelandbrug scenario now genuinely passes at full scale (`Through opening:
+true`, 4,962m, zero warnings), matching Round 3's small-fixture result.
+Verified three ways: the `autoroute` test suite (39/39), a direct script
+against the regenerated `data/zeeland.sqlite` via `RoutingDatabase`/
+`RoutingEngine`, and live through the running plugin's HTTP API
+(`POST /signalk/v1/api/router/route`, 1.3s response, deployed via
+`deploy.sh`). Did 4.2 first as originally suggested, then 4.1.
+
+**4.2 fix** (`autoroute`, `src/navmesh.ts` + `src/database.ts`): profiling
+(`console.time` around `precomputeFunnelEdges`'s two sub-phases) found the
+doc's own original lead wrong — `upgradeRingBoundaryEdges` was never the
+problem (120ms total). The real cost was `addAnchorShortcutEdges`, almost
+entirely from one ~5,000-boundary-node region (189s of the ~237s total),
+split roughly evenly between the anchor-anchor and boundary-to-anchor
+sub-loops. Two independent, correctness-preserving fixes, not a cap or a
+truncation:
+1. **`corridorSearch` was a plain Dijkstra; made it A\*.** Added a
+   straight-line-distance-to-nearest-end-candidate heuristic. Since edge
+   weights are haversine distances between triangle centroids (a metric
+   satisfying the triangle inequality), the heuristic is admissible and
+   consistent, so results are provably identical to the old Dijkstra's —
+   pure speedup. Cut the total to ~140s.
+2. **Boundary-to-nearest-anchor selection was picking anchors by ring
+   arc-index distance, not real geometric distance** — a poor proxy on
+   Zeeland's convoluted coastline that both chose lower-quality anchors and
+   made their corridor searches needlessly expensive (a genuinely distant
+   target visits far more of the triangle mesh). Switched to real haversine
+   distance (40 cheap comparisons per node, negligible next to the corridor
+   search it feeds). Cut the total further to ~76s.
+
+**4.1 fix** (this repo, `nautical_routing_pipeline.py`, `_stitch_component_pieces`
++ `build_navmesh_region` + `build_skeleton_network`): live-instrumented
+`astarSearch` (temporary logging, reverted after use — same method that
+found all three Round 3 bugs) and found the search actually got within
+34m of the real opening, at a cheap cost, but the boundary node it reached
+had **zero edges** leading any further toward the bridge — confirmed via
+direct SQL that the region on the *far* side of that 34m gap (containing
+the bridge's own skeleton nodes) was correctly stitched, but this region's
+own near-side node wasn't, despite the pipeline correctly flagging it as a
+seam node in `boundary_node_ids`. Root cause, confirmed by adding temporary
+`[DEBUG]` logging inside `_stitch_component_pieces` and rerunning the full
+pipeline: at full-country scale, the giant Zeeland/Oosterschelde water
+body's initial union-find state has thousands of separate groups (8,440 —
+one per navmesh region ring, per island ring, per skeleton chain) before
+any stitching runs. `MAX_TOTAL_SAMPLES // len(groups)` floors to exactly 1
+sample per group, and — critically — **nothing rotates which single member
+gets sampled across rounds**, so a 21-member group containing our target
+node kept offering the *same* (wrong) representative for all 30 rounds.
+The overall union-find *did* eventually converge to one component (so no
+"components left unmerged" warning fired for this one), but only via some
+other, unrelated node in that 21-member group connecting out through a
+distant detour — never via our target's own trivial ~34m connector. This
+reframed the bug: it was never really "disconnected" at the coarse
+union-find level, just missing the *specific, cheap* edge a real route
+needed, while the router correctly found the only path that did exist (via
+the low fixed span).
+
+Fix: a new **Pass 0** in `_stitch_component_pieces`, run before the
+existing radius/sampling passes — a k-nearest-neighbor `cKDTree` query
+restricted to `navmesh_seam_node_ids` (a new tracked set: navmesh perimeter
+vertices already flagged as seam-adjacent in `build_navmesh_region`, plus
+skeleton dead-end nodes now similarly flagged in `build_skeleton_network`).
+This sidesteps group-sampling entirely — every seam node gets to examine
+its own nearest few neighbors directly, an O(log n) KD-tree query
+regardless of how many seam nodes exist in total (unlike the existing
+`MAX_IDS_FOR_PASS1`-gated all-pairs-within-radius pass, which is skipped at
+this scale specifically because materializing every candidate pair is what
+caused the original 15GB OOM this cap protects against). Verified this
+doesn't just paper over the one test case: raw-SQLite connectivity metrics
+(a standalone BFS over nodes/edges, independent of the fix) improved
+slightly overall — largest connected component 15.93% of nodes vs 13.86%
+before, fewer isolated fragments (5,368 vs 5,390) — and node/edge counts
+moved by a sane, small amount (+98 nodes, +1,072 edges from the added
+stitching connectors), not a structural change. `data/zeeland.sqlite`
+regenerated: 33,895 nodes, 56,211 edges, 23 navmesh regions,
+3,016 stitching edges added (vs the pre-fix run's 2,034).
+
+One dead end worth recording so it isn't retried: an earlier attempt at
+this same fix tried to prioritize seam nodes *within* the existing
+per-group sampling loop (still capped at 1 sample/group). That regenerated
+database was byte-identical at the specific gap — the cap itself, not the
+selection-within-a-group, was the actual bottleneck, which only a
+sampling-independent pass (this one) could fix.
+
+Both items below are the original investigation notes from earlier in the
+session, kept for the reasoning trail; see the outcome above for what was
+actually found and fixed.
+
+Both items below were **reproduced live this session** against the actual
+`data/zeeland.sqlite` (regenerated fresh, stats verified: 33,860 nodes,
+55,139 edges, 23 navmesh regions) through the real `RoutingDatabase`/
+`RoutingEngine` classes — not inferred from logs.
+
+#### 4.1 Bridge-avoidance regression persists at full scale (confirmed, root cause not yet found)
+
+Same request as the now-passing `test/zeelandbrug.test.ts` fixture
+(`51.613,3.885` → `51.609,3.896`, draft 2.0m/beam 5.0m/airDraft 19.5m),
+run against the full-scale database instead of the small
+`zeelandbrug_tight` fixture: **still fails**. `Through real opening: false`,
+route confined to lat 51.609–51.620 (never reaches the real opening at
+51.627), and the same class of warning fires:
+```
+via_constrained: Route to destination: constrained for 1 leg(s) 0.0Nm
+  — air draft 11.0m < required 21m
+  (from 51.61364,3.89309 to 51.61352,3.89318)
+```
+Traced this specific edge: it's a genuine, correctly-computed base pipeline
+edge (`max_air_draft=11.0`, confirmed via direct SQL — not a synthetic
+anchor/shortcut edge with a missing or wrong attribute) belonging to the
+Zeelandbrug's `CATBRG=1` fixed span (source feature index 97 in
+`bridges_polygons.geojson`, `OBJNAM="Zeelandbrug, N256"`) — a single
+polygon feature spanning enough length that this crossing point, ~500m
+from that feature's centroid, is still part of the same physical fixed
+span the earlier "still open" note flagged. **Not a newly-discovered
+fifth crossing** — same structure, confirmed.
+
+Given Round 3 already fixed the SSFA sign bug, the A* goal-test suffix
+bug, and the obstacle-layer false block, and this exact symptom persists
+at larger scale, the most likely explanation is a **new, scale-dependent
+issue distinct from all three Round 3 fixes** — plausible candidates,
+in the order to check them:
+
+1. **Region/anchor reachability at longer range.** The real opening is
+   ~1.5-2km from start, likely requiring the route to cross through more
+   intermediate navmesh regions/skeleton stretches than the short
+   `zeelandbrug_tight` scenario ever exercised. Check whether the anchor
+   graph actually offers a connected, reasonably-costed path spanning
+   that many region-crossings, or whether reachability degrades over
+   multiple hops.
+2. **Cost-domain sanity check.** The `+1,000,000` soft penalty
+   (`getEdgePenalty`, `routing.ts:1474`) should trivially dominate any
+   real few-km detour — confirm this is actually true in practice (log
+   the winning path's total cost vs. what a path through the real
+   opening would cost, using the same live-instrumentation technique
+   that worked for Round 3, not a bypass). If the real-opening path's
+   cost is somehow *also* very high, that's the actual lead, not the
+   penalty math.
+3. Re-apply the exact Round 3 method (temporary logging directly in
+   `astarSearch`/`seedNavmeshCandidates`, reverted after use) — it
+   correctly surfaced all three prior bugs and is the proven approach
+   here, not more inference from outside the engine.
+
+#### 4.2 New finding: full-scale graph load takes ~237 seconds (one-time, not per-request)
+
+Timed `loadGraph()` and `calculateRoute()` separately against
+`data/zeeland.sqlite`: **`loadGraph()` took ~237s**; the subsequent
+`calculateRoute()` call took ~2.7s. This means it's a load-time cost
+(paid once at plugin startup, or on hot-reload after downloading a new
+region database per AGENTS.md's "hot-reload for routing engine" feature)
+— not something a user experiences per route request — but still a real
+problem: a ~4-minute load for one modest region is a genuine deployment
+concern, and it will only get worse scaling to all of NL/Europe per the
+roadmap.
+
+**Where to look first**: `database.ts`'s `precomputeFunnelEdges` (called
+once from `loadGraph`) runs two sub-phases per region —
+`upgradeRingBoundaryEdges` and `addAnchorShortcutEdges`. The Round 1
+anchor-sparsification fix bounded the *anchor-pair* cost
+(`maxAnchors² = 1,600` funnel calls per region, worst case), but
+**`upgradeRingBoundaryEdges` calls `Navmesh.funnelBetweenNodes` once per
+boundary node's ring-adjacent neighbors — that's `O(total boundary nodes
+across all regions)`, which was never bounded by the anchor fix and
+scales with real coastline complexity** (potentially tens of thousands
+across 23 regions, each call doing a Dijkstra corridor search + SSFA).
+This is a strong, concrete lead, not yet confirmed as *the* dominant
+cost — first step is to time the two sub-phases separately (a temporary
+`console.time`/`console.timeEnd` around each call in
+`precomputeFunnelEdges`, reverted after use, same discipline as Round
+3's diagnostic logging) to confirm which one actually dominates before
+designing a fix. Plausible fixes once confirmed: most ring-adjacent
+pairs are geometrically very close together, so their funnel path is
+almost certainly a trivial single- or two-triangle corridor — consider
+skipping the funnel computation entirely for ring-adjacent pairs below
+some small distance threshold (keep the existing straight-line distance,
+which is already accurate at that scale) rather than computing a full
+corridor search + SSFA for a pair that's obviously not going to benefit
+from it.
+
+#### 4.3 Suggested order
+
+Do 4.2 first — it's better-isolated (a clean, reproducible timing split)
+and a fix there won't be entangled with 4.1's routing-logic investigation.
+Then 4.1, using the proven live-instrumentation method. Re-run the full
+39-test suite plus a manual full-scale check after each fix; consider
+adding a *second* automated regression fixture at full-Zeeland scale
+(not just `zeelandbrug_tight`) once 4.1 is resolved, since that's exactly
+the scale gap that let this round's issues hide from the existing test.
+
+**Followed as suggested — see the "Outcome" note at the top of this Round
+4 section for what was actually found and fixed.** The full-Zeeland-scale
+regression fixture suggested above is still **not** done — a real gap,
+since this is exactly the scale that hid both of this round's bugs from
+the existing `zeelandbrug_tight`-based test. Committing a ~24MB full-scale
+`.sqlite` fixture (vs the current ~2MB tight-clip one) is a real cost;
+worth deciding deliberately rather than defaulting either way.
+
+### Phase 2 Hardening, Round 5 — Real-world bug report + two new findings
+
+Triggered by a live user report (screenshot of a genuinely bad route in
+the deployed webapp UI, start `51.6889,4.2124` near Oude-Tonge to
+`51.6306,3.8026` near Zierikzee) plus direct visual inspection of the
+graph-edges debug overlay. Reproduced exactly (see below) and
+investigated this session — this supersedes some of §4.2's guesses with
+real measurements.
+
+#### 5.1 Correction to §4.2's profiling guess — and a WIP fix already in progress, not yet committed
+
+**§4.2 guessed `upgradeRingBoundaryEdges` was the dominant load-time
+cost. Direct timing (this session, before finding the WIP fix below)
+showed that guess was wrong**: `upgradeRingBoundaryEdges` took ~131ms
+total across all 23 regions; `addAnchorShortcutEdges` took **4:27
+(267s)** — essentially the entire load time — dominated by a handful of
+outlier regions (one with 4,999 boundary nodes alone cost ~198s: 52s
+anchor-anchor + 146s boundary-to-anchor).
+
+**Found, while investigating, `src/database.ts` and `src/navmesh.ts`
+already had real but uncommitted changes in the working tree** (not made
+by this session, presumably in-progress work from elsewhere) that
+directly target this, citing this exact session's measurements in their
+own comments:
+- `corridorSearch` (`navmesh.ts`) converted from plain Dijkstra to A*
+  with an admissible straight-line-to-nearest-end-candidate heuristic
+  (provably identical results, since triangle-centroid haversine
+  distances satisfy the triangle inequality — a pure speedup).
+- `addAnchorShortcutEdges` (`database.ts`) changed from picking each
+  boundary node's "nearest" anchor by ring arc-index to real haversine
+  distance — arc-adjacent isn't geometrically close on a convoluted
+  coastline, so the old method was both picking worse anchors *and*
+  making the corridor search for a genuinely distant, wrong target more
+  expensive.
+
+**Verified this session**: rebuilt with these changes in place, 39/39
+tests still pass, and full-scale `loadGraph()` dropped from **237s to
+75s** (3.15x). Real, substantial, and safe to build on — **but not yet
+committed as of this session; commit it** (with its own test/verification
+pass) before continuing, so it isn't sitting only in an editor's working
+tree.
+
+**Important: this WIP fix improves load time only, not route quality.**
+Re-ran the exact reported bad route after rebuilding with it — identical
+result (36,946m, same warnings, same southern detour). The routing-choice
+defect below is a separate, still-unfixed problem.
+
+#### 5.2 Reproduced: the reported bad route (still broken)
+
+`51.6889,4.2124` → `51.6306,3.8026`, draft 2.0m/beam 6.0m/airDraft 17.0m,
+against the full `data/zeeland.sqlite`: **36,946m** (matches the UI's
+displayed 19.9nmi exactly), confirmed via full coordinate dump to dip
+from the start (lat 51.689) down to **lat 51.609** — a genuine ~5-6km
+detour south through Keeten/Krabbenkreek — before returning north to the
+lat-51.631 destination. A direct crossing of the main Oosterschelde basin
+(wide open water, per the zoomed-out map) is visibly available and not
+used. This is very likely the same root-cause class as §4.1 (missing
+interior navmesh shortcuts forcing a walk along boundary rings/narrow
+channels instead of a clean cross-region path), now shown to be far more
+consequential at full scale than the narrow Zeelandbrug corridor alone
+suggested — **do §4.1's investigation on this scenario, not only the
+Zeelandbrug one**, since it's a larger, clearer manifestation of the same
+class of bug.
+
+The `via_constrained` warning text is misleading and worth fixing
+separately: it reports "depth 0.0m < required 2.3m" but the actual
+per-segment dump shows no segment with `minDepth` below 1.0m along this
+route (18 segments in the 1.0-2.5m range, clustered right at departure —
+likely a genuinely shallow, unavoidable approach channel near the start
+point, not a routing defect) — plus **one** separate segment at
+`(51.61364,3.89309)→(51.61352,3.89318)` with `maxAirDraft=11`, which is
+the *exact same* Zeelandbrug low fixed span from §4.1/Round 3. The
+warning-aggregation logic in `routing.ts` is combining a depth-constraint
+group and an air-draft-constraint group into one message and reporting a
+value ("0.0m") that doesn't match any real constrained segment found —
+worth a small separate fix so warnings are trustworthy for diagnosis, but
+not the cause of the bad route itself.
+
+#### 5.3 Answering the two direct questions asked
+
+**"Do edges cross land a lot — is that as designed?" — genuinely unclear,
+flagged by the user as likely bigger than a rendering nitpick, and they're
+right to push back. Do not treat this as resolved.**
+
+What's actually confirmed, not guessed: sampled 3,000 real edges from
+`zeeland.sqlite` in the affected bounding box and tested each against the
+real land polygons — only 5 (0.17%) genuinely cross land, all
+`edge_kind_id=0` (skeleton, the one category never claimed to be
+land-safe *by construction*). And separately, **confirmed by reading the
+code, not inferring**: `RoutingDatabase.getEdgesInBBox` (`database.ts:826`)
+and the `/signalk/v1/api/router/graph/edges` endpoint (`api.ts:509`) that
+feeds the webapp's "Graph edges" debug view only return
+`source_lat/source_lon/target_lat/target_lon` — **`path_points` is not
+in that API's response shape at all**, so the debug view is structurally
+incapable of drawing a curved path even for an edge that has one
+internally. That much is fact, and it does mean every edge in that view —
+including long anchor-shortcut edges, which are *deliberately* between
+far-apart points (farthest-point sampling) — renders as a straight chord,
+which explains why a fan of lines can visually span kilometers of real
+farmland (screenshot: the Sint-Annaland/Sint-Philipsland peninsula) rather
+than just skirting a single headland.
+
+**What is NOT yet verified, and shouldn't have been asserted as
+confidently as it was**: whether the *actual returned route* — not the
+debug view — correctly follows an edge's curved `path_points` whenever
+one of these long shortcut edges is used, everywhere it can be used
+(`buildRouteResult`/`buildSubSegments` are known to consume `path_points`
+where present, per earlier verification, but that verification predates
+this specific class of long, land-spanning anchor shortcuts and the
+concurrent WIP changes to `database.ts`/`navmesh.ts` found this session —
+it hasn't been re-checked against *this* evidence). **Concrete next
+step, priority, before assuming this is "just" a display issue**: take a
+real route request that is known to traverse one of these long
+fan-pattern anchor-shortcut edges (the reported bug's route is a good
+candidate — check which specific edges its 161 segments actually used),
+and confirm its *rendered, returned* polyline follows water the whole
+way, not a straight chord over the peninsula. If it does, then this really
+is display-only and the fix is extending the API/frontend to carry and
+draw `path_points` (below). If any real returned route geometry cuts
+across land, that's a distinct, more serious bug in how a shortcut edge's
+path gets threaded through — most likely a specific code path that reads
+`edge.distance`/`edge.lat`/`edge.lon` without also reading `path_points`
+for this edge type, not caught by existing tests since they don't
+exercise a full-scale mesh with far-apart anchors.
+
+**Fix for the confirmed part regardless**: extend `getEdgesInBBox`'s
+returned shape and the `/graph/edges` endpoint to include `path_points`
+when present, and make the webapp's debug overlay draw it instead of a
+straight chord. Do this either way — even if real routing is proven
+correct, the debug view giving a false impression of gross land-crossing
+is itself worth fixing since it's exactly what a user (or a future
+debugging session) will look at first.
+
+**"The shallowness warning is probably the chosen path, not a lack of
+deep water" — confirmed, partially.** As above: most of the flagged
+"shallow" segments are a real, likely-unavoidable shallow patch right at
+departure, not a symptom of poor path choice. But the air-draft warning
+*is* exactly the already-known low-bridge-avoidance defect (§4.1) — a bad
+path choice forcing a crossing that a better route (through the real
+opening, or simply not needing to come anywhere near that bridge on a
+direct Oosterschelde crossing) would avoid entirely.
+
+#### 5.4 New, confirmed: small non-navigable basins are absurdly over-tessellated, and are a real contributor to load cost
+
+Direct observation from the debug overlay (screenshot: two near-circular
+solid-green regions with dense red boundary rings, near the Philipsdam
+between Hoogbekken and Laagbekken) prompted a direct check — **confirmed,
+with real numbers**: these basins' source polygons carry **566 to 1,760
+vertices** for physical areas as small as **34,000 m²** (roughly 185m
+across) up to 236,000 m² (roughly 490m across). That's a raw, unsimplified
+survey-grade vertex density wildly disproportionate to a feature this
+small, and very likely explains why specific individual regions (the
+4,999- and 2,877-boundary-node outliers that dominated §5.1's timing
+breakdown) were so expensive relative to their real navigational
+importance. These are Delta Works water-management retention/storage
+basins (part of the Philipsdam/Grevelingen system), almost certainly not
+realistically navigable or relevant to a routed vessel at all.
+
+**Recommended fix, likely cheaper and more impactful than deeper
+algorithmic tuning**: before classification/triangulation, either (a)
+exclude small enclosed water bodies that have no connection to the wider
+navigable network above some minimum width/area threshold (a "is this
+reachable-by-boat-at-all" filter, not just a size filter, since some
+small-but-genuinely-navigable marina basins should stay), or (b) apply a
+much more aggressive `simplify()` tolerance scaled to the polygon's own
+vertex-density-per-area *before* it ever reaches `_split_wide_narrow`/
+`_polygon_to_pslg`, rather than only reactively simplifying when the PSLG
+budget cap is exceeded (`NAVMESH_PSLG_BUDGET`, `build_navmesh_region`).
+Either fix reduces both load time and rendered visual clutter (the user's
+"way too many edges" observation) directly, and is likely faster to land
+than §5.5 below.
+
+#### 5.5 New architectural idea from this session, worth a real design pass (not urgent, but valuable): node placement from buoys/beacons, not raw coastline vertices
+
+Direct, good observation: instead of deriving skeleton/navmesh node
+positions purely from the (often needlessly detailed) coastline polygon
+boundary, detect real navigation aids — buoys and beacons — and prefer
+*those* positions as skeleton centerline vertices and lane-edge anchors
+where they exist along a channel. This is a natural extension of the
+architecture's own original vision (README's "paired lane edges follow
+IALA buoyage") that was never actually wired up to a real buoy data
+source: **the pipeline currently ingests no buoy/beacon layer at all** —
+its input set is `land, coastal_water, inland_waterways, depth_areas,
+bridges, locks, fairways, pois, restricted_areas, obstructions, hulks,
+mariculture, caution_areas` — no S-57 `BOYLAT`/`BOYSPP`/`BCNLAT`/etc.
+Two real benefits if implemented: (1) fewer, better-placed nodes along
+buoyed channels (a real navigational reference beats an arbitrary
+coastline-derived vertex), and (2) a natural, principled way to decide
+*where* a channel needs a node at all — a stretch with no buoys and wide,
+even depth needs far fewer nodes than one with a marked, winding fairway.
+Scope this as its own future phase (data ingestion + a "prefer buoy
+positions when building skeleton/lane geometry, fall back to today's
+raster/medial-axis method where no buoy data exists" design) rather than
+folding it into Round 4/5's bug-fixing work — it's a genuine improvement,
+not a fix for something broken, and deserves its own focused design
+session with the same rigor as Phase 1's original plan.
 
 ---
 
