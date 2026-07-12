@@ -1,15 +1,255 @@
 # Next Phases — Navmesh-Hybrid Pipeline (Post Phase 0)
 
-Status: Phase 0 (schema migration, skeleton centerline extraction, bridge
-attachment, provenance stamping) is implemented and committed (`e6f1fc5`).
-Phase 1 (below) has since been **implemented and verified this session**
-— see "Phase 1 — Implementation Verification & Memory-Safety Hardening"
-for what was checked and what's solid. The two remaining scaling risks
-flagged there (unbounded PSLG size, whole-dataset connectivity buffer)
-have since also been closed out (see that section's updates) and the
-Zeelandbrug pilot re-verified end-to-end after the fix. Ready to commit
-and move on to Phase 2 (separate repo) or scale-out to the full Zeeland
-clip.
+Status: Phase 0 and Phase 1 (this repo, `signalk-router-pipeline`) are
+implemented, verified, and committed (`e6f1fc5`, `7e64df9`). Phase 2
+(funnel-algorithm consumption, in the separate `autoroute` repo) also
+turned out to already be implemented and committed (`aabc5db`). **The
+"Phase 2 Hardening — Boundary Shortcut Sparsification" fix below is now
+implemented in `autoroute`** (`selectAnchors`/anchor shortcuts in
+`navmesh.ts`/`database.ts`, composed non-live seeding in `routing.ts`,
+regression tests in `test/navmesh-integration.test.ts`) — see its own
+"Implementation status" subsection for what was verified and what remains
+genuinely open.
+
+**`data/zeeland.sqlite` has been regenerated with the current (Phase 1)
+pipeline** — the copy that had been sitting in `data/` was stale, still
+`metadata.architecture = "navmesh-hybrid-phase0"` with zero
+`navmesh_regions` rows (predates even Phase 0's real triangulation; backed
+up as `data/zeeland_phase0_stale.sqlite.bak`). Regenerating it at full
+scale (not just the `zeelandbrug_tight` clip) surfaced a real,
+previously-unexercised performance bug, now fixed — see
+`_stitch_component_pieces`'s new `MAX_EVALUATIONS_PER_ROUND` cap:
+
+- **Symptom**: the full run hung for 1h45m+ with no forward progress,
+  confirmed (via `ps`/CPU-time inspection; `py-spy` wasn't permitted to
+  attach) stuck in `_ensure_coastal_connectivity` → `_stitch_component_pieces`,
+  before `calculate_edge_attributes` had even spawned its multiprocessing
+  workers.
+- **Root cause**: `MAX_TOTAL_SAMPLES`/`MAX_ROUNDS` (the memory-safety caps
+  from the previous session, still correct and unchanged) bound the
+  distance-*matrix* size per round, but not the number of *pairs walked
+  off it*. A component fragmented into many small groups (per_group_cap
+  near 1) makes nearly every one of up to `MAX_TOTAL_SAMPLES**2/2` sorted
+  pairs still cross-group, each falling through to `try_add`'s expensive
+  `within(poly_m)` + `_crosses_land` shapely checks — unbounded in count,
+  regardless of dataset size. One real full-Zeeland component apparently
+  had thousands of sub-pieces (a "7401 components left unmerged" warning
+  surfaced post-fix, for context).
+- **Fix**: `MAX_EVALUATIONS_PER_ROUND = 20000` caps the number of pairs
+  actually passed to `try_add` per round, same "bound cost by a fixed
+  constant regardless of dataset size" idea as the existing caps, applied
+  one level down. Also added periodic `component N/M` progress logging in
+  `_ensure_coastal_connectivity` so a genuinely slow run is now visible
+  instead of silent.
+- **Result**: full Zeeland pipeline run (344 components, 23 navmesh
+  regions) now completes in ~6.5 minutes end-to-end. New `zeeland.sqlite`:
+  `architecture=navmesh-hybrid-phase1`, 33,797 nodes (down from the stale
+  file's 85,023 — expected, interior navmesh vertices no longer become
+  literal graph nodes), `edge_kind_id` 0 (skeleton): 25,297, 1 (navmesh
+  boundary): 29,678, `navmesh_regions`: 23 rows.
+
+## Phase 2 Hardening — Boundary Shortcut Sparsification (URGENT — do this first)
+
+### Implementation status (this session)
+
+Implemented in `autoroute` per the design below, with one deliberate
+correction to step 3 (details there): `selectAnchors` (farthest-point
+sampling, `navmesh.ts`), `precomputeFunnelEdges` rewritten to drop the
+150-node cap and add anchor-anchor + nearest-anchor shortcut edges
+(`database.ts`), and `astarSearch`'s live per-point seeding restricted to
+anchors (`routing.ts`). All 38 tests pass (35 pre-existing + 3 new in
+`test/navmesh-integration.test.ts`'s `navmesh boundary-shortcut
+sparsification (regression)` suite, using a synthetic 160-boundary-node
+grid fixture — past the old cap — asserting: no precompute-cap warning
+fires, anchor count stays bounded, and a direct single-hop edge now
+exists between two boundary nodes on opposite sides of the region instead
+of forcing a ~80-edge ring walk).
+
+**Real-scenario re-validation** (`zeelandbrug_test.ts` against
+`zeelandbrug_tight_phase1.sqlite`, same scenario as the original bug
+report): distance improved from 4924m to 4808m — real but modest,
+**not** the "close to Phase 0's original result, no zigzag" outcome
+originally hoped for. Root-caused via careful A/B testing (temporarily
+disabling pieces of the fix and diffing `precomputeFunnelEdges`'s output
+edge-by-edge):
+
+- **Naively restricting the live-seeding *candidate set* to just anchors
+  (not only the number of live calls) breaks A* admissibility.** The
+  search heuristic (`h`) treats every candidate boundary node as if
+  finishing from it costs only straight-line distance to the literal
+  point — but reaching a candidate isn't actually "done": it still needs
+  its funnel-computed suffix/prefix hop, whose true cost isn't folded
+  into `h`. With all ~700+ boundary nodes as candidates this rarely
+  matters (any one of them is usually close to the literal point anyway).
+  Restrict to ~40 sparse anchors and it can matter a lot: A* can settle on
+  an anchor that's cheap to reach through the main graph but geometrically
+  far from the literal point, with a large, unaccounted-for last-mile hop.
+  **Fix applied**: keep every boundary node a valid candidate (preserving
+  the original goal-test granularity) but compute its cost by composing a
+  live anchor result with a precomputed anchor↔node shortcut edge
+  (`RoutingEngine.seedNavmeshCandidates`, `routing.ts`) instead of a live
+  `funnelPathFromPoint` call per node — this is what actually delivers the
+  "695+713 uncached live calls → ~40" performance fix from the design
+  below without the correctness regression.
+- **A second, separate, and still-open issue**: even after the above fix,
+  `Through opening: false` persists with the same real air-draft
+  constraint warning (`11.0m < required 21m`) as the original bug report.
+  This matches the risk this document already flagged: possible
+  `_add_opening_bridge_edges` bridge-tagging failure in the pipeline (this
+  repo). A second contributing factor was also found and is **not** a
+  pipeline bug: a synthetic stress-test fixture (regular right-triangle
+  grid, `test/navmesh-integration.test.ts`) showed `navmesh.ts`'s
+  Simple-Stupid-Funnel-Algorithm implementation can fail to "cut corners"
+  on certain corridor shapes, degenerating to keeping every portal vertex
+  (see that test's comments) — while real Zeeland `triangle`-library
+  output was spot-checked separately (2,852 anchor-shortcut pairs, ratio
+  of funnel distance to straight-line ~1.0 for all but 34, and those only
+  marginally off) and does **not** show this pathology, so it's a latent
+  corridor-search/funnel edge case, not the dominant cause of the
+  remaining Zeelandbrug gap. **Neither of these is fixed by this
+  session's change** — both are new, separately-scoped follow-ups, not
+  part of the boundary-shortcut-sparsification fix itself.
+
+### What's confirmed broken (verified by actually running the scenario, not just reading code)
+
+Built `autoroute`, ran the full automated suite (35/35 pass, including
+dedicated `navmesh.test.ts`/`navmesh-integration.test.ts`), then ran the
+real `zeelandbrug_test.ts` scenario against a genuine Phase-1-generated
+database (`zeelandbrug_tight_phase1.sqlite`, staged at
+`/tmp/test_route/netherlands.sqlite`). Passing unit tests did **not**
+catch this — it only surfaces on a real generated database with realistic
+region sizes, which is exactly why this needs to become a permanent
+regression test (see below), not just something to re-run manually once.
+
+- **`Through opening: false`** — the route no longer passes through the
+  bridge opening at all, a regression from Phase 0's own test result for
+  the identical start/end coordinates.
+- **Route length 4,924m for two points ≈900m apart straight-line** (a
+  5.5× inflation), with visible zigzag: first ~80 segments are tiny
+  (1–3m) jittery back-and-forth steps, then a stretch of much coarser,
+  seemingly directionless jumps.
+- **A real constraint warning fired**: `air draft 11.0m < required 21m`
+  — the route was forced through an edge `getEdgePenalty` (routing.ts:1474)
+  penalizes at `+1,000,000` (a very strong soft constraint, not a hard
+  `-1` reject like land-crossing) — meaning A* found *no cheaper
+  alternative* anywhere, which is itself a symptom of the same
+  connectivity problem, not a separate bug. (Confirmed via `run_pipeline`'s
+  stage order, `nautical_routing_pipeline.py:357-369`: connectivity
+  stitching runs *before* `calculate_edge_attributes`, so this is a real
+  computed attribute on a real edge, not a stitched edge missing its
+  attributes — it's a legitimate low structure the router settled for
+  because it couldn't cheaply reach the real opening bridge.)
+- Console confirms why: `navmesh region 1: 731 boundary nodes exceeds
+  precompute cap (150) — leaving straight-line fallback edges in place`
+  (twice — both of this test's two adjacent regions, 731 and 714 boundary
+  nodes, exceed the cap; the "region 1" label is just `metadata.region_id`,
+  shared by all regions in one file, not a distinguishing per-region id —
+  harmless log confusion, not a separate bug).
+- Diagnostic instrumentation (added temporarily, reverted, not committed)
+  confirmed: 695/713 candidates seeded live for this one request, zero
+  overlap between start's and end's boundary-node sets (ruling out a
+  simpler shared-seam-node explanation).
+
+### Root cause
+
+`database.ts`'s `precomputeFunnelEdges` (`:358-398`) was designed around
+an assumption from an earlier draft of this plan — a small, k-NN-clustered
+boundary-node set "one small cluster per seam" — that the pipeline
+**deliberately abandoned** (its own `build_navmesh_region` docstring
+explains why: k-NN chords cut across peninsulas on non-convex regions, so
+every perimeter vertex is connected in ring order instead). Real regions
+therefore have hundreds of boundary nodes **by design**, not as an edge
+case — this small test already has 731 and 714. Two consequences, not one:
+
+1. **The 150 cap skips precompute entirely** for realistically-sized
+   regions, per the warning above.
+2. **Even without the cap, `precomputeFunnelEdges` only ever upgrades
+   *existing* `edge_kind_id=1` edges** — and the pipeline only creates
+   those between *ring-adjacent* perimeter vertices. It never had a
+   mechanism to create a genuine interior shortcut between two *distant*
+   boundary nodes of the same region, cap or no cap. The live per-point
+   seeding (`funnelPathFromPoint`, called once per boundary node when a
+   user's start/end literally falls inside a region — `routing.ts:1156-1169`)
+   *is* a correct, genuine interior shortcut computation, but only from
+   the literal user point — it doesn't help two boundary nodes of the same
+   region reach each other cheaply, which is exactly what's needed when
+   crossing from one region, through a stitch point, into an adjacent
+   region. Lacking that, the router falls back to walking the fine-grained
+   ring — which is exactly the observed zigzag — to find whichever stitch
+   point is cheapest, even if that means a long, indirect detour that
+   ultimately settles for a low, non-recognized crossing instead of the
+   real opening bridge.
+
+### Fix: anchor-based shortcut sparsification
+
+Stop conflating "how many vertices are on this region's boundary" (a
+geometry fact that scales with real coastline complexity — correctly
+in the hundreds) with "how many distinct points we bother precomputing
+interior shortcuts between" (an algorithmic choice that should stay a
+small, bounded constant regardless of coastline detail). Concretely:
+
+1. **Add an anchor-selection helper** (`navmesh.ts`, pure geometry, no
+   `database.ts` dependency, matching the module's existing convention):
+   `selectAnchors(region: NavmeshRegion, maxAnchors = 40): number[]` —
+   farthest-point sampling over `boundaryNodeIds` (walk the ring, greedily
+   pick the next node that maximizes minimum distance to already-picked
+   anchors) so anchors are well-distributed around the boundary, not
+   clustered at whatever the first N happened to be.
+2. **Rewrite `precomputeFunnelEdges`** (`database.ts:358-398`): drop the
+   `MAX_BOUNDARY_NODES` gate entirely. For every region: select anchors
+   (bounded cost regardless of boundary size — 40² = 1,600 funnel calls,
+   worst case, once at load time), compute genuine `funnelBetweenNodes`
+   shortcuts between **every anchor pair** (this is the real interior
+   "highway" that was missing), and separately compute a shortcut from
+   every *non-anchor* boundary node to its **nearest 1–2 anchors** (by
+   ring arc-distance, cheap to compute, no need for a full funnel call
+   per candidate). Insert both as new/upgraded `edge_kind_id=1` edges —
+   anchor-to-anchor edges are new (there was no ring-adjacency to
+   "upgrade" before), boundary-to-nearest-anchor edges may already exist
+   as ring edges (upgrade in place) or may need new edges for
+   non-ring-adjacent nearest anchors.
+3. **Restrict live seeding to anchors, not every boundary node**
+   (`routing.ts:1156-1169`, `1164-1169`, and the equivalent in
+   `trySameRegionNavmeshRoute` if it loops boundary nodes anywhere): when
+   a user point falls inside a region, live-`funnelPathFromPoint` only
+   against that region's anchor set. This is the fix for the *performance*
+   half of this bug (695+713 uncached live calls → ~40 each) and works
+   correctly precisely *because* step 2 now guarantees every anchor
+   connects cheaply to the rest of the region's interior — a user point's
+   cheapest path to any boundary node now always routes through its
+   nearest anchor(s) rather than needing to be evaluated against all 700+
+   individually.
+4. Keep the existing sanity guard (`result.distance > edge.distance * 3 +
+   50` skip, `database.ts:390`) — it's independent of this fix and still
+   correct.
+
+### Validation
+
+1. Re-run the exact `zeelandbrug_test.ts` scenario against a freshly
+   regenerated Phase-1 database. Expect: total distance close to Phase
+   0's original result (not 4,924m for a ~900m-apart pair), no fine-grained
+   zigzag, and — **as a hypothesis to confirm, not a guarantee** — likely
+   `Through opening: true` again, since a genuine interior shortcut should
+   make the real bridge-opening route cheaper than detouring to the low
+   11m crossing. If the low-crossing warning *persists* after this fix,
+   that's evidence of a separate, second bug (possibly `_add_opening_bridge_edges`
+   failing to detect/tag the real opening bridge near this corridor) —
+   treat that as a new, separately-scoped follow-up, not part of this fix.
+2. **Add this exact scenario as a real automated regression test**, not
+   just a manual script — the existing 35/35 passing suite did not catch
+   any of this. At minimum, assert: route reaches within some tolerance
+   of the destination, total distance is within some multiple (e.g. 2×)
+   of straight-line distance, and no segment's `maxAirDraft` is below the
+   vessel's required clearance unless explicitly tagged as an
+   opening-bridge override. This closes the exact gap that let a real
+   regression ship past a fully-green test suite.
+3. Spot-check performance: log/time `precomputeFunnelEdges` and the live
+   seeding path before/after, on a database with regions at realistic
+   scale (the tight clip's 700+ boundary nodes, not a synthetic small
+   mesh) — confirm the anchor cap actually bounds cost the way it's
+   supposed to.
+
+---
 
 ## What's confirmed working from Phase 0
 

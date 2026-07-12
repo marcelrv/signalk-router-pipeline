@@ -1079,6 +1079,20 @@ class NauticalRoutingPipeline:
         # got OOM-killed at full-dataset scale.
         MAX_TOTAL_SAMPLES = 1500
         MAX_ROUNDS = 30
+        # Bounds the distance-MATRIX size, not the number of pairs walked off it --
+        # a highly-fragmented component (many small groups, e.g. an estuary split
+        # into hundreds of laned/skeleton pieces at full Zeeland scale) drives
+        # per_group_cap down near 1, so nearly every one of the up to
+        # MAX_TOTAL_SAMPLES**2/2 sorted pairs below is still cross-group early on
+        # and falls through to try_add's expensive `within(poly_m)` +
+        # `_crosses_land` checks. Confirmed against the real machine: without this
+        # cap, one real Zeeland component's stitch pass alone ran for 1h45m+
+        # before being killed, still stuck in this same loop (no multiprocessing
+        # workers had even spawned yet for the next pipeline stage). Bounding the
+        # number of *evaluated* pairs, not just the matrix they're sorted from, is
+        # what actually fixes it -- same "constant regardless of dataset size"
+        # idea as MAX_TOTAL_SAMPLES/MAX_ROUNDS above, just applied one level down.
+        MAX_EVALUATIONS_PER_ROUND = 20000
         from scipy.spatial.distance import cdist
         for _round in range(MAX_ROUNDS):
             groups: Dict[Any, List[int]] = {}
@@ -1096,16 +1110,24 @@ class NauticalRoutingPipeline:
             dmat = cdist(sample_coords, sample_coords)
             np.fill_diagonal(dmat, np.inf)
             merged_this_round = 0
-            # Walk the FULL sorted candidate list once, merging every valid pair found
-            # (not just the first) -- `find()` inside try_add skips pairs that have
-            # already been merged earlier in this same pass, so one sort serves many
-            # merges instead of recomputing groups/samples/distances per merge.
+            # Walk the sorted candidate list, merging every valid pair found (not
+            # just the first) -- `find()` inside try_add skips pairs that have
+            # already been merged earlier in this same pass, so one sort serves
+            # many merges instead of recomputing groups/samples/distances per
+            # merge. Capped at MAX_EVALUATIONS_PER_ROUND pairs (see above); an
+            # unfinished round still leaves the remaining groups to the next
+            # round (or the "could not find a connector" warning below if
+            # MAX_ROUNDS runs out first).
+            evaluated = 0
             for flat_idx in np.argsort(dmat, axis=None):
                 si, sj = divmod(int(flat_idx), n_samples)
                 if si >= sj:
                     continue
                 if try_add(sample_idxs[si], sample_idxs[sj]):
                     merged_this_round += 1
+                evaluated += 1
+                if evaluated >= MAX_EVALUATIONS_PER_ROUND:
+                    break
             if merged_this_round == 0:
                 remaining = len({find(n) for n in ids})
                 if remaining > 1:
@@ -1521,7 +1543,9 @@ class NauticalRoutingPipeline:
         sindex = node_points.sindex
 
         total_added = 0
-        for component in components:
+        for i, component in enumerate(components):
+            if (i + 1) % 20 == 0 or i == 0:
+                logger.info(f"  Coastal connectivity: component {i + 1}/{len(components)}...")
             probe = component.buffer(0.001)  # ~100m in degrees; generous spatial pre-filter only
             candidates = node_points.index[sindex.query(probe, predicate="intersects")]
             if len(candidates) < 2:
