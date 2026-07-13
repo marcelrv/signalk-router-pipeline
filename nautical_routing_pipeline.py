@@ -95,7 +95,7 @@ def _edge_attr_worker(edge_chunk):
     obstacles_gdf = gdfs.get('obstacles', gpd.GeoDataFrame())
 
     results = {}
-    for u, v, u_lon, u_lat, v_lon, v_lat, edge_type, u_res, v_res, is_opening_bridge_edge in edge_chunk:
+    for u, v, u_lon, u_lat, v_lon, v_lat, edge_type, is_opening_bridge_edge in edge_chunk:
         attrs = {}
         _, _, distance = geod.inv(u_lon, u_lat, v_lon, v_lat)
         attrs['distance'] = round(distance, 2)
@@ -1548,7 +1548,6 @@ class NauticalRoutingPipeline:
             for pt in opening_pts:
                 c_lon, c_lat = pt.x, pt.y
                 b_id = self._get_or_create_node(c_lon, c_lat, node_type="coastal")
-                self.graph.nodes[b_id]["resolution"] = 0.001
                 self.graph.nodes[b_id]["node_depth"] = 99.0
                 self._stamp_node(b_id, NODE_KIND_POINT, DEFAULT_SOURCE_TIER, bridge_src)
 
@@ -1763,8 +1762,6 @@ class NauticalRoutingPipeline:
                     u_node["lon"], u_node["lat"],
                     v_node["lon"], v_node["lat"],
                     data.get("edge_type", "coastal"),
-                    u_node.get("resolution", 0.005),
-                    v_node.get("resolution", 0.005),
                     data.get("is_opening_bridge_edge", False),
                 )
 
@@ -1909,7 +1906,6 @@ class NauticalRoutingPipeline:
                     id INTEGER PRIMARY KEY,
                     lat REAL,
                     lon REAL,
-                    resolution REAL DEFAULT 0.0,  -- DEPRECATED: kept for autoroute compat (db-worker.ts reads it unconditionally); always 0.0 in Phase 0
                     node_depth REAL DEFAULT -1,
                     region_id INTEGER REFERENCES metadata(id) ON DELETE CASCADE,
                     node_kind_id INTEGER DEFAULT 0 REFERENCES node_kind_enum(id),
@@ -2005,14 +2001,13 @@ class NauticalRoutingPipeline:
             region_id = cursor.lastrowid
             
             nodes_data = [(n, data["lat"], data["lon"],
-                           0.0,  # resolution: deprecated, always 0.0 (autoroute compat)
                            data.get("node_depth", -1),
                            region_id,
                            data.get("node_kind_id", NODE_KIND_POINT),
                            data.get("source_tier", DEFAULT_SOURCE_TIER),
                            data.get("source_id"))
                           for n, data in self.graph.nodes(data=True)]
-            cursor.executemany("INSERT INTO nodes (id, lat, lon, resolution, node_depth, region_id, node_kind_id, source_tier, source_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", nodes_data)
+            cursor.executemany("INSERT INTO nodes (id, lat, lon, node_depth, region_id, node_kind_id, source_tier, source_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", nodes_data)
             
             edges_data = [(
                 u, v,
