@@ -1075,43 +1075,69 @@ class NauticalRoutingPipeline:
             added += 2
             return True
 
-        # Pass 0: seam-focused k-nearest-neighbor pass, independent of Pass 1's
+        # Pass 0: k-nearest-neighbor pass, independent of Pass 1's
         # MAX_IDS_FOR_PASS1 gate. That gate exists because materializing every
         # coastal-node pair within snap_radius_m (tree.query_pairs()) blows up
         # combinatorially over tens of thousands of densely-spaced nodes -- but
-        # navmesh_seam_node_ids (perimeter vertices tagged on a real
-        # narrow/wide seam, or dead-end skeleton chain nodes) is a much
-        # smaller, sparser subset, and a k-nearest-neighbor *query* (not an
-        # all-pairs-within-radius scan) costs O(log n) per point regardless of
-        # how many seam nodes exist in total, so it's safe to run unconditionally.
+        # a k-nearest-neighbor *query* (not an all-pairs-within-radius scan)
+        # costs O(log n) per point regardless of how many nodes exist in
+        # total, so it's safe to run unconditionally over every node in the
+        # component, not just a pre-tagged subset -- try_add's union-find
+        # check (`find(u) == find(v)`) rejects an already-connected pair
+        # before any of the expensive shapely checks run, so this doesn't
+        # reintroduce Pass 1's "thousands of already-connected same-chain
+        # neighbors" cost: those pairs are almost always already unified via
+        # their own chain/ring edges and get skipped in O(1).
         #
-        # Round 4 found this necessary: at full-country scale a single
-        # component split into thousands of initial union-find groups (e.g.
-        # 8440 for the Zeeland/Oosterschelde body -- one per navmesh region
-        # ring, per island ring, per skeleton chain), which floors Pass 2's
-        # per-group sample cap to 1 regardless of group size. A real, ~30m
-        # gap at the Zeelandbrug bridge opening sat in a 21-node group
-        # alongside other seam nodes; whichever single member Pass 2 happened
-        # to sample every round (the same one, all 30 rounds -- nothing
-        # rotates the pick) was never the right one, so the connector was
-        # never found despite being trivially within snap_radius_m. This pass
-        # sidesteps group sampling for seam nodes entirely: every seam node
-        # gets to look at its own nearest neighbors directly.
-        seam_idx_list = [i for i, n in enumerate(ids) if n in self.navmesh_seam_node_ids]
-        if len(seam_idx_list) >= 2:
+        # Originally this queried only navmesh_seam_node_ids (perimeter
+        # vertices tagged on a real narrow/wide seam, or dead-end skeleton
+        # chain nodes) -- Round 4 found that necessary for a real, ~30m gap
+        # at the Zeelandbrug bridge opening (see below). Round 6 found that
+        # tagged-seam-only restriction itself a gap: a skeleton chain's
+        # *mid-chain* node (degree 2, never a dead end, never seam-tagged)
+        # can pass within a stone's throw of a navmesh region's boundary --
+        # not at the exact coordinate `_seam_coord_set` recorded for that
+        # region's own true narrow/wide split -- while the two pieces are
+        # still only connected, overall, via some much longer route
+        # elsewhere in the component. Nothing before this pass ever
+        # considered that specific pair, since neither side was tagged as a
+        # seam node: the *component* was already technically fully
+        # connected (satisfying every pass's actual goal), so the guarantee
+        # passes below had no reason to also add this shorter, more direct
+        # connector. Confirmed on a real full-scale reproduction: a skeleton
+        # node 88m from a navmesh boundary node had no edge between them,
+        # forcing a real route to detour ~20km round-trip through the one
+        # place a connection *did* exist instead. Querying every node (not
+        # just tagged seam nodes) as both source and target catches this
+        # class of gap directly.
+        #
+        # Round 4's original finding, still true: at full-country scale a
+        # single component split into thousands of initial union-find groups
+        # (e.g. 8440 for the Zeeland/Oosterschelde body -- one per navmesh
+        # region ring, per island ring, per skeleton chain), which floors
+        # Pass 2's per-group sample cap to 1 regardless of group size. A
+        # real, ~30m gap at the Zeelandbrug bridge opening sat in a 21-node
+        # group alongside other seam nodes; whichever single member Pass 2
+        # happened to sample every round (the same one, all 30 rounds --
+        # nothing rotates the pick) was never the right one, so the
+        # connector was never found despite being trivially within
+        # snap_radius_m. This pass sidesteps group sampling entirely: every
+        # node gets to look at its own nearest neighbors directly.
+        pass0_idx_list = list(range(len(ids)))
+        if len(pass0_idx_list) >= 2:
             from scipy.spatial import cKDTree
-            seam_coords = coords_m[seam_idx_list]
-            seam_tree = cKDTree(seam_coords)
-            k = min(6, len(seam_idx_list))
-            _, neighbor_local_idxs = seam_tree.query(seam_coords, k=k)
+            pass0_coords = coords_m[pass0_idx_list]
+            pass0_tree = cKDTree(pass0_coords)
+            k = min(6, len(pass0_idx_list))
+            _, neighbor_local_idxs = pass0_tree.query(pass0_coords, k=k)
             if k == 1:
                 neighbor_local_idxs = neighbor_local_idxs.reshape(-1, 1)
             for local_i, neighbors in enumerate(neighbor_local_idxs):
-                gi = seam_idx_list[local_i]
+                gi = pass0_idx_list[local_i]
                 for local_j in neighbors:
                     if local_j == local_i:
                         continue
-                    gj = seam_idx_list[int(local_j)]
+                    gj = pass0_idx_list[int(local_j)]
                     if np.linalg.norm(coords_m[gi] - coords_m[gj]) > snap_radius_m:
                         continue
                     try_add(gi, gj)
