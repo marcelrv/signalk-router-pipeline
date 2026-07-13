@@ -1001,6 +1001,115 @@ from a deployed-path location have been reverted (`git checkout --
 src/routing.ts`) — the built code no longer throws for anyone without
 those files at that exact path. All 39 tests pass on the clean build.
 
+#### 5.2.2 Follow-up on §5.2.1's open questions (analysis, not yet implemented)
+
+Read the actual code (`_add_opening_bridge_edges`, `_ensure_coastal_connectivity`,
+the `locks` handling in `_edge_attr_worker`) to answer §5.2.1's "think through
+whether there's a real reason inland and coastal networks were kept
+separate" before anyone reaches for the broad fix it proposed:
+
+- **Movable bridges already link inland and coastal nodes today, with no
+  type filter at all.** `_add_opening_bridge_edges`'s quadrant search
+  (`nautical_routing_pipeline.py:1558`, `for nid, data in
+  self.graph.nodes(data=True)`) considers every node regardless of
+  `node_type` — so a movable bridge over a fairway/inland-waterway
+  intersection is already a real, working, type-blind inland↔coastal
+  connection. This is useful precedent: type-blind linking at a genuine
+  physical interface is already safe and shipping, not hypothetical.
+- **Locks don't create connectivity at all, by design** — the `locks_gdf`
+  usage in `_edge_attr_worker` (~line 94-167) only consults lock polygons
+  to annotate an *already-existing* edge's attributes/cost, never to add a
+  new edge. That's fine: a lock chamber sits on a waterway that's already
+  one continuous line feature, so it doesn't need a separate connectivity
+  mechanism the way an inland/coastal seam does.
+- **So the actual, narrower gap is specifically: inland waterway reaching
+  open coastal water with neither a movable bridge nor any other
+  intersection-based hook** — an unlocked tidal creek or a canal mouth
+  opening directly into an estuary. Today that case has *no* mechanism at
+  all, other than an incidental exact-coordinate collision in
+  `_get_or_create_node` — which is exactly the accident that let the
+  reported-bug route rejoin the coastal network near Tholen.
+
+**Refined recommendation** (narrower than "extend `_ensure_coastal_connectivity`'s
+candidate set to include inland nodes near a coastal component," though
+that's the right shape of fix): don't make it a blanket per-component
+merge. Scope the added candidates to inland nodes that geometrically
+terminate at or inside a `coastal_water` polygon (the inland waterway
+line-work's own endpoint touches/crosses the coastal polygon boundary) —
+not every inland node within stitching radius of the component. That
+keeps the same physically-grounded-interface property the bridge case
+already has (only link where the two networks genuinely meet), and avoids
+inventing a routable shortcut through a canal reach that was never meant
+to carry coastal traffic. The existing `within(poly_m)`/`_crosses_land`
+checks in `_stitch_component_pieces` still gate the actual edge once a
+candidate pair is proposed, same as every other stitch pass — only the
+candidate-selection step needs to change, not the safety checks.
+
+**Unblocking the pre-Round-4-baseline comparison** (§5.2.1 called this
+"genuinely unknown," blocked by a tooling dead end guessing a
+`RoutingDatabase` constructor option): don't guess a constructor arg —
+stage the backup file the same way every other manual test in this repo
+does it (see §"Validation" under Phase 0, `cp <db> /tmp/test_route/netherlands.sqlite`):
+`cp data/zeeland_pre_round4.sqlite.bak /tmp/test_route/netherlands.sqlite`
+before running the reported-bug scenario, so `RoutingDatabase` opens it
+via its normal default path instead of a nonexistent custom-filename
+option. Do this before deciding whether the inland-network fix above is
+sufficient — if the pre-Round-4 baseline *also* routed through the inland
+chain, the fix is still correct but not urgent-regression framing; if it
+didn't, there's a separate, still-undiscovered coastal-only gap worth
+finding first.
+
+#### 5.2.3 Separately raised (not from this session's coding-agent work, discussed directly with the user) — density/precision tuning and a second pilot region
+
+Three related items, not yet implemented, flagged as worth doing before
+investing further Round 7 time or a fresh region build:
+
+1. **`_split_wide_narrow`'s `simplify_tol_m=1.0` default is too precise
+   and leaks into the final database.** Douglas-Peucker at 1.0m barely
+   removes any vertices from survey-grade coastline data (small real bends
+   every few meters mean almost nothing is under-tolerance) — and that
+   same simplified polygon flows straight into `_polygon_to_pslg`/
+   `build_navmesh_region` with no further coarsening, becoming the actual
+   exported `navmesh_regions.vertices`. This is very likely the same
+   mechanism behind §5.4's finding below, not a separate issue. Proposed
+   fix (not yet implemented): keep the fine tolerance for the wide/narrow
+   *classification* decision and medial-axis centering (where precision
+   matters), but add a separate, much coarser simplify pass on the navmesh
+   region boundary specifically before it becomes PSLG input/output.
+2. **`min_navmesh_radius_m=300.0` triggers navmesh treatment for water
+   the user considers channel-like, not genuinely wide** — mesh was
+   expected to appear only for the North Sea/IJsselmeer/wide Oosterschelde
+   scale, with medium water instead getting one or two navigation lines
+   (centerline or offset sides). Raising it substantially (~800m
+   suggested) is a separate, complementary fix to item 1 — item 1 reduces
+   vertex count *within* regions that get navmesh treatment; this reduces
+   *how many* regions get it at all.
+3. **Direct connection to this round's Pass 0b fix, worth flagging to
+   whoever tunes items 1-2**: Pass 0b's own code comment
+   (`_stitch_component_pieces`) cites "a real region in this dataset has
+   up to 2,877 perimeter vertices packed a few meters apart" as the exact
+   reason a plain top-6 KNN crowds out real cross-type connectors — the
+   same over-tessellation §5.4 independently measured (566-1,760 vertices
+   for basins as small as 185m across). Fixing items 1-2 would likely
+   reduce how often Pass 0b-style same-type-crowding gaps occur in the
+   first place, not just cut load time/visual clutter. Not a reason to
+   skip Pass 0b (it's committed and correct on its own merits regardless),
+   but worth re-checking whether Pass 0b's crowding rate drops materially
+   once items 1-2 land.
+4. **Second Phase 2 hardening pilot region: Puerto Rico.** Zeeland-only
+   tuning risks overfitting to one water-body character; a prior
+   pre-redesign Puerto Rico attempt exists (`autoroute/data/pr_routing2.sqlite.disabled`,
+   schema_version=3, dense-grid/unconstrained-Delaunay signature — not
+   reusable, would need a full fresh run against the current architecture).
+   NOAA ENC data for the region is already downloaded (`python3
+   data/download_noaa.py --region us-caribbean` from `autoroute/data/`,
+   154 `.000` files at `autoroute/data/US/us-caribbean/PR`, ~35MB).
+   **Recommended sequencing**: land items 1-2 above and re-verify Zeeland
+   first, so the Puerto Rico build isn't spent validating soon-to-be-stale
+   parameters; then run `enc_preprocessor.py` (10-30+ min) and a full
+   pipeline build against it as the second reference region for whatever
+   Round 7 hardening follows.
+
 #### 5.3 Answering the two direct questions asked
 
 **"Do edges cross land a lot — is that as designed?" — genuinely unclear,
@@ -1119,6 +1228,115 @@ raster/medial-axis method where no buoy data exists" design) rather than
 folding it into Round 4/5's bug-fixing work — it's a genuine improvement,
 not a fix for something broken, and deserves its own focused design
 session with the same rigor as Phase 1's original plan.
+
+### Phase 2 Hardening, Round 7 — navmesh boundary edges systematically shallow (real bug, fixed and verified)
+
+**User's diagnosis, confirmed exactly right by the code**: `classify_water_body`
+gates `navmesh` classification on `_has_navigable_depth`, which is an
+**any-overlap test** (`deep.sindex.query(polygon, predicate="intersects");
+return len(hits) > 0`) — a wide polygon qualifies as navmesh-eligible if a
+*single* deep DEPARE polygon intersects it anywhere, not if it's deep
+throughout. Since `build_navmesh_region` registers **every** vertex of the
+qualifying polygon's own perimeter as a real graph node and connects
+adjacent ones with real, depth-sampled `edge_kind_id=1` edges
+(`navmesh_boundary`), a region's outer boundary — which is exactly where
+real bathymetry shoals fastest — becomes the source of that region's
+actual routable depth data. Nodes never get placed further offshore in
+the confirmed-deep interior, because the architecture deliberately avoids
+grid/interior point injection.
+
+**Confirmed empirically, not just by reading code**, against the real
+full-scale `data/zeeland.sqlite`: of 32,210 `edge_kind_id=1` edges,
+**28,854 (89.6%) were shallower than the 6.0m depth ceiling**, averaging
+3.17m — actually shallower on average than the narrow-channel `edge_kind_id=0`
+skeleton centerline edges (6.72m avg), which is backwards from the
+architecture's intent. This directly explains a symptom flagged as far
+back as Round 5 (§5.3) and left as "probably a real shallow patch, not a
+path-choice problem" — that framing was too narrow; it's systemic, not a
+one-off patch.
+
+**Fix**: new `_split_deep_shallow(poly_m, utm, depth_gdf, depth_ceiling_m)`,
+the depth-side analog of the existing `_split_wide_narrow` — intersects a
+width-eligible polygon against the union of DEPARE polygons that clear
+the ceiling, keeps the confirmed-deep sub-piece(s) as the real navmesh
+candidate(s), and routes the shallow/unsurveyed remainder through the
+same skeleton/laned classification path a narrow piece already uses.
+Wired into `build_network`'s wide-piece loop, right before
+`classify_water_body`'s navmesh branch.
+
+**Two real robustness problems found and fixed during implementation, not
+after**:
+1. A first version (spatial-filtered, `make_valid()`-cleaned, but only a
+   `.buffer(0)` on the final union) **segfaulted** `_triangle.triangulate`
+   — real DEPARE polygons from adjacent survey contours don't align
+   cleanly with each other or the water body's own boundary, so a straight
+   intersection/difference chain produces thin slivers and small holes
+   that are topologically pathological, not just visually messy. Fixed
+   with a `.simplify(1.0)` (same tolerance `_split_wide_narrow` already
+   uses) plus a 5m morphological closing (`.buffer(5).buffer(-5)`) on the
+   deep mask before it's ever used to cut anything.
+2. Even after that fix, a **knife-edge cut exactly at the depth-ceiling
+   contour** put 84% of resulting boundary edges in the 5.0-6.0m band
+   specifically — technically still "below ceiling" per the strict
+   `<6.0` count, but from ordinary DEPARE-band/sampling noise right at the
+   transition line, not genuine shallow water (only 0.47% of edges were
+   actually `<3.0m` at this point). Fixed with a further
+   `DEPTH_SPLIT_SAFETY_MARGIN_M = 20.0` erosion past the ceiling contour,
+   so the region boundary sits inside confirmed-deep water with real
+   clearance instead of exactly on the line.
+
+**Verified twice**: first on the small `zeelandbrug_tight` clip (navmesh-
+boundary-edge average depth 5.64m → 7.06m after adding the margin;
+`<6.0m` count 84% → 5.7%), **then confirmed at real full scale**
+(`data/zeeland_depthsplit.sqlite`, fresh regeneration, 13m39s, exit 0,
+no crash):
+
+| | Before (`zeeland.sqlite`, original) | After (`zeeland_depthsplit.sqlite`) |
+|---|---|---|
+| navmesh_boundary (`edge_kind_id=1`) edges | 32,210 | 164,826 |
+| — average depth | 3.17m | **6.88m** |
+| — `<6.0m` (below ceiling) | 89.6% | **8.2%** |
+| — `<3.0m` (genuinely shallow) | not separately measured, but dominant | **0.68%** |
+| centerline (`edge_kind_id=0`) average depth | 6.72m | 4.15m (now correctly *shallower* than navmesh boundary, not deeper — the inversion is fixed) |
+| `navmesh_regions` | 23 | 201 |
+
+The core fix is real and holds at full scale, not just a small-clip
+artifact.
+
+**New trade-off this surfaced, not yet resolved — check before calling
+this done**: total edge count grew substantially (navmesh_boundary ~5.1x,
+centerline ~2.9x) — expected, since splitting by depth both multiplies
+region count (23→201, mostly smaller/simpler pieces) and moves shallow
+remainders into real skeleton treatment that previously didn't exist at
+all for those areas. Region vertex-count distribution is mostly
+reasonable (201 regions, median 226 vertices) but has a real tail: p90 =
+3,210, **max = 34,851** (one region alone exceeds `NAVMESH_PSLG_BUDGET`
+before even counting segments, meaning it's hitting the simplify-retry
+path hardened above on every build, not as an edge case).
+
+**Load-time check done, and it's good news, not a new regression**:
+staged `zeeland_depthsplit.sqlite` and timed `loadGraph()` the same way
+Round 4 did. **27.9s** for 114,607 nodes / 248,537 edges — *faster* than
+Round 4's ~70s baseline despite ~3.4x the nodes and ~4.5x the edges.
+Splitting large, complex, monolithic regions into many smaller, simpler
+ones (23→201) evidently costs the anchor-sparsification precompute less
+in aggregate than a handful of pathologically large regions did — this
+tracks with Round 4's own finding that load time was dominated by a
+*few* outlier regions with huge boundary-node counts, not by total graph
+size. The depth-split fix is a clear win on both axes verified so far
+(depth accuracy and load time); the PSLG-budget/simplify-retry cost on
+the one 34,851-vertex outlier region is the remaining open question, not
+overall load time.
+
+**Not yet done**: whether `navmesh_seam_node_ids`/`boundary_node_ids`
+correctly include the *new* depth-cut boundary (as opposed to only the
+pre-existing width-based wide/narrow seam) wasn't specifically verified —
+the generic, broadened Pass 0/Pass 0b stitching from Round 6 should still
+connect a depth-split navmesh piece to its own shallow remainder via
+plain distance-based KNN even without seam tagging, but this hasn't been
+confirmed with a real connectivity check the way Round 6's fixes were.
+Worth a real route-through-a-depth-split-region test before this is
+considered fully closed, not just a depth-distribution check.
 
 ---
 
@@ -1483,6 +1701,18 @@ top of a graph that's still fundamentally a point cloud in open water —
 sequence mattered, and now that both are working, this is the next real
 work after the still-open Phase 2 Hardening item above (§5.2/"Round 6") is
 resolved.
+
+Three more sub-phases, checked against the original project roadmap and
+confirmed genuinely new rather than a gap in it, are designed in
+[`PHASE_4_DESIGN.md`](PHASE_4_DESIGN.md): position-/route-aware dynamic
+database loading (`autoroute` only — stop loading every downloaded
+region into memory unconditionally); AI-vision-assisted resolution of
+genuinely ambiguous path choices (extends 3c's override workflow with a
+new trigger category and a concrete vision-model input/output design,
+still human-reviewed, never a live per-query call); and bridge/lock
+wait-time & schedule data (new `pois` fields, sourced via 3c's override
+workflow same as the AI-vision case — the routing-cost/ETA consumption
+side is `autoroute`'s `feature-bridge-lock-waits.md`, not this repo).
 
 ## Critical files
 
