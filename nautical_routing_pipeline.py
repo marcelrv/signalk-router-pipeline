@@ -245,6 +245,10 @@ NAVMESH_MAX_TRIANGLES = 200_000 # sanity cap on triangulate() output; retry coar
 DEPTH_SPLIT_SAFETY_MARGIN_M = 20.0  # _split_deep_shallow: extra erosion past the depth-ceiling
                                      # contour so navmesh boundary edges clear it with margin,
                                      # not sit exactly on the transition
+DEPTH_SPLIT_CLOSING_RADIUS_M = 50.0  # _split_deep_shallow: morphological closing radius to bridge
+                                     # DEPARE survey-contour misalignment gaps between adjacent
+                                     # deep bands before cutting (Round 7's original 5m left most
+                                     # of this fragmentation in place -- see Round 8 writeup)
 
 
 @dataclass
@@ -529,7 +533,8 @@ class NauticalRoutingPipeline:
                     # "this piece is deep". Carve out the confirmed-deep sub-area before
                     # triangulating; the shallow/unsurveyed remainder falls back to
                     # skeleton/laned treatment exactly like a narrow piece.
-                    deep_m, shallow_m = self._split_deep_shallow(piece_m, utm, depth_gdf, cfg.depth_ceiling_m)
+                    deep_m, shallow_m = self._split_deep_shallow(
+                        piece_m, utm, depth_gdf, cfg.depth_ceiling_m, cfg.min_navmesh_radius_m)
                     for deep_piece_m in self._explode_polygonal(deep_m):
                         counts["navmesh"] += 1
                         navmesh_pieces.append((deep_piece_m, utm, seam_coords))
@@ -617,7 +622,8 @@ class NauticalRoutingPipeline:
         return {(round(x, precision), round(y, precision))
                 for x, y in shapely.get_coordinates(seam_geom)}
 
-    def _split_deep_shallow(self, poly_m, utm, depth_gdf, depth_ceiling_m: float):
+    def _split_deep_shallow(self, poly_m, utm, depth_gdf, depth_ceiling_m: float,
+                             min_navmesh_radius_m: float):
         """Split a width-eligible ("wide") metric-CRS polygon into a deep part
         that's actually confirmed navmesh-eligible and a shallow/unsurveyed
         remainder that isn't -- the depth-side analog of `_split_wide_narrow`.
@@ -692,9 +698,12 @@ class NauticalRoutingPipeline:
         # a straight union/intersection/difference chain produces thin
         # slivers and small holes that are topologically pathological (not
         # just visually messy) -- this is what was still crashing
-        # _triangle.triangulate after simplify() alone. 5m closing radius:
-        # small relative to open water, big enough to erase chart-contour
-        # misalignment slivers.
+        # _triangle.triangulate after simplify() alone. Closing radius
+        # (`DEPTH_SPLIT_CLOSING_RADIUS_M`): started at 5m in the version that
+        # first fixed the triangulate() crash, but that left most of the
+        # fragmentation in place -- confirmed on real data that adjacent
+        # DEPARE survey-contour bands routinely need tens of meters, not
+        # single-digit meters, to bridge cleanly (Round 8 investigation).
         # A knife-edge cut exactly at the depth-ceiling contour puts the
         # region's own boundary -- which becomes real, sampled graph edges --
         # right at the transition, so ordinary DEPARE band-boundary/sampling
@@ -706,10 +715,33 @@ class NauticalRoutingPipeline:
         # past the ceiling contour so the region boundary sits inside
         # confirmed-deep water with real clearance, not exactly on the line.
         deep_union_m = (unary_union(list(deep_mask_m.geometry)).buffer(0)
-                         .simplify(1.0).buffer(0).buffer(5.0).buffer(-5.0)
+                         .simplify(1.0).buffer(0)
+                         .buffer(DEPTH_SPLIT_CLOSING_RADIUS_M).buffer(-DEPTH_SPLIT_CLOSING_RADIUS_M)
                          .buffer(-DEPTH_SPLIT_SAFETY_MARGIN_M))
         deep = self._clean_polygonal(poly_m.intersection(deep_union_m))
         shallow = self._clean_polygonal(poly_m.difference(deep_union_m))
+
+        # Even after closing, a deep sub-piece can come out too small/narrow to
+        # be genuinely navmesh-eligible any more -- either real GEOS
+        # intersection-boundary noise (confirmed on real data: some resulting
+        # pieces were a few hundredths of a m^2, sitting meters from a
+        # multi-km^2 neighbor -- clearly a cut artifact, not a water body), or
+        # a real but tiny, non-navigable pocket (same class of feature flagged
+        # in Round 5 SS5.4). Re-apply the same width test `_split_wide_narrow`
+        # already gates initial wide/narrow classification with: a deep piece
+        # that no longer contains a disk of `min_navmesh_radius_m` isn't wide
+        # enough to deserve full navmesh treatment, so fold it back into the
+        # shallow/skeleton path instead of emitting a degenerate navmesh_regions row.
+        still_deep_pieces, reclassified_pieces = [], []
+        for piece in self._explode_polygonal(deep):
+            wide_piece, narrow_piece, _ = self._split_wide_narrow(piece, min_navmesh_radius_m)
+            if not wide_piece.is_empty:
+                still_deep_pieces.append(wide_piece)
+            if not narrow_piece.is_empty:
+                reclassified_pieces.append(narrow_piece)
+        deep = unary_union(still_deep_pieces) if still_deep_pieces else Polygon()
+        if reclassified_pieces:
+            shallow = self._clean_polygonal(unary_union([shallow, *reclassified_pieces]))
         return deep, shallow
 
     def classify_water_body(self, polygon, is_wide: bool, depth_gdf, fairway_gdf,
