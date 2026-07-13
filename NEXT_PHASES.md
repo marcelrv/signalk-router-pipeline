@@ -12,44 +12,64 @@ session**: rebuilt fresh, 39/39 tests pass (including the real, meaningful
 fixture — read its assertions directly, they check actual route shape and
 constraint compliance, not just "did it return something").
 
-**Two things confirmed this session, both needing a "Round 4" before
-Phase 3 or full scale-out — see "Phase 2 Hardening, Round 4" below:**
+**Phase 2 Hardening, Round 4 is DONE, independently re-verified today
+against a fresh build + the current full-scale `data/zeeland.sqlite`
+(commits `72c0a43` autoroute, `512188f` this repo)**: 39/39 tests pass,
+`loadGraph()` is 69s (was 237s), and the Zeelandbrug scenario genuinely
+passes at full scale — `Through opening: true`, 4,962m, zero warnings,
+confirmed directly, not just re-reading the commit message.
 
-1. The already-flagged full-scale bridge-avoidance issue is **real,
-   reproduced live** against the actual `data/zeeland.sqlite` (not
-   inferred) — the router still detours to a low fixed span of the same
-   physical Zeelandbrug structure instead of the ~1.5-2km-further real
-   opening, exactly as predicted, at a specific, now-identified edge.
-2. **New finding, not previously documented**: loading the full-scale
-   `data/zeeland.sqlite` (23 navmesh regions) into the routing engine
-   takes **~237 seconds**. Isolated by direct timing to graph *load*
-   specifically — the route calculation itself, once loaded, takes ~2.7s.
-   So this is a one-time startup/reload cost, not a per-request problem,
-   but a 4-minute plugin load is a real practical issue on its own,
-   especially since it will only grow as this scales to all of NL and
-   beyond per the roadmap.
+**But Round 5's real-world bug report (§5.2) is not resolved by Round
+4 — re-tested today, it's worse by every number that matters:**
 
-**"Phase 2 Hardening, Round 5" added — a real user bug report
-(screenshot of a bad live route) plus direct visual inspection of the
-debug graph-edges overlay, both investigated and reproduced this
-session.** Highlights: (a) an **uncommitted, in-progress fix already
-sitting in `autoroute`'s working tree** (not made this session) genuinely
-cuts load time 237s→75s (verified) but does **not** fix route quality —
-commit it, it's good, but keep debugging §4.1/§5.2; (b) the reported bad
-route (a ~5-6km unnecessary detour through Krabbenkreek/Keeten instead of
-a direct Oosterschelde crossing) is reproduced and is a bigger, clearer
-manifestation of the same still-open bridge-avoidance-class defect; (c)
-"edges crossing land" — confirmed the debug view's API genuinely omits
+| | Before Round 4 | After Round 4 (today) |
+|---|---|---|
+| Total distance | 36,946m | **62,398m** |
+| Southernmost point | lat 51.609 | **lat 51.497** |
+| Air-draft warning | yes (Zeelandbrug low span) | gone |
+| Depth warning | yes (19 legs, departure area) | still there |
+
+Fixing the narrow Zeelandbrug corridor did not fix — and may have
+exposed or worsened — the broader routing-quality problem the real user
+bug report is about. **Do not treat Round 4 as closing out the original
+bug report.**
+
+**Round 6 made real, verified progress — two genuine, committed fixes —
+but the reported bug (§5.2) is still not resolved, and its real root
+cause turned out to be architecturally deeper than either fix.** Round 6
+found and fixed a connectivity gap (a skeleton mid-chain node, never
+seam-tagged, sitting 88m from a navmesh boundary node) by broadening
+Pass 0 to query every node in the component. A same-session follow-up
+found and fixed a second, distinct gap class (a 94.8m skeleton-to-boundary
+gap that survived the first fix because dense same-type neighbors starved
+it out of a plain top-6 KNN query) with a type-aware cross-KNN Pass 0b.
+Both are committed, both are independently verified safe (full
+regenerations, no memory/performance regression, Zeelandbrug scenario
+unchanged at 4,962m/zero warnings). **Neither moved the reported-bug
+scenario's numbers at all (56,833m / 51.544°N, unchanged by the second
+fix)** — because its real cause is different: essentially the entire
+southward excursion runs on `inland_waterways`-sourced graph edges
+(`node_type="inland"`), a separate data source and network that
+`_ensure_coastal_connectivity` categorically excludes from all stitching,
+with no other mechanism connecting it to the coastal network at all.
+**Not done — see "Phase 2 Hardening, Round 6" §5.2.1 for the full
+verified picture, the evidence trail, and the concrete next step**
+(a real design decision about inland/coastal network stitching, not a
+tuning fix), including working scratch scripts in `autoroute`'s working
+tree, a real starting point for whoever continues this.
+
+**Also from the Round 5 investigation, still relevant:** (c) "edges
+crossing land" — confirmed the debug view's API genuinely omits
 `path_points` (so it can only ever draw straight chords), but **whether
 the actual returned route geometry is affected is still unverified — user
 correctly pushed back on treating this as resolved, see §5.3, do not
-downgrade this**; (d) small non-navigable retention basins
-are confirmed absurdly over-tessellated (up to 1,760 vertices for a
-34,000 m² pond) and are a real, comparatively cheap-to-fix contributor to
-both load time and visual clutter; (e) a good new architectural idea —
-deriving skeleton/lane nodes from real buoy/beacon positions instead of
-raw coastline vertices — is scoped as a future design item. See "Phase 2
-Hardening, Round 5" for details and concrete next steps on all five.
+downgrade this**; (d) small non-navigable retention basins are confirmed
+absurdly over-tessellated (up to 1,760 vertices for a 34,000 m² pond) and
+are a real, comparatively cheap-to-fix contributor to both load time and
+visual clutter; (e) a good new architectural idea — deriving skeleton/lane
+nodes from real buoy/beacon positions instead of raw coastline vertices —
+is scoped as a future design item. See "Phase 2 Hardening, Round 5" for
+details.
 
 **`data/zeeland.sqlite` has been regenerated with the current (Phase 1)
 pipeline** — the copy that had been sitting in `data/` was stale, still
@@ -669,7 +689,13 @@ graph-edges debug overlay. Reproduced exactly (see below) and
 investigated this session — this supersedes some of §4.2's guesses with
 real measurements.
 
-#### 5.1 Correction to §4.2's profiling guess — and a WIP fix already in progress, not yet committed
+#### 5.1 Correction to §4.2's profiling guess — DONE, committed as part of Round 4 (`72c0a43`)
+
+**Re-verified today, independently, against a fresh build and the current
+full-scale `data/zeeland.sqlite` (33,895 nodes/56,211 edges/23 regions,
+post-4.1-fix): `loadGraph()` took 69s** (consistent with Round 4's
+claimed ~76s), 39/39 tests pass. This item is closed — see the historical
+notes below for how it was found, kept for the reasoning trail.
 
 **§4.2 guessed `upgradeRingBoundaryEdges` was the dominant load-time
 cost. Direct timing (this session, before finding the WIP fix below)
@@ -707,36 +733,273 @@ Re-ran the exact reported bad route after rebuilding with it — identical
 result (36,946m, same warnings, same southern detour). The routing-choice
 defect below is a separate, still-unfixed problem.
 
-#### 5.2 Reproduced: the reported bad route (still broken)
+#### 5.2 Reported bad route: STILL BROKEN after Round 4's fix, and worse by the numbers — this is the priority for Round 6
 
-`51.6889,4.2124` → `51.6306,3.8026`, draft 2.0m/beam 6.0m/airDraft 17.0m,
-against the full `data/zeeland.sqlite`: **36,946m** (matches the UI's
-displayed 19.9nmi exactly), confirmed via full coordinate dump to dip
-from the start (lat 51.689) down to **lat 51.609** — a genuine ~5-6km
-detour south through Keeten/Krabbenkreek — before returning north to the
-lat-51.631 destination. A direct crossing of the main Oosterschelde basin
-(wide open water, per the zoomed-out map) is visibly available and not
-used. This is very likely the same root-cause class as §4.1 (missing
-interior navmesh shortcuts forcing a walk along boundary rings/narrow
-channels instead of a clean cross-region path), now shown to be far more
-consequential at full scale than the narrow Zeelandbrug corridor alone
-suggested — **do §4.1's investigation on this scenario, not only the
-Zeelandbrug one**, since it's a larger, clearer manifestation of the same
-class of bug.
+**Re-tested today against the post-4.1-fix `data/zeeland.sqlite`
+(33,895 nodes/56,211 edges/23 regions, confirmed current) — the specific
+Zeelandbrug low-bridge symptom is gone, but the overall route is now
+measurably worse, not fixed:**
 
-The `via_constrained` warning text is misleading and worth fixing
-separately: it reports "depth 0.0m < required 2.3m" but the actual
+| | Before Round 4 (this doc, original) | After Round 4 (re-tested today) |
+|---|---|---|
+| Total distance | 36,946m | **62,398m** |
+| Southernmost point reached | lat 51.609 | **lat 51.497** (~21km south of the direct line) |
+| Warnings | depth (19 legs) + air-draft (Zeelandbrug low span) | depth (19 legs) only — **air-draft warning gone** |
+
+The air-draft warning disappearing is consistent with 4.1's fix working
+(the route no longer needs the low Zeelandbrug span) — full coordinate
+dump confirms it now correctly threads through the real opening bbox
+(`51.626-51.628, 3.910-3.912`) near the very end of the route. But getting
+there now involves a bizarre, much larger detour: south from the start
+through Keeten/Krabbenkreek as before, but this time continuing **far**
+past Krabbenkreek down to ~51.50°N (near Tholen/Volkerak, well outside any
+sensible path between these two points) before turning back north to
+finally approach the real opening. **Fixing the narrow Zeelandbrug
+scenario exposed or worsened this broader problem — it did not fix it.**
+Do not treat Round 4 as having resolved the original bug report; §4.1's
+narrow-scenario fix and this broader one are evidently not the same
+defect, or not the whole of it.
+
+**Ruled out, checked directly, don't re-suspect it**: the new Pass 0
+seam-stitching k-NN pass (§4.1's fix) is not a likely cause of this
+specific detour — read `_stitch_component_pieces`'s Pass 0
+(`nautical_routing_pipeline.py:1078-1117`) directly and confirmed it (a)
+routes every candidate through the same `try_add` land-crossing/
+containment checks every other stitching pass uses, and (b) is hard-capped
+to `snap_radius_m=500m` connections only — it cannot itself be the source
+of an 11km+ jump.
+
+**More plausible, not yet checked**: Pass 2's pre-existing "guarantee"
+stitching pass has no equivalent distance cap — its job is to connect
+*any* two remaining components regardless of distance, checked only for
+land-crossing and staying within the overall component polygon, not for
+"is this actually a sane route a boat would take." A component polygon
+covering the whole Oosterschelde/Krammer/Volkerak system is large and
+non-convex enough that a long straight connector between two faraway
+points could pass both checks while being a poor navigational choice if
+it ever gets used as a literal edge rather than just a fallback-of-last-
+resort. Also plausible: a genuine issue in how the TS runtime's navmesh/
+anchor consumption behaves for a route that must cross *several* regions
+in sequence (this scenario, unlike the 2-region Zeelandbrug case, likely
+crosses many), not just one hop — Round 4's fixes were verified against
+the Zeelandbrug's simpler 2-region case, not a long multi-region crossing
+like this one.
+
+**Concrete next step — same proven method as Rounds 3/4, applied to
+*this* scenario specifically**: temporary live instrumentation in
+`astarSearch`/`seedNavmeshCandidates`/`trySameRegionNavmeshRoute` (added,
+verified, then reverted — not a bypass) to see exactly which edges/regions
+the winning path actually traverses around the 51.50-51.52°N excursion,
+and whether that stretch is one long literal edge (a Pass-2-style
+guarantee connector — check its `source`/`target`/`distance` directly in
+the exported `.sqlite` if so) or many small hops through a real but
+poorly-connected sub-region. Do this before assuming it's the same root
+cause as §4.1 — today's evidence suggests it might not be.
+
+The `via_constrained` warning text is still misleading and still worth
+fixing separately: it reports "depth 0.0m < required 2.3m" but the actual
 per-segment dump shows no segment with `minDepth` below 1.0m along this
 route (18 segments in the 1.0-2.5m range, clustered right at departure —
 likely a genuinely shallow, unavoidable approach channel near the start
-point, not a routing defect) — plus **one** separate segment at
-`(51.61364,3.89309)→(51.61352,3.89318)` with `maxAirDraft=11`, which is
-the *exact same* Zeelandbrug low fixed span from §4.1/Round 3. The
-warning-aggregation logic in `routing.ts` is combining a depth-constraint
-group and an air-draft-constraint group into one message and reporting a
-value ("0.0m") that doesn't match any real constrained segment found —
-worth a small separate fix so warnings are trustworthy for diagnosis, but
-not the cause of the bad route itself.
+point, not a routing defect). Not the cause of the bad route itself, but
+worth fixing so future warnings are trustworthy for diagnosis.
+
+### Phase 2 Hardening, Round 6 — real, genuine progress; NOT yet correct — continue from here
+
+**A separate session found and fixed a real, distinct bug (this repo,
+`nautical_routing_pipeline.py`, `_stitch_component_pieces` Pass 0), then
+was interrupted before the broader §5.2 problem was fully resolved.**
+Verified independently below — do not re-litigate what's confirmed
+fixed, but do not mistake it for the whole fix either.
+
+**What was found**: Round 4's Pass 0 only queried nodes already tagged
+`navmesh_seam_node_ids` (perimeter vertices flagged at a real narrow/wide
+split, or skeleton dead-ends). Round 6 found a distinct gap class: a
+skeleton chain's **mid-chain** node (degree 2, never a dead end, never
+seam-tagged) can sit a stone's throw (confirmed case: 88m) from a navmesh
+region's boundary node without ever getting connected, because neither
+side was ever a candidate for Pass 0's KNN query — the overall component
+was already technically fully connected via some far longer route
+elsewhere, so the later "guarantee" passes had no reason to add this much
+shorter one either. Confirmed via live instrumentation in `astarSearch`
+(the same method Round 3/4 used — temporary logging + `debug_region13.json`/
+`debug_region16.json` node-ID watchlists, still present in the working
+tree, not yet reverted).
+
+**Fix applied**: broadened Pass 0 to KNN-query **every** node in the
+component, not just seam-tagged ones — safe because `try_add`'s
+union-find check (`find(u) == find(v)`) rejects an already-connected pair
+in O(1) before any expensive shapely check runs, so this doesn't
+reintroduce Pass 1's original "materialize every pair" blowup. Full
+reasoning is in the code comment itself (`_stitch_component_pieces`,
+around the Pass 0 block) — it's thorough and worth reading directly
+rather than duplicating here.
+
+**Independently re-verified today** (fresh build, fresh full-scale
+regeneration — `data/zeeland_round6.sqlite`, two successful runs logged
+in `data/zeeland_round6_run.log`/`_run2.log`):
+
+- **No memory/performance regression**: full pipeline run completed in
+  ~8m8s (was ~6.5min post-Round-4) — slower, not dangerously so, no OOM,
+  no hang. 33,801 nodes / 56,899 edges / 4,056 stitching edges added
+  (more than Round 4's 3,016 — consistent with catching a real,
+  previously-missed class of gap, not noise).
+- **Zeelandbrug scenario: still passes cleanly.** `Through opening: true`,
+  4,962m, zero warnings — no regression from this change.
+- **The reported bug scenario: genuinely improved, but still broken.**
+
+| | Original (pre-Round 4) | Post-Round-4 | Post-Round-6 (today) |
+|---|---|---|---|
+| Total distance | 36,946m | 62,398m | **56,833m** |
+| Southernmost point | lat 51.609 | lat 51.497 | **lat 51.544** |
+| Air-draft warning | present | gone | gone |
+| Depth warning | present (departure area) | present | present (departure area, same class) |
+
+The trend is in the right direction across both post-Round-4 and
+post-Round-6 fixes, but **the route is still worse than the original
+pre-Round-4 baseline** (straight-line distance between these two points
+is ~29km — 56,833m is 1.96x that; the original 36,946m was already only
+1.27x). Full coordinate dump confirms the route now correctly threads
+through the real Zeelandbrug opening near the end (`~51.6269,3.91083`)
+but takes a large, still-unexplained loop down to ~51.54-51.57°N (near
+Tholen) first. This has the same *shape* of problem as the one just
+fixed — very possibly another instance of the same missing-connector
+class of gap, somewhere in that southern area — but has **not been
+confirmed** as the same root cause; don't assume it without checking.
+
+**Status: committed, real, and safe — but this fix alone did not close
+out §5.2.** (Confirmed and superseded by the follow-up work below, done
+in the same session as this write-up.)
+
+#### 5.2.1 Round 6 follow-up — a second real fix landed, but the reported bug's actual root cause is deeper than either stitching fix
+
+Resumed exactly where the interrupted session left off, using its own
+artifacts (`round6-*.mjs` scratch scripts, `debug_region13.json`/
+`debug_region16.json` watchlists, the `[DEBUG round6]` instrumentation
+already wired into `astarSearch`) against a **freshly regenerated**
+`data/zeeland_round6.sqlite` (confirmed to reflect the just-committed
+Pass 0 fix, not a stale copy). Reproduced the documented numbers exactly
+(56,833m, southmost 51.54366°N) before changing anything.
+
+**Second real gap found and fixed, but it wasn't the one causing this
+bug.** Hop-by-hop analysis of the reproduced path found one dominant
+outlier: a single 9,358m `edge_kind_id=1` (navmesh boundary/anchor
+shortcut) edge from (51.54546, 3.86751) to (51.61983, 3.90169) — a real,
+legitimate funnel-computed edge (`hasPathPoints=true`, distance matches
+its own path length), not a bug itself, but suspicious as the one hop
+that jumps the whole 51.54-51.61°N gap in one step. Tracing backward from
+its source node along the route's skeleton-only prefix found a **second,
+distinct 94.8m gap**: skeleton node `1157916690409570` (51.64352, 4.0957)
+sits 94.8m from navmesh boundary node `509919030409659` (51.64417,
+4.09659) of the very region the route eventually detours ~20km south to
+enter — no edge either direction, confirmed directly against the fresh
+data. This survived the just-committed Round 6 fix.
+
+Root-caused via direct inspection of `_stitch_component_pieces`'s Pass 0:
+querying `k=6` nearest neighbors **without regard to node type** means
+that inside a densely triangulated navmesh region (this one has 2,877
+boundary nodes packed a few meters apart), a node's own top-6 nearest
+neighbors are almost always same-type immediate neighbors — crowding out
+a real cross-type connector that might be 50-100m away. Both this
+skeleton node's and this boundary node's own top-6 lists were full of
+same-type points closer than 94.8m, so Pass 0 never tried the pair,
+despite it being well within `snap_radius_m`. **Fix applied**: a new Pass
+0b splits the KNN query by type (`node_kind_id`, already stamped on every
+navmesh perimeter vertex, seam-tagged or not) via two separate KD-trees —
+every skeleton/other node looks at its own k nearest navmesh vertices,
+and vice versa — guaranteeing the true nearest cross-type candidate is
+always considered regardless of same-type local density on either side.
+
+**Verified via full regeneration**: no regression (~9m19s, was ~8m8s),
+4,618 stitching edges added (up from Round 6's 4,056 — a real, additional
+class of gap, not noise), Zeelandbrug scenario unchanged (4,962m, zero
+warnings, re-verified against the final full-scale `data/zeeland.sqlite`
+itself, not just the small test fixture). **Committed on its own
+merits**, same as Round 6's fix.
+
+**But re-testing the reported-bug scenario against this fix produced
+*exactly* the same numbers as before it: 56,833m, southmost 51.54366°N —
+zero change.** This was the first sign that the 94.8m gap, despite being
+real, wasn't this bug's actual cause. Direct investigation (adding
+temporary trace logging to `_stitch_component_pieces`, reverted before
+committing — see method note below) confirmed why: **node
+`1157916690409570` is not a normal coastal skeleton node at all — it's
+`node_type="inland"`, built from the separate `inland_waterways_lines.geojson`
+layer, not `coastal_water` polygons.** This is directly decodable from
+the node ID itself (`_coord_to_id`'s `type_int` bit: IDs ≥
+648,000,000,000,000 are inland-typed; confirmed against both the raw
+`nodes.node_kind_id`/lat/lon columns and by reconstructing the ID formula
+by hand) — no live instrumentation was even needed to prove it, once
+suspected.
+
+**This is the real root cause, and it's bigger than a stitching-pass
+tuning problem: `_ensure_coastal_connectivity`
+(`nautical_routing_pipeline.py:1713`) unconditionally excludes every
+`node_type="inland"` node from `coastal_nodes` before any component or
+candidate is even gathered** — so no amount of tuning `_stitch_component_pieces`'s
+KNN logic (broader Pass 0, type-aware Pass 0b, anything) can ever reach
+an inland-typed node; it's never offered as a candidate in the first
+place. And **there is no other mechanism in the pipeline that connects
+inland nodes to the coastal network at all** — the only path is
+incidental exact-coordinate reuse in `_get_or_create_node` (an
+inland_waterways vertex that happens to round to the same (lon, lat) as
+an already-existing coastal node, to 5 decimal places / ~1.1m). Checking
+every node ID along the reported-bug route's southward excursion
+confirms the practical consequence directly: **essentially the entire
+route, from very close to the start point all the way down to the
+51.54366°N southmost point, runs on `inland_waterways`-sourced edges**,
+not the coastal skeleton/navmesh network the last three rounds of
+investigation had been focused on. The route only rejoins the coastal
+network right at the southern end, via what is almost certainly one of
+these incidental exact-coordinate coincidences, which is why it happens
+exactly where it does (near Tholen) rather than somewhere closer to a
+direct line between the two requested points.
+
+**What's genuinely unknown, and shouldn't be assumed either way without
+checking**: whether the pre-Round-4 baseline (36,946m) *also* used this
+inland network (in which case this is a pre-existing characteristic of
+how these two data sources compose, not a regression), or used a purely
+coastal route that's since become unreachable due to some other gap
+(in which case the inland detour is a fallback masking a *different*,
+still-undiscovered coastal-network gap). An attempt to check this
+directly against `data/zeeland_pre_round4.sqlite.bak` this session hit an
+unrelated tooling problem (a guessed `RoutingDatabase` constructor option
+for a custom filename doesn't exist; it silently fell back to a stale
+`data_round6_test/zeeland.sqlite` state and the search pathologically
+never terminated in region 16 — a tooling dead end, not a finding about
+the baseline route, and not investigated further this session).
+
+**Concrete next step for whoever picks this up**: this needs an actual
+design decision, not a quick tuning fix. `_stitch_component_pieces`'s
+existing safety checks (`within(poly_m)`, `_crosses_land`) are purely
+geometric and type-agnostic — extending `_ensure_coastal_connectivity`'s
+candidate set to also include inland nodes near a given coastal
+component's polygon, and letting those same checks gate what actually
+gets connected, is architecturally consistent with how every other
+stitch in this function already works, and is the most likely-correct
+fix. But do the comparison above first (does the good pre-Round-4 route
+also use this inland chain?) before assuming that's sufficient, and
+think through whether there's a real reason inland and coastal networks
+were kept separate before touching it (lock/depth/dimension semantics
+that might differ between the two data sources and shouldn't be silently
+merged without preserving them).
+
+**Method note, for reproducibility**: this session's diagnostic work
+(hop-distance analysis, node-ID type-bit decoding, a temporary
+`try_add`/component-membership trace added to and then removed from
+`_stitch_component_pieces` before committing) is not preserved in the
+committed diff — only the real Pass 0b fix is. The `round6*.mjs` scripts
+in `autoroute`'s working tree (now including several new ones from this
+session: `round6b-check*.mjs`, `round6c-region1.mjs`,
+`round6d-region-correct.mjs`) remain as a real, reusable starting point
+for whoever continues this, same as before.
+
+**Housekeeping, done this session**: `autoroute/src/routing.ts`'s
+temporary `[DEBUG round6]` console logging and the two hardcoded
+`fs.readFileSync` calls reading `debug_region13.json`/`debug_region16.json`
+from a deployed-path location have been reverted (`git checkout --
+src/routing.ts`) — the built code no longer throws for anyone without
+those files at that exact path. All 39 tests pass on the clean build.
 
 #### 5.3 Answering the two direct questions asked
 
@@ -1202,18 +1465,24 @@ logic.
 
 ---
 
-## Phase 3 and beyond (pointer only — see `README.md`'s roadmap)
+## Phase 3 and beyond (pointer only — see `PHASE_3_DESIGN.md`)
 
-Already described at the right level of detail in this repo's `README.md`
-and not repeated here: OSM/OpenSeaMap (tier 3) and GEBCO/EMODnet (tier 4)
-data fusion; the human/AI-assisted override-authoring workflow against
-`router-data`'s `overrides/` directory; EMODnet vessel-density and
-MarineCadastre AIS validation/gap-filling; scale-out to full NL, then a
-first NOAA-charted US region; supernode/macro-edge hierarchical routing.
-None of these are blocked by Phase 1/2 above, but doing them before the
-navmesh-region generation is real (Phase 1) or consumable (Phase 2) would
-mean building on top of a graph that's still fundamentally a point cloud
-in open water — sequence matters here.
+Detailed design (data sources, conflation strategy, concrete file/script
+names, schema additions, phase ordering) now lives in
+[`PHASE_3_DESIGN.md`](PHASE_3_DESIGN.md), not here — that document assumes
+Phase 0-2 and Phase 2 Hardening are working and does not re-litigate their
+verification, which stays in this file. Six sub-phases: OSM/OpenSeaMap
+(tier 3) and GEBCO/EMODnet (tier 4) data fusion; the human/AI-assisted
+override-authoring workflow against `router-data`'s `overrides/`
+directory; EMODnet vessel-density and MarineCadastre AIS
+validation/gap-filling; scale-out to full NL, then a first NOAA-charted US
+region; supernode/macro-edge hierarchical routing. None of these are
+blocked by Phase 1/2, but doing them before the navmesh-region generation
+was real (Phase 1) or consumable (Phase 2) would have meant building on
+top of a graph that's still fundamentally a point cloud in open water —
+sequence mattered, and now that both are working, this is the next real
+work after the still-open Phase 2 Hardening item above (§5.2/"Round 6") is
+resolved.
 
 ## Critical files
 
