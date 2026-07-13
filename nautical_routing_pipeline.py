@@ -16,7 +16,7 @@ import pandas as pd
 import geopandas as gpd
 import networkx as nx
 import shapely
-from shapely.geometry import Point, LineString, Polygon, MultiPoint, MultiLineString, MultiPolygon, mapping
+from shapely.geometry import Point, LineString, Polygon, MultiPoint, MultiLineString, MultiPolygon, mapping, box
 from shapely.ops import triangulate, unary_union
 from pyproj import Geod
 
@@ -242,6 +242,9 @@ DEFAULT_SOURCE_TIER = 1  # 1 = official hydrographic authority (ENC/IENC)
 NAVMESH_TARGET_EDGE_M = 650.0  # target interior triangle edge length (spec's 500-800m band)
 NAVMESH_PSLG_BUDGET = 20_000    # max len(vertices)+len(segments) fed into triangle's PSLG mode
 NAVMESH_MAX_TRIANGLES = 200_000 # sanity cap on triangulate() output; retry coarser above this
+DEPTH_SPLIT_SAFETY_MARGIN_M = 20.0  # _split_deep_shallow: extra erosion past the depth-ceiling
+                                     # contour so navmesh boundary edges clear it with margin,
+                                     # not sit exactly on the transition
 
 
 @dataclass
@@ -510,17 +513,31 @@ class NauticalRoutingPipeline:
                     counts[kind] += len(self._explode_polygonal(narrow_m))
                     skeleton_pieces.append(narrow_wgs84)
 
-                # Wide (navmesh-eligible) pieces DO need to stay exploded into individual
-                # simple polygons: `triangle`'s PSLG triangulation takes one exterior ring
-                # (+ holes) per call, not a MultiPolygon of disjoint areas.
+                # Wide (navmesh-eligible-by-width) pieces DO need to stay exploded into
+                # individual simple polygons: `triangle`'s PSLG triangulation takes one
+                # exterior ring (+ holes) per call, not a MultiPolygon of disjoint areas.
                 for piece_m in self._explode_polygonal(wide_m):
                     piece_wgs84 = gpd.GeoSeries([piece_m], crs=utm).to_crs(self.CRS_WGS84).iloc[0]
                     kind = self.classify_water_body(piece_wgs84, True, depth_gdf, fairway_gdf, cfg)
-                    counts[kind] += 1
-                    if kind == "navmesh":
-                        navmesh_pieces.append((piece_m, utm, seam_coords))
-                    else:
+                    if kind != "navmesh":
+                        counts[kind] += 1
                         skeleton_pieces.append(piece_wgs84)
+                        continue
+
+                    # Width-eligible AND passes classify_water_body's any-overlap depth
+                    # check -- but "any deep DEPARE polygon overlaps this piece" is not
+                    # "this piece is deep". Carve out the confirmed-deep sub-area before
+                    # triangulating; the shallow/unsurveyed remainder falls back to
+                    # skeleton/laned treatment exactly like a narrow piece.
+                    deep_m, shallow_m = self._split_deep_shallow(piece_m, utm, depth_gdf, cfg.depth_ceiling_m)
+                    for deep_piece_m in self._explode_polygonal(deep_m):
+                        counts["navmesh"] += 1
+                        navmesh_pieces.append((deep_piece_m, utm, seam_coords))
+                    if not shallow_m.is_empty:
+                        shallow_wgs84 = gpd.GeoSeries([shallow_m], crs=utm).to_crs(self.CRS_WGS84).iloc[0]
+                        shallow_kind = self.classify_water_body(shallow_wgs84, False, depth_gdf, fairway_gdf, cfg)
+                        counts[shallow_kind] += len(self._explode_polygonal(shallow_m))
+                        skeleton_pieces.append(shallow_wgs84)
 
                 # Build skeleton pieces before navmesh pieces so navmesh seam nodes can
                 # coordinate-snap onto already-created skeleton endpoint nodes.
@@ -599,6 +616,101 @@ class NauticalRoutingPipeline:
             return set()
         return {(round(x, precision), round(y, precision))
                 for x, y in shapely.get_coordinates(seam_geom)}
+
+    def _split_deep_shallow(self, poly_m, utm, depth_gdf, depth_ceiling_m: float):
+        """Split a width-eligible ("wide") metric-CRS polygon into a deep part
+        that's actually confirmed navmesh-eligible and a shallow/unsurveyed
+        remainder that isn't -- the depth-side analog of `_split_wide_narrow`.
+
+        `_has_navigable_depth` (used by `classify_water_body`) is an ANY-overlap
+        test: a wide polygon qualifies as 'navmesh' if a single deep DEPARE
+        polygon intersects it anywhere, even if the polygon is mostly shallow.
+        Confirmed on a real full-scale run this isn't a rounding-error edge case:
+        89.6% of navmesh_boundary (edge_kind_id=1) edges came out shallower than
+        the depth ceiling (avg 3.17m vs the 6.0m default ceiling), because the
+        region's own PERIMETER -- which becomes real, depth-sampled graph edges,
+        see build_navmesh_region -- runs through whatever shallow fringe the
+        original wide polygon had, not just its confirmed-deep interior. Real
+        navmesh boundary edges ended up shallower on average than skeleton
+        (narrow-channel) edges, which is backwards from the architecture's own
+        intent. This carves the shallow fringe OUT before triangulation instead
+        of only gating the whole-polygon classification decision.
+
+        Deliberately vector, not raster: DEPARE data is already polygon
+        geometry with DRVAL1, so intersecting it directly is both simpler and
+        more precise than rasterizing just to re-vectorize a threshold mask.
+        No DEPARE coverage at all for this polygon falls back to the existing
+        `_has_navigable_depth` behavior (treat as fully deep) rather than
+        becoming stricter for data that was never partially-shallow to begin
+        with -- this fix targets the "partially surveyed as shallow" case, not
+        unsurveyed gaps.
+        """
+        if depth_gdf is None or depth_gdf.empty or "DRVAL1" not in depth_gdf.columns:
+            return poly_m, Polygon()
+        # Spatial pre-filter first (this component's own bbox only, in the
+        # source CRS -- cheap, and avoids handing unary_union a global
+        # depth-area layer's worth of geometry for a single small piece) and
+        # make_valid() every candidate before unioning: raw S-57-derived
+        # DEPARE polygons can be invalid (self-intersecting rings etc.), and
+        # unary_union/intersection/difference on invalid input is a real GEOS
+        # segfault risk, not just a correctness one -- confirmed by hitting
+        # exactly that crash with the naive version of this function during
+        # implementation (no spatial filter, only buffer(0) on the union
+        # *result*, nothing on the inputs). Mirrors the make_valid() pattern
+        # already used for the obstacle layer above, not a new convention.
+        poly_wgs84_bounds = gpd.GeoSeries([poly_m], crs=utm).to_crs(depth_gdf.crs).total_bounds
+        try:
+            candidate_idx = depth_gdf.sindex.query(box(*poly_wgs84_bounds), predicate="intersects")
+        except Exception:
+            candidate_idx = depth_gdf.index
+        candidates = depth_gdf.iloc[candidate_idx] if len(candidate_idx) else depth_gdf.iloc[[]]
+        if candidates.empty:
+            return Polygon(), poly_m
+        drval = pd.to_numeric(candidates["DRVAL1"], errors="coerce")
+        deep_gdf = candidates[drval >= depth_ceiling_m]
+        if deep_gdf.empty:
+            return Polygon(), poly_m
+        deep_geoms = deep_gdf.geometry.make_valid()
+        deep_geoms = deep_geoms[deep_geoms.notnull() & deep_geoms.is_valid]
+        if deep_geoms.empty:
+            return Polygon(), poly_m
+        deep_mask_m = gpd.GeoSeries(deep_geoms, crs=depth_gdf.crs).to_crs(utm)
+        # Simplify the DEPARE-derived cut boundary before it ever reaches
+        # triangulation, same reasoning and same tolerance _split_wide_narrow
+        # already applies to its own boundary: raw DEPARE polygons carry
+        # survey-grade vertex density (confirmed elsewhere in this file's
+        # history to run to hundreds of vertices for small features), and
+        # feeding that complexity straight into build_navmesh_region's PSLG
+        # pushed a region over NAVMESH_PSLG_BUDGET that fit comfortably
+        # before this split existed, triggering build_navmesh_region's
+        # simplify-retry loop on a many-holed polygon and segfaulting
+        # _triangle.triangulate -- confirmed by reproducing the crash with
+        # this step absent and it going away with it present.
+        # Morphological closing (+buffer then -buffer) on top of simplify:
+        # real DEPARE polygons from adjacent survey contours rarely align
+        # exactly with each other or with the water body's own boundary, so
+        # a straight union/intersection/difference chain produces thin
+        # slivers and small holes that are topologically pathological (not
+        # just visually messy) -- this is what was still crashing
+        # _triangle.triangulate after simplify() alone. 5m closing radius:
+        # small relative to open water, big enough to erase chart-contour
+        # misalignment slivers.
+        # A knife-edge cut exactly at the depth-ceiling contour puts the
+        # region's own boundary -- which becomes real, sampled graph edges --
+        # right at the transition, so ordinary DEPARE band-boundary/sampling
+        # noise pushes a lot of it to read just *under* the ceiling rather
+        # than comfortably above (confirmed: without this margin, 84% of
+        # boundary edges landed in the 5.0-6.0m band specifically, not
+        # spread shallower -- a real but different, much smaller problem than
+        # the one this function fixes). Erode the deep mask a further margin
+        # past the ceiling contour so the region boundary sits inside
+        # confirmed-deep water with real clearance, not exactly on the line.
+        deep_union_m = (unary_union(list(deep_mask_m.geometry)).buffer(0)
+                         .simplify(1.0).buffer(0).buffer(5.0).buffer(-5.0)
+                         .buffer(-DEPTH_SPLIT_SAFETY_MARGIN_M))
+        deep = self._clean_polygonal(poly_m.intersection(deep_union_m))
+        shallow = self._clean_polygonal(poly_m.difference(deep_union_m))
+        return deep, shallow
 
     def classify_water_body(self, polygon, is_wide: bool, depth_gdf, fairway_gdf,
                             config) -> Literal["navmesh", "skeleton", "laned"]:
