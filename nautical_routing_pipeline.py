@@ -1142,6 +1142,62 @@ class NauticalRoutingPipeline:
                         continue
                     try_add(gi, gj)
 
+        # Pass 0b: cross-type k-nearest-neighbor pass, navmesh perimeter
+        # vertices against everything else (skeleton chain nodes, etc).
+        # Pass 0 above queries each node's k=6 nearest neighbors regardless
+        # of type -- inside a densely triangulated navmesh region (a real
+        # region in this dataset has up to 2,877 perimeter vertices packed a
+        # few meters apart), a node's own top-6 nearest neighbors are almost
+        # always same-type immediate neighbors, which crowds out the one
+        # cross-type connector that might be 50-100m away and actually
+        # needed. Confirmed on a real full-scale reproduction: a skeleton
+        # node 94.8m from that region's nearest boundary node had neither
+        # node's top-6 list include the other (both lists were full of
+        # same-type points closer than 94.8m), so Pass 0 never tried the
+        # pair despite it being well within snap_radius_m -- forcing a real
+        # route to detour ~20km round-trip through the one place a
+        # connection did exist. Splitting the KNN query by type (every
+        # skeleton/other node looks at its k nearest navmesh vertices, and
+        # vice versa, via two separate KD-trees) guarantees the true
+        # nearest cross-type candidate is always considered, independent of
+        # same-type local density on either side. node_kind_id is already
+        # stamped NODE_KIND_NAVMESH_VERTEX for every navmesh perimeter
+        # vertex (build_navmesh_region), including ones never seam-tagged,
+        # so no new bookkeeping is needed to tell the two groups apart.
+        navmesh_idx = [i for i, n in enumerate(ids)
+                       if self.graph.nodes[n].get("node_kind_id", NODE_KIND_POINT) == NODE_KIND_NAVMESH_VERTEX]
+        other_idx = [i for i in range(len(ids)) if i not in set(navmesh_idx)]
+        if navmesh_idx and other_idx:
+            from scipy.spatial import cKDTree
+            navmesh_coords = coords_m[navmesh_idx]
+            other_coords = coords_m[other_idx]
+            navmesh_tree = cKDTree(navmesh_coords)
+            other_tree = cKDTree(other_coords)
+
+            k_navmesh = min(6, len(navmesh_idx))
+            _, nn_idxs = navmesh_tree.query(other_coords, k=k_navmesh)
+            if k_navmesh == 1:
+                nn_idxs = nn_idxs.reshape(-1, 1)
+            for local_i, neighbors in enumerate(nn_idxs):
+                gi = other_idx[local_i]
+                for local_j in neighbors:
+                    gj = navmesh_idx[int(local_j)]
+                    if np.linalg.norm(coords_m[gi] - coords_m[gj]) > snap_radius_m:
+                        continue
+                    try_add(gi, gj)
+
+            k_other = min(6, len(other_idx))
+            _, nn_idxs2 = other_tree.query(navmesh_coords, k=k_other)
+            if k_other == 1:
+                nn_idxs2 = nn_idxs2.reshape(-1, 1)
+            for local_i, neighbors in enumerate(nn_idxs2):
+                gi = navmesh_idx[local_i]
+                for local_j in neighbors:
+                    gj = other_idx[int(local_j)]
+                    if np.linalg.norm(coords_m[gi] - coords_m[gj]) > snap_radius_m:
+                        continue
+                    try_add(gi, gj)
+
         # Pass 1: cheap radius-limited KD-tree pass, handles the common case of a
         # small local gap between two adjacent pieces. SKIPPED for large node counts:
         # `tree.query_pairs()` materializes EVERY pair within radius before anything
