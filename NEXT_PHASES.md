@@ -1338,6 +1338,119 @@ confirmed with a real connectivity check the way Round 6's fixes were.
 Worth a real route-through-a-depth-split-region test before this is
 considered fully closed, not just a depth-distribution check.
 
+### Phase 2 Hardening, Round 8 — depth-split region fragmentation (real bug, fixed and verified)
+
+**Confirmed, not just observed**: a fresh area-distribution check on Round
+7's output (not run at the time) found `navmesh_regions` at 201 was
+heavily skewed — 143 of the 201 (71%) were tiny (roughly under 100m
+across), while a handful were genuinely large, for a region the size of
+Zeeland where fewer than 10 real open-water bodies are expected.
+
+**Root cause, confirmed by direct measurement, not guessing**: `_split_deep_shallow`'s
+5m morphological closing (`.buffer(5).buffer(-5)`, added in Round 7 to fix
+a `triangulate()` segfault) was far too small to bridge the real gap it
+needed to. Isolating just the deep-DEPARE-band union (drval1 >= 6.0m,
+9,246 polygons in `zeeland_clip`) and re-running the closing step alone at
+increasing radii, holding everything else fixed:
+
+| closing radius | resulting pieces | tiny (<10,000m²) |
+|---|---|---|
+| 5m (Round 7) | 238 | 187 |
+| 25m | 142 | 95 |
+| 50m | 108 | 68 |
+| 100m | 85 | 51 |
+| 200m | 50 | 31 |
+
+Monotonic, real, and large — confirming lead 1 from this round's brief (a
+thin unsurveyed/misaligned seam between adjacent DEPARE survey-contour
+bands, not a genuine shallow gap). Direct evidence this isn't abstract:
+the most extreme fragments were sub-1m² polygons (one measured 0.007m²)
+sitting 3-48m from a 706,728,203m² neighbor region — pure GEOS
+intersection-boundary noise from the depth cut, not real hydrography. 117
+of the 201 regions sat within 2km of that one giant region, i.e. were
+shrapnel from the same original wide polygon.
+
+Separately, a handful of isolated small basins (a few thousand m², no
+large neighbor nearby even at 1000m) also existed — the class of feature
+Round 5 §5.4 already flagged, confirming lead 2 is real too, just a
+smaller secondary contributor.
+
+**Fix, addressing both leads**: (1) `DEPTH_SPLIT_CLOSING_RADIUS_M` raised
+5m → 50m (order of magnitude, per the brief, not fine-tuned further — the
+marginal gain past 50m drops off while the risk of over-merging distinct
+real features rises). (2) After the depth cut, each deep sub-piece is
+re-run through the *existing* `_split_wide_narrow` width test (reusing
+`min_navmesh_radius_m`, not a new invented threshold): a piece that no
+longer contains a disk of that radius — either genuine GEOS cut noise or
+a real-but-tiny non-navigable pocket — folds back into the shallow side
+instead of becoming a degenerate `navmesh_regions` row.
+
+**Verified with the same method Round 7 used**, full rebuild against
+`data/zeeland_clip`:
+
+| | Round 7 (before) | Round 8 (after) |
+|---|---|---|
+| `navmesh_regions` count | 201 | **25** |
+| region area: min / median / p90 / max (m²) | tiny tail down to 0.007 | **382,691 / 3.19M / 41.6M / 503.8M** |
+| regions under 10,000m² | 143 | **0** |
+| navmesh_boundary avg depth | 6.88m | 6.90m (no regression) |
+| navmesh_boundary <6.0m | 8.2% | 14.3% (still vastly better than pre-Round-7's 89.6%; the width re-filter trades a little margin-band noise for eliminating the fragmentation) |
+| nodes / edges | 114,607 / 248,537 | **60,572 / 125,275** |
+| build time | 13m39s–13m56s (reproduced) | **9m24s** |
+| PSLG-budget simplify-retry triggers | on every build (34,851-vertex outlier) | **once**, for one 40,228-vertex region, succeeded on first retry |
+
+25 regions is closer to real Zeeland hydrography than 201, though still
+above the "fewer than 10" estimate — the remaining 25 read as genuinely
+distinct open-water bodies (min area 382,691m², none of the previous
+degenerate sliver tail), not fragmentation artifacts.
+
+**`loadGraph()` re-verified in `autoroute`, same method as Round 4/7**:
+staged the rebuilt db, called `RoutingDatabase.init()` +
+`loadGraph()` directly (`dist/database.js`) via the node:22 Docker
+pattern. **1.84s** — not just "no regression" but a further ~15x
+improvement over Round 7's already-improved 27.9s, consistent with Round
+4's own finding that the anchor-shortcut precompute cost is dominated by
+a few structurally-complex outlier regions, not total graph size: Round 7
+still had one 34,851-vertex region hitting the PSLG simplify-retry path
+on every build; Round 8 has none.
+
+**Stitching check done (Round 7's other open item), with a real
+connectivity test, not just code-reading**: built the full graph
+(nodes+edges) with `networkx` and checked connected-component membership
+for every `navmesh_regions` row's own perimeter vertices (matched to
+`nodes` by coordinate at the actual 5-decimal precision `_get_or_create_node`
+rounds to — importantly *not* 6 decimals, which silently fails almost
+every match). Result: **98.3% of all region-perimeter nodes across all 25
+regions are in the single giant connected component** (23 of 25 regions
+at 99.7-100%), confirming the generic Pass 0 KNN stitching (Round 6) does
+correctly reach the new depth-cut boundary even without explicit
+`boundary_node_ids` seam-tagging for it (confirmed separately: 24 of the
+25 regions have zero tagged `boundary_node_ids` — the seam-coordinate set
+passed into `build_navmesh_region` for a depth-split piece is still only
+the original width-based wide/narrow seam, never updated to include the
+depth cut — yet stitching still finds these nodes because Pass 0 scans
+every coastal node in the original connected-water component, not just
+tagged ones).
+
+**New, smaller finding, not yet fixed — flag for a future round, don't
+conflate with the fix above**: 2 of the 25 regions (a linked pair, ~950
+combined nodes, near 51.63°N/3.59°E) sit in a component that's fully
+disconnected from the main graph despite being only **57m** from it —
+well inside the 500m `_stitch_component_pieces` snap radius. Checked
+whether this is a Round 8 regression: **it is not** — the same
+"near-miss" class (a disconnected component within 500m of the main
+network that the stitch guarantee pass logs as "could not find a valid
+in-polygon connector among sampled candidates") already existed at
+similar relative scale in the reproduced Round 7 baseline (237 near-miss
+components / 1,488 nodes there, vs 256 / 1,961 n here) — this is the
+same pre-existing, already-tracked Round 5/6 stitching-guarantee-pass gap,
+not a new bug class. Round 8's fix does modestly shift more nodes into
+that bucket in relative terms (1.3% → 3.2% of total nodes), most likely
+because the larger closing radius and width re-filter change piece
+boundaries at some seams enough to remove a previously-valid land-avoiding
+connector — worth keeping in mind next time Round 5/6's stitching gap
+gets picked back up, but out of scope for this round's fix.
+
 ---
 
 ## What's confirmed working from Phase 0
