@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
 Add named POIs from nautical-routing-pipeline GeoJSON layers to an EXISTING
-autoroute SQLite database
+routeiq SQLite database
 
 The script is deliberately standalone so it can be re-run against any database
-that follows the autoroute schema (nodes/edges/pois tables).
+that follows the routeiq schema (nodes/edges/pois tables).
 
 POI extraction mirrors nautical_routing_pipeline.py exactly (same layers, same
 name/point selection, same deterministic MD5 ids, same bridge subtype/height
@@ -226,7 +226,7 @@ CREATE TABLE IF NOT EXISTS pois (
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[1],
                                  formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    ap.add_argument("--db", required=True, help="Existing autoroute SQLite database")
+    ap.add_argument("--db", required=True, help="Existing routeiq SQLite database")
     ap.add_argument("--input-dir", default="./output_geojson",
                     help="Directory with pipeline GeoJSON layers")
     ap.add_argument("--layer", action="append", default=[], metavar="TYPE=PATH",

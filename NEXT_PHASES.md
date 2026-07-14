@@ -3,7 +3,7 @@
 Status: Phase 0 and Phase 1 (this repo, `signalk-router-pipeline`) are
 implemented, verified, and committed (`e6f1fc5`, `7e64df9`, `dee556c`,
 `3c108b1`). Phase 2 (funnel-algorithm consumption, in the separate
-`autoroute` repo) also turned out to already be implemented and committed
+`routeiq` repo) also turned out to already be implemented and committed
 (`bfd3560`), and its own "Boundary Shortcut Sparsification" hardening pass
 (`ece6278`) and "Round 3 — Navmesh Entry/Exit Correctness" pass
 (`2ebd29b`) are committed too. **Round 3 is independently re-verified this
@@ -14,7 +14,7 @@ constraint compliance, not just "did it return something").
 
 **Phase 2 Hardening, Round 4 is DONE, independently re-verified today
 against a fresh build + the current full-scale `data/zeeland.sqlite`
-(commits `72c0a43` autoroute, `512188f` this repo)**: 39/39 tests pass,
+(commits `72c0a43` routeiq, `512188f` this repo)**: 39/39 tests pass,
 `loadGraph()` is 69s (was 237s), and the Zeelandbrug scenario genuinely
 passes at full scale — `Through opening: true`, 4,962m, zero warnings,
 confirmed directly, not just re-reading the commit message.
@@ -55,7 +55,7 @@ with no other mechanism connecting it to the coastal network at all.
 **Not done — see "Phase 2 Hardening, Round 6" §5.2.1 for the full
 verified picture, the evidence trail, and the concrete next step**
 (a real design decision about inland/coastal network stitching, not a
-tuning fix), including working scratch scripts in `autoroute`'s working
+tuning fix), including working scratch scripts in `routeiq`'s working
 tree, a real starting point for whoever continues this.
 
 **Also from the Round 5 investigation, still relevant:** (c) "edges
@@ -112,7 +112,7 @@ previously-unexercised performance bug, now fixed — see
 
 ### Implementation status (this session)
 
-Implemented in `autoroute` per the design below, with one deliberate
+Implemented in `routeiq` per the design below, with one deliberate
 correction to step 3 (details there): `selectAnchors` (farthest-point
 sampling, `navmesh.ts`), `precomputeFunnelEdges` rewritten to drop the
 150-node cap and add anchor-anchor + nearest-anchor shortcut edges
@@ -172,7 +172,7 @@ edge-by-edge):
 
 ### Round 2 — Follow-up investigation (verified this session, corrects the lead above)
 
-Rebuilt `autoroute` fresh (38/38 tests still pass) and re-verified against
+Rebuilt `routeiq` fresh (38/38 tests still pass) and re-verified against
 a **freshly regenerated** database rather than trusting the existing
 `zeelandbrug_tight_phase1.sqlite` fixture — this mattered:
 
@@ -230,7 +230,7 @@ from outside it. See "Recommended next steps" below.
 
 ### What's confirmed broken (verified by actually running the scenario, not just reading code)
 
-Built `autoroute`, ran the full automated suite (35/35 pass, including
+Built `routeiq`, ran the full automated suite (35/35 pass, including
 dedicated `navmesh.test.ts`/`navmesh-integration.test.ts`), then ran the
 real `zeelandbrug_test.ts` scenario against a genuine Phase-1-generated
 database (`zeelandbrug_tight_phase1.sqlite`, staged at
@@ -377,7 +377,7 @@ the direct instrumentation approach this section originally specified
 (live logging in `astarSearch`/`seedNavmeshCandidates`, not a bypass) is
 exactly what surfaced all three:
 
-1. **`autoroute`/`navmesh.ts`: SSFA funnel algorithm had `left`/`right`
+1. **`routeiq`/`navmesh.ts`: SSFA funnel algorithm had `left`/`right`
    portal vertices swapped.** `funnel()`'s `getPortalEdge` consumption
    built each portal as `{ left: vertices[edge.b], right: vertices[edge.a]
    }` — backwards. Confirmed by reproducing the exact failure on a
@@ -405,7 +405,7 @@ exactly what surfaced all three:
    looser assertion had been accidentally passing *because* of the bug
    (extra zigzag points inflated the count past its threshold either
    way), so it wouldn't have caught a regression.
-2. **`autoroute`/`routing.ts`: `astarSearch`'s goal test ignored the
+2. **`routeiq`/`routing.ts`: `astarSearch`'s goal test ignored the
    funnel "suffix" cost.** When a navmesh region resolves multiple
    boundary-node candidates (`seedNavmeshCandidates`), each candidate's
    own precomputed cost back to the literal destination point (its
@@ -427,7 +427,7 @@ exactly what surfaced all three:
    symmetrically on exit. (`MinHeap` gained a `peek()` method to support
    this.)
 3. **`signalk-router-pipeline`/pipeline: the obstacle layer hard-blocked
-   the bridge's own opening corridor.** Even with both `autoroute` fixes,
+   the bridge's own opening corridor.** Even with both `routeiq` fixes,
    the route still couldn't reach the bridge at all — direct inspection
    showed every one of the bridge's own 4 crossing edges, plus dozens of
    navmesh boundary-ring edges leading to them, had `crosses_obstacle=1`,
@@ -456,7 +456,7 @@ exactly what surfaced all three:
      since a *genuinely* `RESTRN=1` obstacle elsewhere could still
      otherwise block a real opening-bridge crossing.
 4. **`No route found` error message improved** (unrelated bug report from
-   the same session, `autoroute`/`routing.ts`): previously always blamed
+   the same session, `routeiq`/`routing.ts`): previously always blamed
    vessel dimensions ("checking vessel dimensions draft=Xm...") regardless
    of actual cause. `astarSearch` now tallies *why* edges were skipped
    during the failed search (land, obstacle, draft, air draft, beam, coast
@@ -486,13 +486,13 @@ exactly what surfaced all three:
 session — full-scale `loadGraph()` down from ~237s to ~76s (3.1x), and the
 Zeelandbrug scenario now genuinely passes at full scale (`Through opening:
 true`, 4,962m, zero warnings), matching Round 3's small-fixture result.
-Verified three ways: the `autoroute` test suite (39/39), a direct script
+Verified three ways: the `routeiq` test suite (39/39), a direct script
 against the regenerated `data/zeeland.sqlite` via `RoutingDatabase`/
 `RoutingEngine`, and live through the running plugin's HTTP API
 (`POST /signalk/v1/api/router/route`, 1.3s response, deployed via
 `deploy.sh`). Did 4.2 first as originally suggested, then 4.1.
 
-**4.2 fix** (`autoroute`, `src/navmesh.ts` + `src/database.ts`): profiling
+**4.2 fix** (`routeiq`, `src/navmesh.ts` + `src/database.ts`): profiling
 (`console.time` around `precomputeFunnelEdges`'s two sub-phases) found the
 doc's own original lead wrong — `upgradeRingBoundaryEdges` was never the
 problem (120ms total). The real cost was `addAnchorShortcutEdges`, almost
@@ -989,12 +989,12 @@ merged without preserving them).
 `try_add`/component-membership trace added to and then removed from
 `_stitch_component_pieces` before committing) is not preserved in the
 committed diff — only the real Pass 0b fix is. The `round6*.mjs` scripts
-in `autoroute`'s working tree (now including several new ones from this
+in `routeiq`'s working tree (now including several new ones from this
 session: `round6b-check*.mjs`, `round6c-region1.mjs`,
 `round6d-region-correct.mjs`) remain as a real, reusable starting point
 for whoever continues this, same as before.
 
-**Housekeeping, done this session**: `autoroute/src/routing.ts`'s
+**Housekeeping, done this session**: `routeiq/src/routing.ts`'s
 temporary `[DEBUG round6]` console logging and the two hardcoded
 `fs.readFileSync` calls reading `debug_region13.json`/`debug_region16.json`
 from a deployed-path location have been reverted (`git checkout --
@@ -1098,12 +1098,12 @@ investing further Round 7 time or a fresh region build:
    once items 1-2 land.
 4. **Second Phase 2 hardening pilot region: Puerto Rico.** Zeeland-only
    tuning risks overfitting to one water-body character; a prior
-   pre-redesign Puerto Rico attempt exists (`autoroute/data/pr_routing2.sqlite.disabled`,
+   pre-redesign Puerto Rico attempt exists (`routeiq/data/pr_routing2.sqlite.disabled`,
    schema_version=3, dense-grid/unconstrained-Delaunay signature — not
    reusable, would need a full fresh run against the current architecture).
    NOAA ENC data for the region is already downloaded (`python3
-   data/download_noaa.py --region us-caribbean` from `autoroute/data/`,
-   154 `.000` files at `autoroute/data/US/us-caribbean/PR`, ~35MB).
+   data/download_noaa.py --region us-caribbean` from `routeiq/data/`,
+   154 `.000` files at `routeiq/data/US/us-caribbean/PR`, ~35MB).
    **Recommended sequencing**: land items 1-2 above and re-verify Zeeland
    first, so the Puerto Rico build isn't spent validating soon-to-be-stale
    parameters; then run `enc_preprocessor.py` (10-30+ min) and a full
@@ -1404,7 +1404,7 @@ above the "fewer than 10" estimate — the remaining 25 read as genuinely
 distinct open-water bodies (min area 382,691m², none of the previous
 degenerate sliver tail), not fragmentation artifacts.
 
-**`loadGraph()` re-verified in `autoroute`, same method as Round 4/7**:
+**`loadGraph()` re-verified in `routeiq`, same method as Round 4/7**:
 staged the rebuilt db, called `RoutingDatabase.init()` +
 `loadGraph()` directly (`dist/database.js`) via the node:22 Docker
 pattern. **1.84s** — not just "no regression" but a further ~15x
@@ -1450,6 +1450,447 @@ because the larger closing radius and width re-filter change piece
 boundaries at some seams enough to remove a previously-valid land-avoiding
 connector — worth keeping in mind next time Round 5/6's stitching gap
 gets picked back up, but out of scope for this round's fix.
+
+### Phase 2 Hardening, Round 9 — issue collection from live route review (NOT root-caused or fixed yet — collection phase only, by explicit request)
+
+User reviewed a real full-scale route in the live webapp (Oude-Tonge
+51.6890,4.2124 → near Zierikzee 51.6257,3.8370 — the same general area as
+Round 5/6's original reported bug) and flagged multiple distinct issues
+from screenshots. Per explicit instruction: **do not attempt fixes until
+all issues are collected and understood together** — this section is a
+precise record of what was observed, with grounded hypotheses noted
+separately from confirmed root causes. Nothing below is fixed.
+
+**Issue A — ~2x distance detour via a large southward loop through
+Zandkreeksluis/Veerse Meer.** 51.4nmi actual vs. an expected ~20-25nmi
+direct distance. Route panel's own constraint-violation summary: "constrained
+for 49 legs — 3.3nm — depth 0.0m < required 1.5m; air draft 11.0m <
+required 17.3m." Geographically **distinct** from Round 6's original
+southward detour (which ran toward Tholen/Sint-Philipsland, further
+east) — Veerse Meer is a former estuary connected via a lock, plausibly
+also touching `inland_waterways`-sourced data, so whether this is the
+same underlying mechanism (Round 6's inland/coastal exclusion,
+§5.2.2) manifesting at a second location, or a distinct cause, is **not
+yet determined**. The charted 0.0m depth figure is notable on its own
+(conventionally means drying/intertidal) and is being tracked as a
+separate data point, not assumed to share a cause with the distance
+issue.
+
+**Issue B — opening bridge not taken, at a bridge the existing automated
+test doesn't cover.** Symptom matches the Round 4/5 bridge-avoidance
+regression class, but occurs near Zandkreeksluis ("brug over
+buitenhoofd") — a different bridge from the Zeelandbrug that
+`test/zeelandbrug.test.ts` (`routeiq`) actually exercises. Not yet
+determined whether this is: the same underlying defect recurring
+somewhere untested, a regression from later pipeline changes (Rounds
+6-8 all touched navmesh/depth classification), or specific to this
+bridge.
+
+**Issue C — route abandons a correctly-followed fairway near a bridge,
+heads the wrong direction.** Consistent in character with the stitching
+gaps found across Rounds 4/6/8 (a missing connection at a graph-piece
+transition point forcing an unwanted reroute), but this specific
+location/instance has not been isolated.
+
+**Issue D — real route doesn't appear to use navmesh interior at all,
+only the boundary contour.** Two parts, kept separate: (1) no interior
+edges shown in the debug "Graph edges" view is very likely by design —
+navmesh regions store no interior edges at all, only the boundary ring;
+the interior is meant to be consumed live via the funnel algorithm, not
+browsed as a static list — **not confirmed as a bug**. (2) The *actual
+returned route geometry* visually hugging the region's outer contour
+instead of cutting a taut interior line is a materially different, more
+concerning claim — if real, it directly confirms the question left open
+and unverified since Round 5 §5.3 ("whether the actual returned route —
+not the debug view — correctly follows an edge's curved `path_points`").
+**Not yet verified against real data.**
+
+**Issue E — dense fan of edges at bridge/lock POIs, including edges that
+visibly cross land/roads.** New screenshot (Zandkreeksluis area) shows
+many straight lines radiating from multiple close-together "SS(Bridge)"
+points to scattered nodes, several clearly crossing the N256/1e Deltaweg
+road and land. **A strong, code-grounded candidate mechanism already
+exists, not yet confirmed against this specific data**:
+`_add_opening_bridge_edges`'s "quadrant ray-casting" connection step
+(`nautical_routing_pipeline.py` ~line 1556) does a nearest-node search
+per quadrant within a **0.015° (~1.5km) bounding box** around each bridge
+opening point, with **no land-crossing check at connection time** — and
+the edge it adds is created with `crosses_land=0` **hardcoded**, not
+computed from real geometry. Separately, `_sanity_check_no_land_crossings`
+explicitly documents that "opening-bridge edges are never touched" —
+i.e. they're the one edge category exempt from the land-crossing
+strip/audit pass every other edge kind goes through. Together these mean
+a bridge-opening edge is currently the *least* verified edge type in the
+whole pipeline for land-crossing risk, structurally, not just by bad
+luck on this one bridge.
+
+**CONFIRMED, not just hypothesized** (`data/zeeland_round8_verify.sqlite`):
+the Zandkreeksluis bridge-opening node (`509558598386510`, 51.54405,3.8651)
+has a 434m edge to node `509558850385884` (51.54412,3.85884) stored with
+`crosses_land=0` — independently checked against the real
+`land_polygons.geojson` and it **genuinely intersects land**. This one
+edge is also one of exactly 4 edges from the bridge node, matching the
+"connect to nearest node per quadrant" behavior precisely — strong
+evidence this specific edge is a direct product of the unchecked
+quadrant search, not coincidence.
+
+**Issue F — navmesh classification still triggering for water that
+reads as too narrow.** Second new screenshot (near Zoommeer/Bergsche
+Diep) shows a dense, ring/loop-shaped perimeter of many closely-packed
+nodes around a modest-width body of water — the classic navmesh-boundary-
+ring signature for water that doesn't look like it should qualify as
+"open water, no interior nodes needed." This directly reconnects to an
+**already-written-up but never-implemented** recommendation
+(§5.2.3 item 2, from earlier this same investigation): raise
+`min_navmesh_radius_m` (currently 300.0m) substantially. **Confirmed
+still needed**: Round 7/8's depth-split fix (`_split_deep_shallow`) only
+added a depth-based sub-split *on top of* the existing width-based
+split — it never touched `min_navmesh_radius_m` or the width-eligibility
+threshold itself, so this axis is exactly as under-tuned as it was
+before Round 7 started.
+
+**Issue G — navmesh boundary still tracing through visibly shallow/drying
+terrain near Yerseke, even after the Round 7/8 depth-split fix.**
+Screenshot with a real IENC depth-contour basemap underneath shows the
+navmesh_boundary ring (the thick teal ring with circular node markers,
+same visual signature as Issue F) running across areas the chart clearly
+shades as drying/intertidal in a complex, braided tidal-flat channel
+network near Yerseke (Oosterschelde), rather than tracking the
+darker-blue deep channel visibly winding through the same area on the
+same chart. This is notable specifically *because* Round 7/8 already
+fixed the general version of this problem elsewhere in Zeeland — so
+either this particular area wasn't helped by that fix, or something
+about this terrain type defeats it. **Two candidate hypotheses, neither
+confirmed yet**:
+1. `_split_deep_shallow` explicitly falls back to treating a whole piece
+   as fully deep when it finds *no* confirmed-deep DEPARE coverage at
+   all (deliberate, to avoid being stricter than the pre-existing
+   `_has_navigable_depth` for genuinely unsurveyed gaps — see Round 7's
+   writeup). If DEPARE coverage is patchy specifically over this area's
+   real channel, the split may simply never trigger here.
+2. Round 8's `DEPTH_SPLIT_CLOSING_RADIUS_M` (50m, raised specifically to
+   stop false fragmentation elsewhere) may be **too large for this
+   terrain type** — a tidal mudflat's braided channels are often
+   separated by drying banks/spits narrower than 100m, exactly the width
+   a 50m closing radius would bridge over, incorrectly folding a real
+   shallow separator into the "deep" mask instead of correctly excluding
+   it. If true, this is a direct tension with Round 8's own fix, not an
+   unrelated bug — the same parameter, tuned to fix over-fragmentation
+   in one terrain type, may be under-fragmenting (over-including) a
+   different one. Would need checking against DEPARE coverage and the
+   deep-mask shape *before* closing, specifically in this bbox, to tell
+   these two apart (or confirm both are contributing).
+
+**Issue H — a chain of nodes cuts straight across farmland near
+Middelburg, between a lock and a resumed canal segment.** Screenshot
+shows the canal through Middelburg (Kanaal door Walcheren) correctly
+traced by the usual blue-circle chain down to a cluster of small nodes
+right at a visible lock (lock-gate icons, near Havenpoortweg) — then a
+**separate-colored chain of black-dot nodes** continues in a near-straight
+line across open fields, over the "Zeeuwse lijn" railway, to reconnect
+with the blue chain at a canal segment further south near Keetweg. The
+color change (black vs. blue) is itself a real signal, not just
+description — it's consistent with the node-ID type-bit distinction
+(`inland` vs `coastal`) Round 6 decoded directly from real data, so this
+may be an `inland_waterways`-sourced segment stitched to the rest of the
+network by a generic distance-based connector, not the fairway/skeleton
+machinery. **Two already-identified, real gaps make this a plausible
+mechanism, not a wild guess**: (1) Round 6/8 already found and documented
+that **locks have no dedicated connectivity-generating mechanism** the
+way bridges do (`_add_opening_bridge_edges` only handles bridges;
+locks are only ever used to annotate an existing edge's attributes,
+never to create one) — so if this canal is genuinely interrupted at the
+lock chamber, the *only* way these two pieces could connect at all today
+is via a generic stitching pass. (2) That generic stitching
+(`_stitch_component_pieces`) only guards against land-crossing via
+`within(poly_m)`/`_crosses_land` checks against the *land layer* — if the
+lock structure itself is mapped as a small land/building feature (a
+believable gap, not confirmed), a straight connector routed near/through
+it could pass those checks incorrectly.
+
+**CONFIRMED, at smaller scale than E**: independently checked every long
+(>150m) inland-to-inland edge in the wider Middelburg area against real
+`land_polygons.geojson`. Most (14/15) genuinely don't cross land — long
+inland_waterways edges are mostly legitimate sparse-vertex representations
+of real waterway geometry, not automatically suspicious. But one, `1157178078357594`
+(51.43835,3.57594) → `1157195826356045` (51.44329,3.56045), 1209m, stored
+`crosses_land=0`, **genuinely crosses land** when checked directly. Lower
+hit-rate than Issue E's bridge-quadrant mechanism (which is closer to
+100% unchecked by construction), but confirms the same underlying gap —
+`crosses_land` isn't reliably computed/verified for at least some
+inland-typed edges either. Exact identity of *this specific database's*
+edge vs. the one visible in the screenshot not pinned down precisely
+(couldn't correlate screenshot pixels to exact coordinates), but the
+mechanism is real regardless of which exact edge was photographed.
+
+### Investigation update — a master root cause found connecting Issues A, C, and D (user gave the go-ahead to start investigating)
+
+Reproduced the reported route live (`routeiq`'s `RoutingEngine.calculateRoute`,
+same coordinates as the original report, against a fresh
+`zeeland_round8_verify.sqlite`) rather than continuing to theorize from
+screenshots. Distance came back different from the screenshot's 51.4nmi
+(37.4nmi here) — **expected**, since the screenshots were almost
+certainly taken against the live-deployed database, which predates
+Round 7/8's depth-split fix; the qualitative problems (constrained legs,
+`depth 0.0m`, `air draft 11.0m`) persist in the reproduction too, so the
+underlying issues are real and not resolved by Round 7/8, just shifted.
+
+**Found the actual mechanism, not just a symptom.** One "segment" in the
+real returned route: 6,666.75m long, exactly **2 coordinates** (a straight
+chord, no interior detail), `minDepth=0`. Traced it back to the database:
+a **stored `edge_kind_id=1` (navmesh_boundary) edge** between two ring-
+adjacent perimeter vertices, `drval1=-2.0` (genuinely charted as drying/
+intertidal at that sample point) but `crosses_land=0` (the land-crossing
+check only looks at the land layer, not DEPARE/drying data — a real,
+separate gap from Issues E/H, noted for later). **The format spec is
+explicit that `edge_kind_id=1` edges are "not directly traversed as a
+weighted graph edge"** — real navigability through/across a region is
+supposed to come from the funnel-computed upgrade
+(`upgradeRingBoundaryEdges`) and anchor shortcuts
+(`addAnchorShortcutEdges`) that `precomputeFunnelEdges` builds at load
+time. This edge was traversed directly, unupgraded, by the live route.
+
+**Root cause, confirmed by direct query, not inference**: both
+`upgradeRingBoundaryEdges` and `addAnchorShortcutEdges`
+(`routeiq/src/database.ts`) iterate `region.boundaryNodeIds` — the
+region's own `boundary_node_ids` column — to decide which ring edges to
+upgrade and which anchors to build shortcuts between. **24 of the 25
+`navmesh_regions` rows in the current database have a completely empty
+`boundary_node_ids` array.** Round 8's own writeup already noted this in
+passing (in the context of confirming generic Pass 0 stitching still
+works without seam tags) but didn't connect it to this: the depth-split
+fix (Round 7/8) creates new navmesh region boundaries at the depth-cut
+contour, but the seam-coordinate set passed into `build_navmesh_region`
+was never updated to include that new boundary — only the original
+width-based wide/narrow seam. With an empty `boundaryNodeIds`, both
+`for` loops in `precomputeFunnelEdges` simply never execute — **the
+entire funnel-upgrade and anchor-shortcut mechanism is structurally
+disabled for 96% of navmesh regions**, leaving raw, unupgraded
+ring-adjacency chords (however long or badly-placed Round 7/8's
+simplification/closing left them) as the only way through nearly every
+navmesh region in the database.
+
+**This plausibly explains three of the collected issues at once, not
+three separate bugs**:
+- **Issue D** (route never uses the navmesh interior) — directly
+  explained: there's no funnel computation happening for these regions
+  at all, so there's no interior path *to* use.
+- **Issue A** (~2x distance detour) — a strong candidate explanation:
+  without real interior shortcuts, the router either gets forced through
+  bad raw chords (like the one found here) or has to find a much longer
+  real path around regions it can't shortcut through.
+- **Issue C** (route abandons the fairway near a bridge) — plausible but
+  not directly traced yet: erratic behavior at a region transition is
+  consistent with falling back to whatever raw ring edge happens to be
+  nearby instead of a real computed path, but this specific instance
+  wasn't isolated this session.
+
+**Not yet done**: fixing this (the obvious direction is making the
+depth-split boundary contribute to the seam-coordinate set the same way
+the width-based seam already does, so `boundary_node_ids` gets populated
+correctly for depth-split regions too) — per the explicit process for
+this round, confirming the connection was the goal, not fixing yet.
+Also not yet done: isolating Issue B (bridge avoidance) and Issue C
+specifically against this same mechanism, and Issues F/G (Yerseke
+depth-split tuning) remain uninvestigated.
+
+**Issue I — navmesh boundary node density is still high enough that
+fixing the master finding above is not a free lunch.** User's own
+observation, and an important one to weigh together with the fix above,
+not after it: `precomputeFunnelEdges`'s cost is a direct function of
+`boundaryNodeIds.length` (ring-adjacency upgrades) and
+`anchorNodeIds.length` (anchor-to-anchor pairs, **O(n²) per region**).
+Round 8's "27.9s → 1.84s" load-time numbers were measured while this
+mechanism was **structurally disabled** for 24/25 regions (empty
+`boundary_node_ids`) — those numbers say nothing about real precompute
+cost once it's actually populated and the mechanism starts running for
+real. This is exactly the same density concern already raised earlier
+in this same investigation (§5.2.3 items 1-2: raise `min_navmesh_radius_m`,
+add a coarse simplify pass on navmesh boundary *output* specifically) —
+raised then, written up, but **never implemented**, and now more urgent:
+fixing `boundary_node_ids` without also addressing boundary density
+risks trading a correctness bug (silent fallback to bad raw chords) for
+a reintroduced performance bug (Round 4/5's original ~198s-for-one-region
+problem, or worse, since this time it's O(anchors²) rather than the
+older O(boundary_nodes) issue). **Recommendation, not yet acted on**: do
+the `boundary_node_ids` fix and the density-reduction work
+(`min_navmesh_radius_m` + boundary-output simplify) together, then
+re-measure load time the same way Round 4/7/8 all did, rather than
+fixing connectivity first and discovering the cost regression after.
+
+**Next step, per explicit instruction**: issues A/C/D now look
+connected with real evidence, not just suspected — but B, and F/G,
+still need their own look before any fix is attempted, per the same
+"don't conflate, don't fix from a partial picture" discipline as before.
+
+**Issue J — Vlissingen town-center canal (Binnenhaven) appears to have
+no edges/nodes at all in the live webapp, despite the IENC basemap
+showing water there.**
+
+**Correction to the original writeup here**: this section initially
+concluded the live server was running a stale, pre-Round-7/8 database,
+and recommended redeploying before investigating further. **That was
+wrong — checked directly, not assumed.** The actual live-deployed file
+(`/home/node/signalkdev/routeiq/data/zeeland.sqlite`,
+`last_update_date=2026-07-13T13:31:23Z`) is already Round-8-level (25
+`navmesh_regions`, 24/25 with empty `boundary_node_ids`, matching
+depth-distribution numbers) — not stale. Querying it directly (not a
+separately-built copy) found **185 nodes and 374 edges already present**
+in the Vlissingen town-center bbox — real, connected graph coverage.
+So the data is genuinely there; the webapp's debug view just isn't
+showing it.
+
+**Real, more likely explanation, found by reading the webapp code**:
+`graphEdgesUrl()` (`public/index.html`) caps the `/graph/edges` query at
+`limit=5000` for whatever the current map viewport's bbox is. The
+screenshot's viewport spanned a wide area including Zandkreeksluis and
+the Yerseke tidal-flat network — both dense in edges. It's a strong,
+plausible (not yet proven) candidate that the 5000-edge cap was
+exhausted by denser parts of the same viewport before Vlissingen's
+edges were ever included in the response — a display/query-limit issue,
+routeiq-side, not a pipeline data-completeness issue. Not yet
+confirmed by directly checking what the endpoint actually returns for
+that exact viewport, but the mechanism is real and the data-presence
+check already rules out the pipeline as the cause.
+
+**Issue A's discrepancy also corrected**: re-ran the reproduction
+against the *actual live database* (not a separate rebuild) — got
+**51.4nmi, an exact match to the original screenshot**. The earlier
+"37.4nmi, probably a stale-screenshot artifact" conclusion was wrong;
+it was an artifact of testing against a different (separately-built)
+database with real geometry nondeterminism between builds, not the one
+actually deployed. **The master finding (24/25 regions with empty
+`boundary_node_ids`) is now confirmed directly against the live
+database itself**, not just a separate rebuild — re-running the same
+long-straight-chord check against the live file found another
+unupgraded 2-point, 2,448m ring edge, same signature as before. **No
+deployment was actually needed — the live server was already current.**
+
+**Issue J follow-up — a real, separate gap found at a different location,
+after the user restarted the server and re-checked.** The edge-limit-cap
+hypothesis above doesn't hold for this: the new screenshot (Middelburg's
+town canal loop specifically, *not* Vlissingen town center — a different
+bbox from what was checked above) shows a genuinely uncluttered,
+non-dense viewport, ruling out a `limit=5000` truncation. Checked
+directly, live database, correct bbox this time
+(51.495-51.510°N, 3.585-3.608°E, the canal loop's western/northern
+stretch): **zero nodes**. Checked the pipeline's own source data for the
+same bbox: **zero features in `coastal_water_polygons.geojson` and zero
+in `inland_waterways_lines.geojson`** — both of the layers the pipeline
+currently ingests for water topology. **This is a genuine source-data
+gap, not a generation bug**: the current ENC/IENC-derived input simply
+has no charted water feature there at all, most likely because a narrow
+town-center canal like this isn't covered by official hydrographic
+survey data that prioritizes commercial/larger-vessel navigation. The
+basemap tiles showing water there are a completely independent
+rendering (OpenStreetMap/OpenSeaMap tiles), not derived from the same
+GeoJSON the pipeline consumes — "the chart shows water" and "the
+pipeline's input has a water polygon" are not the same claim, and this
+is a concrete case where they diverge.
+
+**This is exactly the gap class Phase 3a (`PHASE_3_DESIGN.md`) already
+exists to fill** — OSM/OpenSeaMap tier-3 fusion, specifically scoped for
+"small harbors, minor canals, features official charts don't bother
+with." Not a new phase needed, a concrete real-world confirmation that
+3a's stated purpose is correct and needed, not hypothetical.
+
+**Correcting the record precisely**: two different things were true at
+two different bboxes, both checked directly rather than assumed —
+Vlissingen town center (the original Issue J bbox) has real, present
+data; Middelburg's canal loop (this new bbox) has a genuine, confirmed
+source-data absence. Don't conflate the two; they're different issues at
+different locations, and only this second one is a real, confirmed gap.
+
+### Triage — pipeline vs. routeiq, for parallel work
+
+Every root cause confirmed so far is pipeline-side
+(`signalk-router-pipeline`); routeiq's role has been either "correctly
+exposed a pipeline data problem" or "needs its own separate look." Split
+out so each repo's work can proceed independently:
+
+**`signalk-router-pipeline` (this repo) — root causes confirmed or
+strongly implicated here:**
+- **Master finding (A/C/D)**: `build_navmesh_region`'s seam-coordinate
+  set never includes the depth-split boundary, leaving
+  `boundary_node_ids` empty for 24/25 regions and silently disabling
+  `routeiq`'s funnel-upgrade mechanism. Fix direction: make the
+  depth-split cut contribute to the seam set the same way the width-based
+  split already does.
+- **Issue I**: do the above together with finally implementing the
+  already-recommended `min_navmesh_radius_m` increase + navmesh-boundary
+  output-simplify pass (§5.2.3), not after — same underlying density
+  problem, and fixing connectivity alone risks a performance regression
+  once the funnel mechanism actually starts running.
+- **Issue E** (confirmed): bridge-opening quadrant search creates
+  land-crossing edges with hardcoded `crosses_land=0`, exempt from the
+  land-crossing audit pass.
+- **Issue F**: navmesh classification still too permissive for narrow
+  water (same `min_navmesh_radius_m` lever as Issue I).
+- **Issue G**: navmesh boundary still crosses drying terrain near
+  Yerseke even after Round 7/8 — DEPARE coverage gap and/or
+  `DEPTH_SPLIT_CLOSING_RADIUS_M` too large for braided tidal-flat
+  terrain specifically (not yet investigated).
+- **Issue H** (confirmed): generic stitching connector crosses land near
+  a Middelburg-area lock — same land-crossing-check-gap family as E.
+- **New, surfaced during the A/C/D investigation, not yet its own
+  lettered issue**: the land-crossing check (`crosses_land`) only tests
+  against the `land` polygon layer, never against DEPARE/drying
+  (negative `DRVAL1`) data — the 6,666m edge central to the master
+  finding had `drval1=-2.0` (genuinely charted as drying) but
+  `crosses_land=0`. Worth fixing alongside E/H since it's the same class
+  of gap, one layer wider.
+- **Issue J (confirmed, corrected)**: not a display bug — a genuine
+  source-data gap. Middelburg's canal loop (west/north stretch) has zero
+  features in both `coastal_water_polygons.geojson` and
+  `inland_waterways_lines.geojson`. Not a pipeline processing bug to fix
+  in `nautical_routing_pipeline.py` — the fix is **data fusion**, i.e.
+  Phase 3a (OSM/OpenSeaMap tier-3), already designed for exactly this
+  class of gap. Real-world confirmation that 3a is needed, not a new
+  work item.
+- **Issue K (new, confirmed, high priority) — `VERCLR=0` treated as a
+  literal zero air-draft clearance instead of "not surveyed."** Found
+  by `routeiq` while isolating Issue B (that specific bridge-avoidance
+  claim didn't reproduce, but this did, and looks like the real
+  mechanism behind Issue A's route inflation). `zeeland.sqlite` has 58
+  fixed bridges; several — including Koningin Beatrixbrug and one of the
+  two Wilhelminabrug POIs — carry `"height": 0.0`. Traced to
+  `_is_valid()` (`nautical_routing_pipeline.py:30`): it only rejects
+  `None`/NaN, so `VERCLR=0.0` passes as valid and
+  `attrs['max_air_draft'] = clearance = 0.0` gets written to the edge —
+  independently re-verified directly against this exact code, confirmed
+  correct. Per S-57 convention, `VERCLR=0` means "vertical clearance not
+  surveyed," not "genuinely zero clearance" (a charted navigable bridge
+  with real 0m clearance is implausible). Practical effect: any vessel
+  with air draft > 0m is hard-blocked from every fixed bridge whose
+  height was never surveyed, forcing detours to whichever bridges
+  happen to have a real charted height instead. `routeiq` measured the
+  real cost directly: a 10.4km direct crossing near Zandkreeksluis
+  inflated to 90.5km (8.73x) for one tested vessel profile, detouring
+  through an entirely unrelated lock/bridge chain near Vlissingen first.
+  **Fix direction**: in the bridge air-draft block (~line 152-158),
+  treat `VERCLR=0` the same as "not present" — fall back to the `999.0`
+  default the "no bridge found" branch already uses, the same pattern
+  already used for movable bridges just above it in the same block.
+
+**`routeiq` (TypeScript runtime) — needs its own investigation,
+separate from the pipeline fixes above:**
+- **Issue B**: bridge avoidance near Zandkreeksluis, a different bridge
+  than `zeelandbrug.test.ts` covers. Not yet isolated whether this is a
+  pipeline data problem (like E) or an `astarSearch`/bridge-avoidance
+  logic issue on this side — needs its own trace before assuming either.
+- **Possible defensive hardening (not a confirmed bug, a design
+  question)**: should `precomputeFunnelEdges` warn/log when it finds a
+  region with empty `boundaryNodeIds` instead of silently doing nothing?
+  The master finding above was only caught because this session went
+  looking for it — a loud failure mode here would have surfaced it much
+  earlier, and would catch the *next* instance of this class of gap
+  automatically instead of needing another live-instrumentation session.
+- **Re-verification, blocked on the pipeline fix landing**: once
+  `boundary_node_ids` is populated correctly, re-run the same load-time
+  check Round 4/7/8 all used (`loadGraph()` timing) — Issue I's whole
+  point is that this number is very likely to change once the funnel
+  mechanism actually runs, and needs to be re-confirmed acceptable, not
+  assumed from Round 8's now-known-incomplete measurement.
 
 ---
 
@@ -1581,7 +2022,7 @@ interior Steiner points, so this is reliable without `-Y`.
 ### 1.3 Minimum-viable-fallback edges (per format spec §6 — required, not optional)
 
 Without literal routable edges connecting a navmesh region's boundary
-nodes, the *current, unmodified* `autoroute` TS runtime — which doesn't
+nodes, the *current, unmodified* `routeiq` TS runtime — which doesn't
 know `navmesh_regions` exists at all (`db-worker.ts`'s `SELECT`s use fixed
 column lists against `nodes`/`edges` only) — would find open water
 completely disconnected. Generate these now, in this phase, not as an
@@ -1764,10 +2205,10 @@ same-body-only intent structurally enforced instead of incidentally true.
 
 ---
 
-## Phase 2 — Funnel-algorithm consumption (separate repo: `autoroute`)
+## Phase 2 — Funnel-algorithm consumption (separate repo: `routeiq`)
 
 Out of scope for `signalk-router-pipeline` — this is TypeScript work in
-`autoroute/src/routing.ts` / `src/database.ts`, implementing the full
+`routeiq/src/routing.ts` / `src/database.ts`, implementing the full
 consumption contract already specified in
 `router-data/specs/routing-database-format-specification.md` §6:
 
@@ -1818,14 +2259,14 @@ resolved.
 Three more sub-phases, checked against the original project roadmap and
 confirmed genuinely new rather than a gap in it, are designed in
 [`PHASE_4_DESIGN.md`](PHASE_4_DESIGN.md): position-/route-aware dynamic
-database loading (`autoroute` only — stop loading every downloaded
+database loading (`routeiq` only — stop loading every downloaded
 region into memory unconditionally); AI-vision-assisted resolution of
 genuinely ambiguous path choices (extends 3c's override workflow with a
 new trigger category and a concrete vision-model input/output design,
 still human-reviewed, never a live per-query call); and bridge/lock
 wait-time & schedule data (new `pois` fields, sourced via 3c's override
 workflow same as the AI-vision case — the routing-cost/ETA consumption
-side is `autoroute`'s `feature-bridge-lock-waits.md`, not this repo).
+side is `routeiq`'s `feature-bridge-lock-waits.md`, not this repo).
 
 ## Critical files
 
@@ -1833,7 +2274,7 @@ side is `autoroute`'s `feature-bridge-lock-waits.md`, not this repo).
 - `signalk-router-pipeline/requirements.txt` — add `triangle`
 - `router-data/specs/routing-database-format-specification.md` §2.9, §6 —
   authoritative schema/consumption contract for both phases
-- `autoroute/src/db-worker.ts` — defines the "must stay routable by the
+- `routeiq/src/db-worker.ts` — defines the "must stay routable by the
   unmodified runtime" compatibility bar for Phase 1; Phase 2's actual
   target for the funnel-algorithm implementation
-- `autoroute/test/zeelandbrug_test.ts` — manual validation target, unchanged
+- `routeiq/test/zeelandbrug_test.ts` — manual validation target, unchanged
