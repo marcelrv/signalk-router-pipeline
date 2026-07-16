@@ -153,7 +153,13 @@ def _edge_attr_worker(edge_chunk):
                             clearance = 999.0
                         else:
                             verclr = _s57_col(row, 'verclr', 'VERCLR', 'VerClr')
-                            if _is_valid(verclr):
+                            # Per S-57 convention, VERCLR=0 means "vertical clearance
+                            # not surveyed," not a genuine zero-clearance bridge (a real
+                            # navigable fixed bridge with 0m clearance is implausible).
+                            # Treat it the same as "not present" — same 999.0 fallback
+                            # used by the movable-bridge branch above and the
+                            # no-bridge-found case.
+                            if _is_valid(verclr) and float(verclr) != 0.0:
                                 clearance = float(verclr)
                             else:
                                 clearance = 999.0
@@ -249,13 +255,41 @@ DEPTH_SPLIT_CLOSING_RADIUS_M = 50.0  # _split_deep_shallow: morphological closin
                                      # DEPARE survey-contour misalignment gaps between adjacent
                                      # deep bands before cutting (Round 7's original 5m left most
                                      # of this fragmentation in place -- see Round 8 writeup)
+NAVMESH_BOUNDARY_SIMPLIFY_M = 5.0   # build_navmesh_region: a separate, coarser simplify pass on
+                                     # the navmesh region's own boundary specifically, applied right
+                                     # before it becomes PSLG input/output. §5.2.3 item 1 (Round 6/7
+                                     # writeup): _split_wide_narrow's simplify_tol_m=1.0 barely thins
+                                     # survey-grade coastline vertex density, and that same
+                                     # under-simplified polygon flows straight through to the exported
+                                     # navmesh_regions.vertices/boundary_geometry. Deliberately much
+                                     # coarser than the 1.0m tolerance used for the wide/narrow and
+                                     # deep/shallow classification decisions and medial-axis centering
+                                     # (where 1.0m precision still matters) -- this pass only affects
+                                     # the polygon that becomes the navmesh triangulation's own
+                                     # boundary. Far finer than NAVMESH_TARGET_EDGE_M (650m) so real
+                                     # shape detail near bridges/inlets survives. Tuned empirically, not
+                                     # guessed: a 3-way full-scale sweep (no pass / 5.0m / 15.0m) found
+                                     # 5.0m already captures most of the vertex-count win (median
+                                     # vertices/region 1247 -> 125, vs 15.0m's 80 -- little further gain)
+                                     # while costing much less real depth-safety margin than 15.0m
+                                     # (navmesh_boundary edges <3.0m: 0.9% no-pass -> 3.9% at 5.0m ->
+                                     # 6.0% at 15.0m -- see NEXT_PHASES.md Round 9 writeup for the full
+                                     # table). Safe to apply after seam_coord_set is computed: shapely's
+                                     # simplify() only ever *removes* vertices (Douglas-Peucker), never
+                                     # moves a retained
+                                     # one, so exact-coordinate seam matching in build_navmesh_region
+                                     # still works correctly on whatever seam vertices survive.
 
 
 @dataclass
 class ClassificationConfig:
     """Tuning knobs for water-body classification (Step B) and skeleton raster (Step C)."""
     depth_ceiling_m: float = 6.0        # navigable-depth threshold separating deep open water from shoal
-    min_navmesh_radius_m: float = 300.0  # a body must contain a disk of this radius to be navmesh-eligible
+    min_navmesh_radius_m: float = 800.0  # a body must contain a disk of this radius to be navmesh-eligible
+                                          # (raised from 300.0, §5.2.3 item 2: 300m was triggering
+                                          # navmesh/ring-boundary treatment for water that reads as
+                                          # channel-like, not genuinely open, per direct user review of
+                                          # real screenshots -- Round 9 Issue F)
     pixel_min_m: float = 2.0            # medial-axis raster pixel floor
     pixel_max_m: float = 10.0           # medial-axis raster pixel ceiling
     pixel_dim_divisor: float = 200.0    # adaptive px = clamp(min_dim / divisor, floor, ceiling)
@@ -533,11 +567,17 @@ class NauticalRoutingPipeline:
                     # "this piece is deep". Carve out the confirmed-deep sub-area before
                     # triangulating; the shallow/unsurveyed remainder falls back to
                     # skeleton/laned treatment exactly like a narrow piece.
-                    deep_m, shallow_m = self._split_deep_shallow(
+                    deep_m, shallow_m, depth_seam_m = self._split_deep_shallow(
                         piece_m, utm, depth_gdf, cfg.depth_ceiling_m, cfg.min_navmesh_radius_m)
+                    # Depth-split boundary is a real seam too (see
+                    # _split_deep_shallow's docstring addendum) -- merge it with
+                    # the original width-based seam so build_navmesh_region tags
+                    # boundary_node_ids on both, not just the width seam.
+                    depth_seam_coords = self._seam_coord_set(depth_seam_m)
+                    combined_seam_coords = seam_coords | depth_seam_coords
                     for deep_piece_m in self._explode_polygonal(deep_m):
                         counts["navmesh"] += 1
-                        navmesh_pieces.append((deep_piece_m, utm, seam_coords))
+                        navmesh_pieces.append((deep_piece_m, utm, combined_seam_coords))
                     if not shallow_m.is_empty:
                         shallow_wgs84 = gpd.GeoSeries([shallow_m], crs=utm).to_crs(self.CRS_WGS84).iloc[0]
                         shallow_kind = self.classify_water_body(shallow_wgs84, False, depth_gdf, fairway_gdf, cfg)
@@ -652,7 +692,7 @@ class NauticalRoutingPipeline:
         unsurveyed gaps.
         """
         if depth_gdf is None or depth_gdf.empty or "DRVAL1" not in depth_gdf.columns:
-            return poly_m, Polygon()
+            return poly_m, Polygon(), Polygon()
         # Spatial pre-filter first (this component's own bbox only, in the
         # source CRS -- cheap, and avoids handing unary_union a global
         # depth-area layer's worth of geometry for a single small piece) and
@@ -671,15 +711,15 @@ class NauticalRoutingPipeline:
             candidate_idx = depth_gdf.index
         candidates = depth_gdf.iloc[candidate_idx] if len(candidate_idx) else depth_gdf.iloc[[]]
         if candidates.empty:
-            return Polygon(), poly_m
+            return Polygon(), poly_m, Polygon()
         drval = pd.to_numeric(candidates["DRVAL1"], errors="coerce")
         deep_gdf = candidates[drval >= depth_ceiling_m]
         if deep_gdf.empty:
-            return Polygon(), poly_m
+            return Polygon(), poly_m, Polygon()
         deep_geoms = deep_gdf.geometry.make_valid()
         deep_geoms = deep_geoms[deep_geoms.notnull() & deep_geoms.is_valid]
         if deep_geoms.empty:
-            return Polygon(), poly_m
+            return Polygon(), poly_m, Polygon()
         deep_mask_m = gpd.GeoSeries(deep_geoms, crs=depth_gdf.crs).to_crs(utm)
         # Simplify the DEPARE-derived cut boundary before it ever reaches
         # triangulation, same reasoning and same tolerance _split_wide_narrow
@@ -742,7 +782,24 @@ class NauticalRoutingPipeline:
         deep = unary_union(still_deep_pieces) if still_deep_pieces else Polygon()
         if reclassified_pieces:
             shallow = self._clean_polygonal(unary_union([shallow, *reclassified_pieces]))
-        return deep, shallow
+
+        # The depth-cut boundary between the final deep/shallow pieces is a real
+        # seam, exactly like _split_wide_narrow's wide/narrow seam -- but it was
+        # never fed into build_navmesh_region's seam_coord_set, so navmesh_regions
+        # rows produced by a depth split never got any boundary_node_ids tagged
+        # for it (confirmed against a live database: 24/25 regions had a
+        # completely empty boundary_node_ids, disabling routeiq's funnel-upgrade
+        # and anchor-shortcut precompute for those regions -- see NEXT_PHASES.md,
+        # "master root cause" writeup). Compute it here, the same way
+        # _split_wide_narrow does (boundary intersection of the two final
+        # pieces), so the caller can merge it into the width-based seam set.
+        depth_seam = Polygon()
+        if not deep.is_empty and not shallow.is_empty:
+            try:
+                depth_seam = deep.boundary.intersection(shallow.boundary)
+            except Exception:
+                depth_seam = Polygon()
+        return deep, shallow, depth_seam
 
     def classify_water_body(self, polygon, is_wide: bool, depth_gdf, fairway_gdf,
                             config) -> Literal["navmesh", "skeleton", "laned"]:
@@ -1027,6 +1084,19 @@ class NauticalRoutingPipeline:
         `build_network`'s cross-piece `_stitch_component_pieces` call to connect
         this region into the rest of its original connected water body.
         """
+        # Coarse boundary-output simplify pass (§5.2.3 item 1, NAVMESH_BOUNDARY_SIMPLIFY_M's
+        # docstring above has the full rationale) -- applied here, after the caller already
+        # computed seam_coord_set from the un-simplified wide/narrow and deep/shallow
+        # boundaries, because simplify() only ever removes vertices, never moves a
+        # retained one, so exact-coordinate seam matching below still works on whatever
+        # seam vertices survive this pass.
+        simplified_poly_m = self._clean_polygonal(poly_m.buffer(0).simplify(NAVMESH_BOUNDARY_SIMPLIFY_M))
+        simplified_pieces = self._explode_polygonal(simplified_poly_m)
+        if not simplified_pieces:
+            logger.warning("  Navmesh region boundary simplify collapsed the polygon; skipping region.")
+            return
+        poly_m = max(simplified_pieces, key=lambda p: p.area)
+
         # PSLG segment count is unbounded (it's the region's own perimeter, including
         # every island ring) and becomes a hard constraint for triangle's quality
         # refinement -- an insufficiently-simplified real-world coastline boundary is
@@ -1115,8 +1185,37 @@ class NauticalRoutingPipeline:
             "source_id": source_id,
         })
 
+    def _drying_gdf(self):
+        """Depth-area polygons charted as drying/intertidal (DRVAL1 < 0.0), cached
+        once per pipeline run. Used alongside the `land` layer by `_crosses_land`
+        for genuine land-crossing safety checks.
+
+        `land` and `depth_areas` (DEPARE) are digitized independently, same as
+        `land`/`coastal_water` -- a stretch of charted drying tidal flat can sit
+        entirely inside `coastal_water`'s own polygon footprint (nowhere near the
+        `land` layer) while still being genuinely unsafe for a connectivity-
+        critical straight-chord edge to cross. Confirmed on real data (Round 9
+        master-finding investigation): a stored navmesh_boundary edge had
+        `drval1=-2.0` (charted drying) but `crosses_land=0`, because the
+        land-only check never saw it.
+        """
+        if getattr(self, "_drying_gdf_cache", None) is not None:
+            return self._drying_gdf_cache
+        depth_gdf = self.gdfs.get("depth_areas", gpd.GeoDataFrame())
+        if depth_gdf is None or depth_gdf.empty or "DRVAL1" not in depth_gdf.columns:
+            self._drying_gdf_cache = gpd.GeoDataFrame(geometry=[], crs=self.CRS_WGS84)
+            return self._drying_gdf_cache
+        drval = pd.to_numeric(depth_gdf["DRVAL1"], errors="coerce")
+        drying = depth_gdf[drval < 0.0].copy()
+        if not drying.empty:
+            drying["geometry"] = drying.geometry.make_valid()
+            drying = drying[drying.geometry.notnull() & drying.geometry.is_valid]
+        self._drying_gdf_cache = drying
+        return self._drying_gdf_cache
+
     def _crosses_land(self, line_wgs84) -> bool:
-        """True if a WGS84 LineString genuinely intersects the separate `land` layer.
+        """True if a WGS84 LineString genuinely intersects the separate `land`
+        layer, OR a charted drying/intertidal DEPARE polygon (see `_drying_gdf`).
 
         `land` is digitized independently from `coastal_water`, so the two don't
         always agree at the vertex level -- `_sanity_check_no_land_crossings` strips
@@ -1124,15 +1223,25 @@ class NauticalRoutingPipeline:
         containment check against a water polygon concluded, so callers that
         generate connectivity-critical edges (ring-perimeter, stitching) should
         pre-check against this same layer to avoid building an edge only to have it
-        stripped later, re-fragmenting whatever it was bridging.
+        stripped later, re-fragmenting whatever it was bridging. Also checks
+        against drying/intertidal terrain, not just the `land` layer -- see
+        `_drying_gdf`'s docstring for why that's a separate, real gap.
         """
         land_gdf = self.gdfs.get("land", gpd.GeoDataFrame())
-        if land_gdf is None or land_gdf.empty:
-            return False
-        try:
-            return len(land_gdf.sindex.query(line_wgs84, predicate="intersects")) > 0
-        except Exception:
-            return bool(land_gdf.intersects(line_wgs84).any())
+        if land_gdf is not None and not land_gdf.empty:
+            try:
+                if len(land_gdf.sindex.query(line_wgs84, predicate="intersects")) > 0:
+                    return True
+            except Exception:
+                if bool(land_gdf.intersects(line_wgs84).any()):
+                    return True
+        drying_gdf = self._drying_gdf()
+        if drying_gdf is not None and not drying_gdf.empty:
+            try:
+                return len(drying_gdf.sindex.query(line_wgs84, predicate="intersects")) > 0
+            except Exception:
+                return bool(drying_gdf.intersects(line_wgs84).any())
+        return False
 
     def _stitch_component_pieces(self, node_ids, component_polygon_wgs84, snap_radius_m: float = 500.0) -> int:
         """Reconnect nodes from independently-built skeleton/navmesh pieces that were
@@ -1714,16 +1823,35 @@ class NauticalRoutingPipeline:
                     elif lon >= c_lon and lat < c_lat: quadrants["SE"].append((d, nid))
                     else: quadrants["SW"].append((d, nid))
                     
+                # Round 9 Issue E: this used to connect unconditionally to the
+                # single nearest node per quadrant, with no land-crossing check
+                # at all, and hardcoded crosses_land=0 on the edge it created --
+                # confirmed against real data to genuinely cross land (a 434m
+                # edge from a real Zandkreeksluis bridge node). Opening-bridge
+                # edges are also the one edge category _sanity_check_no_land_crossings
+                # exempts from its audit pass entirely, so this was structurally
+                # the least land-crossing-verified edge type in the whole
+                # pipeline. Walk each quadrant's candidates nearest-first and take
+                # the first one that doesn't genuinely cross land/drying terrain
+                # (same check _stitch_component_pieces already gates its own
+                # connectors with), instead of blindly taking the nearest.
                 for q, nodes in quadrants.items():
                     if nodes:
                         nodes.sort()
-                        best_nid = nodes[0][1]
-                        if not self.graph.has_edge(b_id, best_nid):
+                        for _, cand_nid in nodes:
+                            if self.graph.has_edge(b_id, cand_nid):
+                                break  # already connected in this quadrant
+                            cand_lon = self.graph.nodes[cand_nid]["lon"]
+                            cand_lat = self.graph.nodes[cand_nid]["lat"]
+                            candidate_line = LineString([(c_lon, c_lat), (cand_lon, cand_lat)])
+                            if self._crosses_land(candidate_line):
+                                continue  # try the next-nearest candidate in this quadrant
                             be = dict(edge_type="coastal", crosses_land=0, is_opening_bridge_edge=True,
                                       source_tier=DEFAULT_SOURCE_TIER, source_id=bridge_src)
-                            self.graph.add_edge(b_id, best_nid, **be)
-                            self.graph.add_edge(best_nid, b_id, **be)
+                            self.graph.add_edge(b_id, cand_nid, **be)
+                            self.graph.add_edge(cand_nid, b_id, **be)
                             added += 2
+                            break
 
         logger.info(f"Added {added} precise bridge opening edges.")
 
@@ -1734,7 +1862,7 @@ class NauticalRoutingPipeline:
         land-crossing risk still remains, so they are actively stripped (as before).
         Skeleton/lane edges are land-safe by construction (built from the
         water-minus-land raster mask), so they get only an informational sampled
-        spot-check — never stripped. Opening-bridge edges are never touched.
+        spot-check — never stripped.
 
         NOTE (deviation from plan Step F): the plan proposed *not* stripping and
         merely asserting >0.5%. Real pilot data shows the placeholder path crosses
@@ -1747,6 +1875,15 @@ class NauticalRoutingPipeline:
         it detects remains in the file, unreferenced. Navmesh fallback edges
         (edge_kind_id=EDGE_KIND_NAVMESH_BOUNDARY) don't set `is_placeholder`,
         so they fall into the lenient `skeleton` bucket below by construction.
+
+        Round 9 Issue E: opening-bridge edges used to be exempted from this
+        entire audit pass ("never touched"), which combined with the quadrant
+        connector's own lack of a land-crossing check (see
+        `_add_opening_bridge_edges`) made them structurally the least
+        land-crossing-verified edge type in the pipeline. `_add_opening_bridge_edges`
+        now pre-checks each candidate before adding it, so this is defense in
+        depth, not the only check -- but they're no longer exempt here either;
+        they fall into the same `skeleton` bucket as everything else below.
         """
         coastal_gdf = self.gdfs.get("coastal_water", gpd.GeoDataFrame())
         land_gdf = self.gdfs.get("land", gpd.GeoDataFrame())
@@ -1757,13 +1894,12 @@ class NauticalRoutingPipeline:
         for u, v, data in self.graph.edges(data=True):
             if data.get("edge_type") != "coastal" or u >= v:
                 continue
-            if data.get("is_opening_bridge_edge"):
-                continue  # never strip / never flag bridge crossings
             u_lon, u_lat = self.graph.nodes[u]["lon"], self.graph.nodes[u]["lat"]
             v_lon, v_lat = self.graph.nodes[v]["lon"], self.graph.nodes[v]["lat"]
             rec = {"u": u, "v": v,
                    "geometry": LineString([(u_lon, u_lat), (v_lon, v_lat)]),
-                   "midpoint": Point((u_lon + v_lon) / 2.0, (u_lat + v_lat) / 2.0)}
+                   "midpoint": Point((u_lon + v_lon) / 2.0, (u_lat + v_lat) / 2.0),
+                   "edge_kind_id": data.get("edge_kind_id", EDGE_KIND_CENTERLINE)}
             (placeholder if data.get("is_placeholder") else skeleton).append(rec)
 
         # --- Placeholder edges: strip land-crossers (temporary path) ---
@@ -1810,6 +1946,36 @@ class NauticalRoutingPipeline:
             rate = len(crossed_uv) / max(1, len(skeleton))
             logger.info(f"  Skeleton land-safety: stripped {sk_removed} directed edges "
                         f"({rate:.2%} of {len(skeleton)} skeleton edges clipped land on a bend).")
+
+        # --- Ring-perimeter / stitching edges: also strip genuine drying/intertidal
+        # crossings, not just land ---
+        # Scoped to edge_kind_id==EDGE_KIND_NAVMESH_BOUNDARY (navmesh ring-perimeter
+        # edges from build_navmesh_region, plus generic connectors from
+        # _stitch_component_pieces) rather than every skeleton-bucket edge:
+        # medial-axis centerline edges legitimately thread through complex
+        # braided tidal-flat terrain where a raw DEPARE-drying intersection is
+        # much noisier signal (see Round 9 Issue G, not yet resolved); a straight
+        # polygon-boundary or stitching chord genuinely crossing charted drying
+        # terrain is a much cleaner correctness signal -- this is the exact class
+        # of edge the Round 9 master finding's 6,666m drval1=-2.0 example was.
+        drying_gdf = self._drying_gdf()
+        if skeleton and not drying_gdf.empty:
+            ring_or_stitch = [r for r in skeleton if r["edge_kind_id"] == EDGE_KIND_NAVMESH_BOUNDARY]
+            if ring_or_stitch:
+                rg = gpd.GeoDataFrame(ring_or_stitch, geometry="geometry", crs=self.CRS_WGS84)
+                dry_crossed = gpd.sjoin(rg[["u", "v", "geometry"]], drying_gdf[["geometry"]],
+                                        predicate="intersects", how="inner")
+                dry_crossed_uv = set(zip(dry_crossed["u"], dry_crossed["v"]))
+                dry_removed = 0
+                for u, v in dry_crossed_uv:
+                    if self.graph.has_edge(u, v):
+                        self.graph.remove_edge(u, v); dry_removed += 1
+                    if self.graph.has_edge(v, u):
+                        self.graph.remove_edge(v, u); dry_removed += 1
+                rate = len(dry_crossed_uv) / max(1, len(ring_or_stitch))
+                logger.info(f"  Ring/stitch drying-safety: stripped {dry_removed} directed edges "
+                            f"({rate:.2%} of {len(ring_or_stitch)} navmesh-boundary-kind edges "
+                            f"crossed charted drying/intertidal terrain).")
 
         for u, v, data in self.graph.edges(data=True):
             if data.get("edge_type") == "coastal":
