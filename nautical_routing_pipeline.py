@@ -95,7 +95,7 @@ def _edge_attr_worker(edge_chunk):
     obstacles_gdf = gdfs.get('obstacles', gpd.GeoDataFrame())
 
     results = {}
-    for u, v, u_lon, u_lat, v_lon, v_lat, edge_type, is_opening_bridge_edge in edge_chunk:
+    for u, v, u_lon, u_lat, v_lon, v_lat, edge_type, is_opening_bridge_edge, requires_lock in edge_chunk:
         attrs = {}
         _, _, distance = geod.inv(u_lon, u_lat, v_lon, v_lat)
         attrs['distance'] = round(distance, 2)
@@ -202,18 +202,20 @@ def _edge_attr_worker(edge_chunk):
                 closest_geom = land_metric.iloc[closest_idx].geometry
                 attrs['distance_to_land'] = round(edge_geom_metric.distance(closest_geom), 2)
 
-        # Obstacle crossing check — skipped for opening-bridge edges (same
-        # exemption already applied to crosses_land at edge-creation time in
-        # _add_opening_bridge_edges): these are precise, deliberately-computed
-        # crossings of a bridge's actual navigable opening via fairway/
-        # waterway centerline intersection, not generic geometry. A broad
-        # obstacle polygon (e.g. a mariculture/marine-farm area) incidentally
-        # overlapping the bridge's footprint must not hard-block the one
-        # crossing point that exists specifically so vessels CAN pass through
-        # the opening — that's the confirmed cause of a real Zeelandbrug
-        # regression (opening never explored at all, not merely deprioritized).
+        # Obstacle crossing check — skipped for opening-bridge AND lock-crossing
+        # edges (same exemption already applied to crosses_land at edge-creation
+        # time in _add_opening_bridge_edges / _add_lock_crossing_edges): these are
+        # precise, deliberately-computed crossings of a bridge's actual navigable
+        # opening, or a lock chamber's actual gate positions, via fairway/waterway
+        # centerline intersection, not generic geometry. A broad obstacle polygon
+        # (e.g. a mariculture/marine-farm area) incidentally overlapping the
+        # bridge's/lock's footprint must not hard-block the one crossing point
+        # that exists specifically so vessels CAN pass through — that's the
+        # confirmed cause of a real Zeelandbrug regression (opening never
+        # explored at all, not merely deprioritized) that the lock case could
+        # equally suffer from.
         attrs['crosses_obstacle'] = 0
-        if not is_opening_bridge_edge and not obstacles_gdf.empty:
+        if not is_opening_bridge_edge and not requires_lock and not obstacles_gdf.empty:
             obs_candidates = _candidates_by_bounds_static(obstacles_gdf, edge_geom)
             if not obs_candidates.empty:
                 intersecting = obs_candidates[obs_candidates.intersects(edge_geom)]
@@ -414,6 +416,7 @@ class NauticalRoutingPipeline:
         self.parse_shapefiles()
         self.build_network()
         self._add_opening_bridge_edges()
+        self._add_lock_crossing_edges()
         self._sanity_check_no_land_crossings()
         self._ensure_coastal_connectivity()
         self.calculate_edge_attributes()
@@ -1855,6 +1858,189 @@ class NauticalRoutingPipeline:
 
         logger.info(f"Added {added} precise bridge opening edges.")
 
+    def _add_lock_crossing_edges(self):
+        """Creates real connectivity across each lock chamber, mirroring
+        `_add_opening_bridge_edges`'s precise-opening-point pattern
+        (`PHASE_4_DESIGN.md` §4c) -- but adapted for a lock's two-gate
+        topology instead of a bridge's single mid-span opening.
+
+        Round 9/10 root-cause finding (see NEXT_PHASES.md): `locks_gdf` was
+        only ever consulted in `_edge_attr_worker` to annotate an edge's
+        `min_width` -- nothing ever CREATED an edge across a lock chamber.
+        Confirmed directly against a real build: zero edges connected either
+        side of the Zandkreeksluis lock chamber (20 nodes west, 14 east, no
+        edge between any pair), forcing routes to detour tens of km around.
+
+        A bridge gets one opening node whose surrounding quadrant search
+        naturally reaches both banks, because a bridge span is short. A lock
+        chamber is long enough, and its gates real enough physical barriers,
+        that a single mid-chamber node can't be relied on to reach both
+        sides via the same land-crossing-safe connection -- so this creates
+        one node per side (at the precise point where a fairway/inland-
+        waterway centerline crosses the lock polygon's boundary, same
+        intersection approach the bridge version uses against the same two
+        layers) plus an explicit chamber-transit edge directly between them.
+        Verified against the real pilot data: 15/17 lock polygons in
+        `data/zeeland_clip` intersect exactly one hw feature giving a clean
+        entry/exit pair; 2/17 have no hw intersection at all and fall back
+        to a single bridge-style centroid node instead.
+
+        Tagged `requires_lock`/`lock_id` (PHASE_4_DESIGN.md §4c's marker,
+        analogous to `is_opening_bridge_edge`) rather than reusing the
+        bridge flag -- a lock transit and a bridge opening are physically
+        different enough (chamber cycle time vs. instantaneous) that a
+        future wait-time model (routeiq's `feature-bridge-lock-waits.md`)
+        will need to tell them apart. The chamber-transit edge itself is
+        additionally flagged `is_lock_transit_edge` since it's specifically
+        the edge a future wait-time cost would attach to, distinct from the
+        shore-side connector edges that merely reach the opening node.
+        """
+        locks_gdf = self.gdfs.get("locks", gpd.GeoDataFrame())
+        if locks_gdf.empty:
+            return
+
+        logger.info("Adding lock crossing edges (Fairway/Waterway Intersections)...")
+        added = 0
+        transit_added = 0
+        fallback_count = 0
+        lock_count = 0
+
+        # Same two layers, same reasoning, as _add_opening_bridge_edges.
+        fw_gdfs = []
+        if not self.gdfs.get("fairways", gpd.GeoDataFrame()).empty: fw_gdfs.append(self.gdfs["fairways"])
+        if not self.gdfs.get("inland_waterways", gpd.GeoDataFrame()).empty: fw_gdfs.append(self.gdfs["inland_waterways"])
+        hw_gdf = pd.concat(fw_gdfs, ignore_index=True) if fw_gdfs else gpd.GeoDataFrame()
+
+        lock_src = self.layer_source_ids.get("locks") if hasattr(self, "layer_source_ids") else None
+
+        for lock_idx, row in locks_gdf.iterrows():
+            lock_geom = row.geometry
+            if lock_geom is None or lock_geom.is_empty:
+                continue
+            lock_count += 1
+            lock_id = int(lock_idx) + 1  # opaque per-lock marker value, not a pois FK
+
+            # Candidate opening-point PAIRS: for each intersecting hw feature,
+            # where its own sub-line crosses the lock polygon's boundary
+            # (typically exactly 2 points -- one entry, one exit). Kept
+            # per-feature rather than pooling every point across every
+            # intersecting feature and taking the global farthest pair --
+            # confirmed against real data that a lock touched by several
+            # unrelated short hw segments (a convergence of channels near
+            # the lock, not real gate crossings) can otherwise produce a
+            # spurious "pair" that spans across land.
+            candidate_pairs = []  # (span, ptA, ptB)
+            if not hw_gdf.empty:
+                intersecting = hw_gdf[hw_gdf.intersects(lock_geom)]
+                for _, hw_row in intersecting.iterrows():
+                    b = lock_geom.boundary.intersection(hw_row.geometry)
+                    pts = []
+                    if isinstance(b, Point):
+                        pts = [b]
+                    elif isinstance(b, MultiPoint):
+                        pts = list(b.geoms)
+                    elif isinstance(b, (LineString, MultiLineString)):
+                        continue  # tangential touch, not a clean crossing pair
+                    if len(pts) >= 2:
+                        best_pair, best_span = None, -1.0
+                        for i in range(len(pts)):
+                            for j in range(i + 1, len(pts)):
+                                d = pts[i].distance(pts[j])
+                                if d > best_span:
+                                    best_span, best_pair = d, (pts[i], pts[j])
+                        candidate_pairs.append((best_span, best_pair[0], best_pair[1]))
+
+            # Prefer the widest span first (most likely the real full-chamber
+            # crossing), but require it to actually clear land/drying terrain
+            # -- same _crosses_land gate Round 9 Issue E added to the bridge
+            # version's shore connections, applied here to the chamber-
+            # spanning line itself too, not just the shore connectors below.
+            candidate_pairs.sort(key=lambda t: -t[0])
+            side_pts = None
+            for _, pt_a, pt_b in candidate_pairs:
+                transit_line = LineString([(pt_a.x, pt_a.y), (pt_b.x, pt_b.y)])
+                if not self._crosses_land(transit_line):
+                    side_pts = [pt_a, pt_b]
+                    break
+
+            if side_pts is None:
+                # No safe two-point crossing found (no hw intersection at all,
+                # or every candidate pair crosses land/drying terrain) --
+                # fall back to the bridge pattern's single centroid node so
+                # the quadrant search below at least has a chance of finding
+                # land-crossing-safe connections on both sides.
+                side_pts = [lock_geom.centroid]
+                fallback_count += 1
+
+            side_node_ids = []
+            for pt in side_pts:
+                c_lon, c_lat = pt.x, pt.y
+                n_id = self._get_or_create_node(c_lon, c_lat, node_type="coastal")
+                self.graph.nodes[n_id]["node_depth"] = 99.0
+                self._stamp_node(n_id, NODE_KIND_POINT, DEFAULT_SOURCE_TIER, lock_src)
+                side_node_ids.append(n_id)
+
+                # Connect this side's node outward to the nearest surrounding
+                # nodes via the same quadrant ray-casting + land-crossing gate
+                # _add_opening_bridge_edges uses (Round 9 Issue E's fix) --
+                # do NOT hardcode crosses_land=0 and connect blindly.
+                SEARCH_MARGIN = 0.015
+                candidates = []
+                for nid, data in self.graph.nodes(data=True):
+                    if nid == n_id or nid in side_node_ids: continue
+                    lon, lat = data["lon"], data["lat"]
+                    if (c_lon - SEARCH_MARGIN <= lon <= c_lon + SEARCH_MARGIN and
+                        c_lat - SEARCH_MARGIN <= lat <= c_lat + SEARCH_MARGIN):
+                        dx = (lon - c_lon) * 111320 * math.cos(math.radians((lat + c_lat) / 2))
+                        dy = (lat - c_lat) * 111320
+                        candidates.append((math.sqrt(dx*dx + dy*dy), lon, lat, nid))
+
+                quadrants = {"NE": [], "NW": [], "SE": [], "SW": []}
+                for d, lon, lat, nid in candidates:
+                    if lon >= c_lon and lat >= c_lat: quadrants["NE"].append((d, nid))
+                    elif lon < c_lon and lat >= c_lat: quadrants["NW"].append((d, nid))
+                    elif lon >= c_lon and lat < c_lat: quadrants["SE"].append((d, nid))
+                    else: quadrants["SW"].append((d, nid))
+
+                for q, nodes in quadrants.items():
+                    if nodes:
+                        nodes.sort()
+                        for _, cand_nid in nodes:
+                            if self.graph.has_edge(n_id, cand_nid):
+                                break  # already connected in this quadrant
+                            cand_lon = self.graph.nodes[cand_nid]["lon"]
+                            cand_lat = self.graph.nodes[cand_nid]["lat"]
+                            candidate_line = LineString([(c_lon, c_lat), (cand_lon, cand_lat)])
+                            if self._crosses_land(candidate_line):
+                                continue  # try the next-nearest candidate in this quadrant
+                            le = dict(edge_type="coastal", crosses_land=0, requires_lock=True,
+                                      lock_id=lock_id, source_tier=DEFAULT_SOURCE_TIER, source_id=lock_src)
+                            self.graph.add_edge(n_id, cand_nid, **le)
+                            self.graph.add_edge(cand_nid, n_id, **le)
+                            added += 2
+                            break
+
+            # Explicit chamber-transit edge connecting the two side nodes
+            # directly -- this is the actual connectivity fix. Without it,
+            # both sides can each independently gain real quadrant
+            # connections to their own bank and still never connect to each
+            # other, which is exactly the confirmed Zandkreeksluis gap.
+            # Already verified land/drying-safe above when the pair was
+            # selected, so no further _crosses_land check needed here.
+            if len(side_node_ids) == 2:
+                a_id, b_id = side_node_ids
+                if not self.graph.has_edge(a_id, b_id):
+                    te = dict(edge_type="coastal", crosses_land=0, requires_lock=True,
+                              lock_id=lock_id, is_lock_transit_edge=True,
+                              source_tier=DEFAULT_SOURCE_TIER, source_id=lock_src)
+                    self.graph.add_edge(a_id, b_id, **te)
+                    self.graph.add_edge(b_id, a_id, **te)
+                    added += 2
+                    transit_added += 2
+
+        logger.info(f"Added {added} lock crossing edges ({transit_added} chamber-transit) "
+                    f"across {lock_count} lock polygons ({fallback_count} single-node fallback).")
+
     def _sanity_check_no_land_crossings(self):
         """Step F — land-crossing safety, retired as load-bearing for skeleton edges.
 
@@ -2073,6 +2259,7 @@ class NauticalRoutingPipeline:
                     v_node["lon"], v_node["lat"],
                     data.get("edge_type", "coastal"),
                     data.get("is_opening_bridge_edge", False),
+                    data.get("requires_lock", False),
                 )
 
         def chunked_iterable(iterable, size):
@@ -2241,6 +2428,8 @@ class NauticalRoutingPipeline:
                     source_tier INTEGER DEFAULT 1,
                     source_id INTEGER REFERENCES data_sources(id),
                     width_profile TEXT,
+                    requires_lock INTEGER DEFAULT 0,
+                    lock_id INTEGER,
                     FOREIGN KEY(source) REFERENCES nodes(id),
                     FOREIGN KEY(target) REFERENCES nodes(id)
                 );
@@ -2335,12 +2524,14 @@ class NauticalRoutingPipeline:
                 data.get("edge_kind_id", EDGE_KIND_CENTERLINE),
                 data.get("source_tier", DEFAULT_SOURCE_TIER),
                 data.get("source_id"),
-                data.get("width_profile")
+                data.get("width_profile"),
+                int(data.get("requires_lock", False)),
+                data.get("lock_id")
             ) for u, v, data in self.graph.edges(data=True)]
             cursor.executemany("""
                 INSERT INTO edges
-                (source, target, distance, min_depth, drval1, max_air_draft, min_width, cost_factor, distance_to_land, edge_type_id, traffic_mode, crosses_land, crosses_obstacle, edge_kind_id, source_tier, source_id, width_profile)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                (source, target, distance, min_depth, drval1, max_air_draft, min_width, cost_factor, distance_to_land, edge_type_id, traffic_mode, crosses_land, crosses_obstacle, edge_kind_id, source_tier, source_id, width_profile, requires_lock, lock_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, edges_data)
 
             navmesh_regions_data = [(
