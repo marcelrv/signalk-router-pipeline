@@ -2168,6 +2168,76 @@ radius as noise) but implementing and verifying it needs its own session.
   are exactly the two verification steps that outage prevented completing
   — not skipped by choice.
 
+### The two blocked verification items, completed independently — and a real root cause found for the persistent route inflation
+
+Picked up exactly where the previous session left off, in a fresh
+session with a working environment. Rebuilt from current `HEAD`
+(`029487e`) independently — `data/zeeland_round9_verify.sqlite` — and
+re-confirmed all six fixes' numbers directly, not just trusted the prior
+commit messages: **0** edges with `max_air_draft=0.0` (was 408), **0/15**
+`navmesh_regions` with empty `boundary_node_ids` (was 24/25), 15 regions,
+navmesh_boundary depth avg 7.17m, median region vertex count 125. All
+match the previous session's claims.
+
+**`loadGraph()` re-timed**: **1.72s** against the fresh build (`routeiq`,
+same Docker node:22 pattern as every prior round) — confirms Issue I's
+tuning genuinely holds even with the funnel-upgrade mechanism now
+actually running for every region, not the 96%-disabled state Round 8's
+1.84s was measured under.
+
+**Issue K's route-level check, done — and it surfaces a real, distinct,
+still-open root cause.** Reproduced the exact scenario from the previous
+session's report (10.4km direct crossing straddling Zandkreeksluis,
+both directions, two vessel profiles) against the fresh build:
+
+| profile | distance | straight-line | ratio |
+|---|---|---|---|
+| draft 1.2m / air 17.0m, A→B | 76.28km | 10.37km | 7.35x |
+| draft 1.2m / air 17.0m, B→A | 76.25km | 10.37km | 7.35x |
+| draft 2.3m / air 11.5m, A→B | 76.28km | 10.37km | 7.35x |
+| draft 2.3m / air 11.5m, B→A | 76.25km | 10.37km | 7.35x |
+
+Still severe — **but notice the ratio is identical across every profile**,
+including a shallow-draft/generous-air-draft vessel that should have no
+constraint problem at all crossing here. That rules out depth/air-draft
+avoidance as the current cause (Issue K's own fix is real and confirmed,
+it just isn't what's driving this specific number). Traced the actual
+route geometry: it runs all the way south to ~51.494°N,3.613°E (the
+Middelburg canal area) before swinging east — the same detour signature
+as the original Issue A report.
+
+**Root cause, confirmed by direct query, not inference**: checked for
+any edge directly connecting the Oosterschelde side of the Zandkreeksluis
+lock chamber to the Veerse Meer side. **Zero exist** — 20 real nodes on
+the west side, 14 on the east side, no edge between any pair of them.
+This is the structural "locks have no dedicated connectivity-generating
+mechanism" gap this project has *identified* several times (Round 6/8's
+writeups, `PHASE_4_DESIGN.md` §4c) but **never actually implemented a
+fix for** — bridges get a real, precise opening-point edge
+(`_add_opening_bridge_edges`); locks only ever annotate an edge's
+attributes, never create one. **None of Round 9's six fixes touched
+this** — they were never going to resolve this specific route's
+inflation, because this was never their target. The VERCLR fix, the
+master finding, and the density work are all real and independently
+confirmed above; they just aren't the reason the Zandkreeksluis-area
+route is still bad.
+
+**Not reproduced**: the previous session's cut-off message mentioned a
+possible regression for one profile/direction that was previously
+direct. This fresh, clean rebuild shows consistent (not regressed)
+severe inflation across all four tested combinations — either that was
+specific to a transient build state before the session ended, or it
+self-resolved; not chasing it further without a reproducible case.
+
+**Concrete next step**: implement real lock-crossing connectivity,
+mirroring `_add_opening_bridge_edges`'s pattern (a precise opening-point
+node where the lock chamber meets navigable water on each side,
+connected via a real edge, not a generic distance-based stitch) — this
+is very likely the actual fix for Issue A/the original user report, not
+anything in this round's six fixes. Worth its own round, same rigor as
+everything else: verify with a real before/after route reproduction of
+this exact scenario, not just that an edge now exists.
+
 ---
 
 ## What's confirmed working from Phase 0
