@@ -2370,6 +2370,23 @@ rebuild) — all within the same ~1.6-1.8s band Round 9 measured (1.72s),
 consistent with the small edge-count addition (+198 edges out of
 ~65,000) being cheap, as expected.
 
+**Round 11 update (routeiq-side, not this repo — see that repo's
+`ROUTEIQ_NEXT_PHASES.md`)**: following up on "the remaining inflation
+needs a fresh investigation" above, found a real, precisely-located bug
+in `routeiq`'s path reconstruction (`aggregateSegmentEdges`,
+`src/database.ts`) — confirmed 0 of 270 segments in a real reproduced
+route carry any funnel-computed interior geometry, despite the
+funnel-upgrade mechanism itself working perfectly (100% success,
+verified with temporary instrumentation). The aggregation function used
+whenever path-smoothing skips over a direct edge silently drops
+`path_points`, so any funnel-curved stretch the smoothed path spans gets
+flattened to a straight chord in the *displayed* route. Likely **not**
+the cause of the distance/cost inflation itself (the aggregated distance
+is real and correctly summed) — a separate, real bug in what gets drawn,
+not necessarily in what gets chosen or its reported length. Not fixed
+yet; full writeup and the reasoning for why it's probably distinct from
+the inflation problem is in the `routeiq` doc.
+
 ---
 
 ## What's confirmed working from Phase 0
