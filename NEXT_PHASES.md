@@ -1731,7 +1731,7 @@ showing water there.**
 concluded the live server was running a stale, pre-Round-7/8 database,
 and recommended redeploying before investigating further. **That was
 wrong — checked directly, not assumed.** The actual live-deployed file
-(`/home/node/signalkdev/routeiq/data/zeeland.sqlite`,
+(`/home/node/signalkdev/signalk-routeiq/data/zeeland.sqlite`,
 `last_update_date=2026-07-13T13:31:23Z`) is already Round-8-level (25
 `navmesh_regions`, 24/25 with empty `boundary_node_ids`, matching
 depth-distribution numbers) — not stale. Querying it directly (not a
@@ -1891,6 +1891,282 @@ separate from the pipeline fixes above:**
   point is that this number is very likely to change once the funnel
   mechanism actually runs, and needs to be re-confirmed acceptable, not
   assumed from Round 8's now-known-incomplete measurement.
+
+### Phase 2 Hardening, Round 9 fixes — Issue K, master finding + Issue I/F, Issue E/H, DEPARE-drying gap (all pipeline-side, verified against real full-scale rebuilds)
+
+Every item below was implemented, then verified against a fresh full-scale
+`data/zeeland_clip` rebuild and real data queries (not just code review),
+same discipline as Rounds 7/8. `data/zeeland_round9_final.sqlite` is the
+final deliverable, combining all fixes below with the tuned parameters
+chosen after the sweep in Issue I/F.
+
+#### Issue K — `VERCLR=0` treated as a literal zero clearance
+
+Fix: `_is_valid(verclr) and float(verclr) != 0.0` gates the clearance
+branch in the bridge air-draft block (~line 155); `VERCLR=0` now falls
+back to the same 999.0 default the movable-bridge and no-bridge-found
+branches already use.
+
+**Verified directly against the database, not just code review**:
+
+| | Before fix | After fix |
+|---|---|---|
+| fixed bridges | 58 | 58 |
+| fixed bridges with `height==0.0` | 16 | 16 (unchanged — this is the raw source data, correctly still recorded) |
+| edges with `max_air_draft=0.0` | 408 | **0** |
+| edges with `max_air_draft=999.0` | (not counted) | 126,653 (Issue-K-only build) |
+
+**Route-level reproduction — partially done, not fully clean**: attempted
+the same reproduction `routeiq` used (10.4km crossing near 51.550,3.800 ->
+51.550,3.950, both directions, two vessel profiles) via a throwaway Node
+script against `RoutingEngine.calculateRoute`, comparing `data/zeeland.sqlite`
+(bug present) against a fresh Issue-K-only rebuild (bug fixed). The
+comparison was **confounded by two things, both already documented
+elsewhere in this file as real traps**: (1) real geometry nondeterminism
+between separate pipeline rebuilds (same caveat as the master-finding
+investigation's first "37.4nmi vs 51.4nmi" false alarm), and (2) the
+Issue-K-only build still had the master-finding bug active (built before
+that fix landed), so both "before" and "after" routes were independently
+distorted by the then-still-broken funnel-upgrade mechanism, on top of
+whatever Issue K itself changed. The data-level fix (408 -> 0 edges) is
+solid and unambiguous; the specific "8.73x inflation gone" route-level
+claim is **not cleanly reproduced this round** — a proper isolated test
+(same code except VERCLR handling, both builds otherwise identical, e.g.
+by diffing a single reverted hunk and rebuilding back-to-back) was staged
+but not completed before this session's environment had a prolonged Bash/
+Docker outage. Flagged as open, not assumed fixed at the route level.
+
+#### Master finding (Issues A/C/D) + Issue I — `boundary_node_ids` population
+
+Fix: `_split_deep_shallow` now also returns the depth-cut boundary
+(`deep.boundary.intersection(shallow.boundary)`, computed the same way
+`_split_wide_narrow`'s wide/narrow seam already was), and `build_network`
+merges that into the seam-coordinate set passed to `build_navmesh_region`
+for every deep piece, instead of only the original width-based seam.
+
+**Verified directly against the fresh full-scale rebuild
+(`data/zeeland_round9_final.sqlite`)**:
+
+| | Before (live `zeeland.sqlite`, Round 8-era) | After (Round 9 final) |
+|---|---|---|
+| `navmesh_regions` count | 25 | 15 (see Issue I/F below for why) |
+| regions with **empty** `boundary_node_ids` | **24 / 25 (96%)** | **0 / 15 (0%)** |
+| regions with populated `boundary_node_ids` | 1 / 25 | **15 / 15** |
+| `boundary_node_ids` per populated region (min/median/max) | n/a (only 1 region) | 32 / 63 / 695 |
+
+This is a direct, unambiguous fix of the master finding: every region now
+has real seam nodes tagged, so `routeiq`'s `precomputeFunnelEdges` (both
+`upgradeRingBoundaryEdges` and `addAnchorShortcutEdges`) will actually run
+for every region instead of silently no-op'ing for 24 of 25 of them.
+
+**Land-crossing spot-check on the specific edge central to the master
+finding's own writeup** (the 6,666.75m, `drval1=-2.0`, `crosses_land=0`
+navmesh_boundary chord): the drying-aware `_crosses_land` check (see DEPARE
+gap below) now catches this class of edge directly — the "Ring/stitch
+drying-safety" pass in `_sanity_check_no_land_crossings` strips exactly
+this kind of edge before export (see DEPARE section for the real strip
+count from this build).
+
+#### Issue I / Issue F — `min_navmesh_radius_m` + navmesh-boundary simplify pass, done together as instructed
+
+Fix 1 (`min_navmesh_radius_m` 300.0 -> 800.0m): raises the disk-radius
+threshold for navmesh eligibility, per §5.2.3 item 2's recommendation
+(the same lever Issue F's "narrow water still getting ring-boundary
+treatment" symptom was tracked to).
+
+Fix 2 (`NAVMESH_BOUNDARY_SIMPLIFY_M`, new constant): a coarser
+Douglas-Peucker simplify pass applied to a navmesh piece's own boundary,
+right before it becomes PSLG input, on top of (not instead of) the fine
+1.0m tolerance still used for the wide/narrow and deep/shallow
+classification decisions and medial-axis centering. Safe with exact-match
+seam tagging because `simplify()` only ever removes vertices, never moves
+a retained one.
+
+**Region eligibility (radius fix), verified against the real rebuild**:
+
+| | Round 8 (`radius=300`) | Round 9 (`radius=800`) |
+|---|---|---|
+| `navmesh_regions` count | 25 | **15** |
+| region area min/median/p90/max (m²) | 382,691 / 3.19M / 41.6M / 503.8M | **2,023,016 / 6,641,065 / 53,999,316 / 461,488,520** |
+| regions under 10,000 m² | 0 | 0 |
+
+Min area roughly 5.3x larger, consistent with a disk-radius threshold
+increase of 800/300 ≈ 2.67x (~7.1x by area) filtering out channel-scale
+water — a real, measured effect, not a fluke.
+
+**Boundary-simplify tolerance — tuned empirically via a 3-way full-scale
+sweep, not guessed**, because an early version (15.0m) traded away more
+depth-safety margin than expected:
+
+| `NAVMESH_BOUNDARY_SIMPLIFY_M` | vertices/region (min/median/max) | `boundary_node_ids`/region (min/median/max) | navmesh_boundary edges | avg depth | `<6.0m` | `<3.0m` |
+|---|---|---|---|---|---|---|
+| none (~0, ablation) | 202 / 1247 / 16317 | 67 / 191 / 2246 | 15,668 | 6.88m | 24.7% | 0.9% |
+| **5.0m (chosen)** | 59 / 125 / 3414 | 32 / 63 / 695 | 3,870 | 7.17m | 30.9% | 3.9% |
+| 15.0m (first try, rejected) | 41 / 80 / 2532 | 24 / 39 / 376 | 2,350 | 7.25m | 30.9% | 6.0% |
+
+5.0m captures most of the vertex-count reduction (the whole point of
+Issue I — bounding `precomputeFunnelEdges`'s O(boundary) ring-upgrade and
+O(anchors²) shortcut cost) while costing much less real depth-safety
+margin than 15.0m did (`<3.0m`, genuinely shallow: 3.9% vs 6.0%). Both
+`<6.0m` and `<3.0m` are real regressions vs. the no-simplify ablation
+(24.7%/0.9%) — any coarsening trades some of Round 7/8's depth-accuracy
+win for density reduction — but 5.0m is the better-measured point on that
+curve, not an assumption. **Honest framing, not spun as free**: this is a
+genuine trade-off, not a strict improvement over Round 8's 14.3% `<6.0m`
+figure (Round 8 didn't separately report `<3.0m`) — accepted because
+Issue I's whole point is that leaving boundary vertex density
+unaddressed risks reintroducing Round 4/5's load-time blowup once the
+master-finding fix actually lets `precomputeFunnelEdges` run for every
+region (previously it was silently disabled for 96% of them). The
+`loadGraph()` re-time this trade-off is supposed to justify was **not
+completed this round** (see "Not yet done" below) — that number is what
+would confirm 5.0m was the right place to land, not just a reasonable one.
+
+#### Issue E — bridge-opening quadrant connector, no land-crossing check
+
+Fix: `_add_opening_bridge_edges`'s quadrant search now walks each
+quadrant's candidates nearest-first and takes the first one that doesn't
+genuinely cross land/drying terrain (via `_crosses_land`), instead of
+blindly connecting to the nearest node and hardcoding `crosses_land=0`.
+Also removed opening-bridge edges' blanket exemption from
+`_sanity_check_no_land_crossings`'s audit pass (defense in depth, not the
+only check now).
+
+**Verified two ways against the real rebuild**:
+1. **The exact edge originally flagged** (bridge node `509558598386510` ->
+   `509558850385884`, 434m, confirmed genuinely crossing land against real
+   `land_polygons.geojson`): the bridge node is present in the new build
+   with the same coordinates, but **no longer connected to that target** —
+   it now has 3 quadrant edges instead of 4 (the fourth quadrant's nearest
+   candidate crossed land and was correctly skipped, with no fallback
+   candidate found in that quadrant).
+2. **Broad sample**: all 109 edges from the 36 opening-bridge POI nodes in
+   the rebuilt database, checked directly against real `land_polygons.geojson`
+   and the drying-DEPARE layer (not the stored `crosses_land` column) — **0
+   genuine land crossings, 0 genuine drying crossings**.
+
+#### Issue H — generic stitching connectors crossing land
+
+Fix: `_stitch_component_pieces`'s `try_add` already called `_crosses_land`
+before adding a connector; it now also benefits from the drying-aware
+extension (below).
+
+**Verified against the real rebuild**: all 135 `_stitch_component_pieces`-
+created connector edges (`edge_kind_id=1`, `source_id IS NULL`, the exact
+signature `try_add` stamps) checked directly against real land + drying
+polygons — **0 genuine crossings**.
+
+**Important correction, found while verifying — not fixed this round**:
+the *specific* edge originally cited for Issue H
+(`1157178078357594` -> `1157195826356045`, 1209m, near Middelburg) is
+**still present and still genuinely crosses land** in the new build.
+Re-checked its `edge_kind_id`: **0 (centerline), not 1** — it is **not**
+a `_stitch_component_pieces` artifact at all, but a raw `inland_waterways`
+centerline edge from `_build_inland_network`, which takes source line
+topology as-is with **no land-crossing check of any kind**. Broader sample
+confirms this is a real, larger, previously-uncharacterized gap: of 1,189
+long (>150m) inland-waterways centerline edges in the rebuilt database,
+**55 (4.6%) genuinely cross land** — much higher than the ~0.17% rate
+Round 5/6 found for coastal skeleton edges. Plausible mechanism, consistent
+with Round 6/8's own already-documented gap: locks have no dedicated
+connectivity mechanism, so a source line that's digitized straight across
+an interrupted lock chamber produces exactly this signature. **Deliberately
+not fixed this round**: `_ensure_coastal_connectivity`'s stitch-guarantee
+pass explicitly excludes inland-type nodes
+(`node_type != "inland"`), so naively stripping these 55 edges the way
+skeleton edges are stripped could fragment the inland network with no
+repair mechanism at all — needs its own careful investigation (most likely
+alongside a real lock-connectivity mechanism, not a blind strip pass)
+before touching it. Recorded here precisely so it isn't lost.
+
+#### New — DEPARE/drying gap (surfaced during the master-finding investigation)
+
+Fix: new `_drying_gdf()` (cached DEPARE polygons with `DRVAL1 < 0.0`,
+i.e. charted drying/intertidal) and `_crosses_land` extended to check
+against it in addition to the `land` layer. `_sanity_check_no_land_crossings`
+gained a new "Ring/stitch drying-safety" pass, scoped to
+`edge_kind_id=EDGE_KIND_NAVMESH_BOUNDARY` (ring-perimeter + stitch
+connectors, not medial-axis skeleton centerlines — deliberately excluded
+per Issue G's braided-tidal-flat concern, see below) — checks and strips
+genuine drying crossings the land-only check structurally could never see.
+
+**Verified directly from the real rebuild's own log**
+(`data/zeeland_simplify5m_run.log`): `Ring/stitch drying-safety: stripped
+4 directed edges (0.11% of 1,796 navmesh-boundary-kind edges crossed
+charted drying/intertidal terrain)` — a real, small, working correction,
+not a no-op. `_add_opening_bridge_edges` and `_stitch_component_pieces`
+both benefit from the same extension at edge-creation time (see Issue E/H
+verification above — 0 crossings of either kind for both edge classes).
+
+#### Issue G — investigated, root cause narrowed, NOT fixed (per explicit instruction)
+
+Investigated the two candidate hypotheses from the Round 9 collection
+write-up directly against real data in the Yerseke bbox
+(4.18-4.25°E, 51.48-51.53°N, Oosterschelde braided tidal-flat area):
+
+**Hypothesis 1 (DEPARE coverage gap) — ruled out.** DEPARE covers
+99.9999...% of `coastal_water` in this bbox (23,516,174 m² coastal water,
+23,516,174 m² DEPARE coverage, 0 m² with no DEPARE data at all). Not a
+coverage gap.
+
+**Hypothesis 2 (`DEPTH_SPLIT_CLOSING_RADIUS_M=50m` too large for this
+terrain) — confirmed, with a real measurement, not just plausibility.**
+Isolated the deep (`DRVAL1>=6.0`) DEPARE union in this bbox before any
+closing: 30 real interior holes (drying/shallow separators fully enclosed
+within the deep mask), totaling 32,862 m². At Round 7's original 5m
+closing radius, 25 of those 30 holes survive (32,691 m², essentially
+unaffected). At Round 8/current's 50m closing radius, **only 1 hole
+survives (8,390 m², a 74.5% reduction in real excluded drying area)** —
+the closing operation is filling in genuine interior drying separators,
+not just bridging misaligned survey-contour seams between distinct deep
+polygons the way it was intended to. Separately confirmed this isn't
+about bridging *between* distinct channels: the two largest deep pieces
+in this bbox are 1,855m apart, far beyond what a 50m closing could ever
+connect — the effect is entirely from filling small *interior* holes
+within a single already-connected deep polygon.
+
+**Not fixed this round, per explicit instruction to investigate before
+fixing.** A real lead exists for a future round (distinguish "thin
+survey-contour misalignment seam" from "real charted drying separator" by
+checking whether the gap already has its own shallow/drying DEPARE
+polygon covering it, rather than treating any gap under the closing
+radius as noise) but implementing and verifying it needs its own session.
+
+### What's still open after this round — read before assuming Round 9 is fully closed
+
+- **Issue K route-level reproduction** — data-level fix (408 -> 0 edges)
+  is solid; the route-level "8.73x inflation gone" claim needs a clean,
+  isolated before/after rebuild (same code except the VERCLR fix, both
+  builds otherwise byte-for-byte from the same input) that wasn't
+  completed this round (blocked by a prolonged environment Bash/Docker
+  outage near the end of the session — see below).
+- **`loadGraph()` re-verification in `routeiq`** — Issue I's whole
+  point (raising `min_navmesh_radius_m` + adding the boundary simplify
+  pass) is to keep `precomputeFunnelEdges`'s real cost bounded now that
+  the master-finding fix lets it actually run for every region, instead
+  of the 96%-silently-disabled state Round 8's "1.84s" was measured
+  under. **This number was not re-measured this round** — do not assume
+  it still holds, exactly the same caution this file already gave for
+  Round 8's figure before this round started. Needs the same
+  `loadGraph()` timing check Round 4/7/8 all used, against
+  `data/zeeland_round9_final.sqlite`.
+- **Inland-waterways centerline land-crossing gap (new, found verifying
+  Issue H)** — 55/1,189 (4.6%) of long inland centerline edges genuinely
+  cross land; not fixed, needs its own investigation given
+  `_ensure_coastal_connectivity` doesn't cover inland nodes at all (see
+  Issue H write-up above for the full reasoning).
+- **Issue G** — root cause narrowed to a real, measured mechanism
+  (`DEPTH_SPLIT_CLOSING_RADIUS_M` over-filling genuine interior drying
+  separators specifically in braided tidal-flat terrain), not fixed.
+- **Issue B** — already resolved from `routeiq`'s side (does not
+  reproduce as originally described; see that repo's `ROUTEIQ_NEXT_PHASES.md`).
+- **Environment note, not a code finding**: this session hit a prolonged
+  (~35+ minute) Auto Mode Bash-safety-classifier outage near the end,
+  which blocked further `python3`/`sqlite3`/Docker-based verification
+  (plain shell commands like `cp`/`grep`/`ls` kept working throughout).
+  The two items above (Issue K route-level check, `loadGraph()` re-time)
+  are exactly the two verification steps that outage prevented completing
+  — not skipped by choice.
 
 ---
 
