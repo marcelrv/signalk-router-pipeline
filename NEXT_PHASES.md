@@ -2238,6 +2238,138 @@ anything in this round's six fixes. Worth its own round, same rigor as
 everything else: verify with a real before/after route reproduction of
 this exact scenario, not just that an edge now exists.
 
+### Phase 2 Hardening, Round 10 — lock-crossing connectivity implemented (real, measured improvement; inflation NOT fully resolved)
+
+**Implementation**: `_add_lock_crossing_edges` (`nautical_routing_pipeline.py`,
+called from `run_pipeline` right after `_add_opening_bridge_edges`),
+mirroring the bridge version's pattern but adapted for a lock's two-gate
+topology instead of a bridge's single mid-span opening. For each of the
+17 lock polygons in `locks_gdf`: intersect each fairway/inland-waterway
+feature crossing the polygon against the polygon's own *boundary*
+(`lock_geom.boundary.intersection(hw_row.geometry)`) to get that
+feature's own entry/exit point pair — kept per-feature rather than
+pooling every point across every intersecting feature and taking the
+global farthest pair, which real data showed can otherwise pick two
+points from unrelated features (a convergence of short unrelated channel
+segments near one lock produced a spurious "pair" that genuinely
+crosses land). Candidate pairs are tried widest-span-first, gated by
+`_crosses_land` (Issue E's land/drying-crossing check, applied here from
+the start, not bolted on after) — the first pair that clears land wins;
+if none do (or no fairway/waterway crosses the polygon at all), falls
+back to a single bridge-style centroid node. Each side gets a real node
+connected outward via the same quadrant ray-casting + `_crosses_land`
+gate `_add_opening_bridge_edges` uses, plus one explicit chamber-transit
+edge directly between the two side nodes — the actual connectivity fix,
+since two independently-shore-connected side nodes still don't connect
+to *each other* without it. Edges are tagged `requires_lock`/`lock_id`
+(new `edges` columns, additive, no `schema_version` bump), the marker
+`PHASE_4_DESIGN.md` §4c called for — analogous to `is_opening_bridge_edge`
+but kept separate since a lock chamber transit and a bridge opening are
+physically different enough (cycle time vs. instantaneous) that
+`routeiq`'s `feature-bridge-lock-waits.md` will eventually need to tell
+them apart; the transit edge itself additionally carries
+`is_lock_transit_edge` (in-graph only, not exported) for that same
+future distinction. Also extended `_edge_attr_worker`'s obstacle-crossing
+exemption (previously opening-bridge-edges-only) to cover lock-crossing
+edges too, same reasoning as the existing bridge exemption.
+
+**Generalizes across the dataset, not just Zandkreeksluis**: rebuilt
+against `data/zeeland_clip` (`data/zeeland_round10_locks.sqlite`) —
+"Added 198 lock crossing edges (30 chamber-transit) across 17 lock
+polygons (2 single-node fallback)." Direct query confirms all 17 lock
+polygons got `requires_lock=1` edges (`lock_id` 1-17, 2-18 edges each);
+15/17 got the full two-node-plus-transit treatment, 2/17 (locks with no
+fairway/waterway crossing their polygon at all in this dataset —
+"Kleine Sluis - kolk 1" and one unnamed lock) fell back to the
+single-centroid-node pattern as designed.
+
+**Direct-query verification of the specific Zandkreeksluis gap — with an
+important complication found along the way**: re-ran the exact west/east
+node-set check that found "zero edges" last round. The new build does
+show a direct edge connecting the two sides (`1157557482386202` west,
+`1157558706386550` east, 244.37m) and BFS from any west node now reaches
+100% of east nodes. **But checking the *same coordinates* against the
+pre-fix database (`data/zeeland_round9_verify.sqlite`) found that exact
+edge already there** — `edge_type_id=1` (inland), sourced from
+`_build_inland_network`, not from anything this round added. The
+inland-waterway centerline threading through Zandkreeksluis happens to
+have a digitized vertex pair that brackets the chamber closely enough
+that this round's new opening-point nodes snapped onto the *same*
+pre-existing coordinates (`_get_or_create_node`'s coordinate-dedup keys
+on rounded lon/lat only, not node type, so a "coastal" lookup silently
+returns an already-existing "inland" node at the same spot). **This
+means the original "zero edges connect either side" finding, while
+correctly identifying a real structural gap in general, was not actually
+demonstrating a gap at Zandkreeksluis specifically in this exact rebuild
+— an inland-network coincidence already bridged it.** Coordinate-level
+diffing of the routed path confirmed the same thing operationally: the
+route's geometry through the immediate Zandkreeksluis chamber area is
+*byte-identical* between the pre-fix and post-fix builds (same 6-vertex
+sequence either side of the crossing) — this round's fix did not change
+how that specific crossing is traversed at all. Whatever *is* different
+about the route (see below) comes from elsewhere along the path, most
+likely one of the other 16 locks (`data/zeeland_clip` also has locks near
+Veere — "Grote Sluis"/"Kleine Sluis" — on the same detour route) gaining
+real connectivity this round where it previously had none; a full
+edge-by-edge diff of the two ~700-vertex routes to pin the exact segment
+wasn't completed this round given time already spent, but the aggregate
+before/after effect below is real and cleanly measured regardless of
+which specific lock produced it.
+
+**Route-level reproduction — clean, isolated, back-to-back A/B, not a
+comparison against an older/separately-built snapshot.** The repo's own
+history (see Round 9's "8.73x inflation gone" note above) already
+documents real geometry nondeterminism between *separately-run* pipeline
+builds as a confound for exactly this kind of before/after claim — hit
+it again this round (a fresh `data/zeeland_round9_verify.sqlite` rebuild
+this session reproduced the historical 7.35x exactly, but the base
+network's own raw node/edge counts before any bridge/lock code runs
+still varied run-to-run: 29,590/62,939 vs. 30,127/64,579 edges for
+supposedly-identical code). Controlled for it the way this file's own
+Round 9 writeup recommended: one code commit, one line
+(`self._add_lock_crossing_edges()`) toggled off for a control build, two
+back-to-back rebuilds from the same process session, otherwise identical
+input and code (`data/zeeland_round10_control.sqlite` vs.
+`data/zeeland_round10_locks.sqlite`):
+
+| scenario | profile | control (fix disabled) | fix enabled | change |
+|---|---|---|---|---|
+| Zandkreeksluis crossing (51.550,3.800→51.550,3.950), A→B | 1.2m/17.0m | 86.45km, **8.34x** | 57.52km, **5.55x** | -33.5% distance |
+| Zandkreeksluis crossing, B→A | 1.2m/17.0m | 86.43km, 8.33x | 57.49km, 5.54x | -33.5% distance |
+| Zandkreeksluis crossing, A→B | 2.3m/11.5m | 86.45km, 8.34x | 57.52km, 5.55x | -33.5% distance |
+| Zandkreeksluis crossing, B→A | 2.3m/11.5m | 86.43km, 8.33x | 57.49km, 5.54x | -33.5% distance |
+| Issue A repro, Oude-Tonge→Zierikzee | 1.2m/17.0m | 67.80km, 2.53x | 61.48km, 2.29x | -9.3% distance |
+| Issue A repro, reverse | 1.2m/17.0m | 67.77km, 2.53x | 61.45km, 2.29x | -9.3% distance |
+| Issue A repro, Oude-Tonge→Zierikzee | 2.3m/11.5m | 71.06km, 2.65x | 64.33km, 2.40x | -9.5% distance |
+| Issue A repro, reverse | 2.3m/11.5m | 70.97km, 2.64x | 64.70km, 2.41x | -8.9% distance |
+
+(straight-line: Zandkreeksluis 10.37km, Oude-Tonge→Zierikzee 26.84km;
+straight-line distances match a straightforward haversine and are
+identical across both builds, as expected.)
+
+**Verdict — real, causally-confirmed, but partial.** The fix has a
+genuine, sizable, reproducible effect in a properly-controlled test
+(-33% on the direct crossing that motivated this round, -9% on the
+original Issue A report), and generalizes structurally across all 17
+locks in the dataset, not just Zandkreeksluis. **It does not come close
+to resolving the inflation**: 5.5x and ~2.3-2.4x are both still severe
+detours for what should be near-direct crossings. Whatever is causing
+the *remaining* inflation is a separate, still-open problem — not
+constraint-avoidance (Round 9 already ruled that out for the
+Zandkreeksluis scenario; identical ratios across profiles held in every
+build this round too) and, per the diffing above, not exclusively the
+lock-connectivity gap either, since fixing it structurally and confirming
+it via direct query still leaves a >5x detour. Worth a fresh
+investigation of its own, ideally starting from an edge-by-edge diff of
+a control-vs-fix route pair (not attempted this round) rather than
+another hypothesis-then-verify cycle.
+
+**`loadGraph()` re-checked, no regression**: 1,660ms (fix enabled) /
+1,764ms (control, fix disabled) / 1,755ms (fresh Round 9-equivalent
+rebuild) — all within the same ~1.6-1.8s band Round 9 measured (1.72s),
+consistent with the small edge-count addition (+198 edges out of
+~65,000) being cheap, as expected.
+
 ---
 
 ## What's confirmed working from Phase 0
