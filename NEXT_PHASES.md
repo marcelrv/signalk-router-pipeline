@@ -2387,6 +2387,241 @@ not necessarily in what gets chosen or its reported length. Not fixed
 yet; full writeup and the reasoning for why it's probably distinct from
 the inflation problem is in the `routeiq` doc.
 
+### Phase 2 Hardening, Round 13 — navmesh regions are single-point-attachment islands (root cause of "route follows the navmesh outer contour"; found, verified, fix pending)
+
+Triggered by a direct user report: "navigation through the navmesh is very
+broken, it seems it follows the navmesh outer contours instead of finding
+the fastest route through the mesh." Investigated with real probes against
+the current best build (`data/zeeland_round10_locks.sqlite`, routeiq at
+`a4a0db5`), not from screenshots. Scratch scripts:
+`routeiq/scratch_round13/*.mjs`.
+
+**Two independent confirmed facts, don't conflate them:**
+
+**1. The live deployed database is stale (deployment issue, not a code
+bug).** `/home/node/signalkdev/signalk-routeiq/data/zeeland.sqlite` is
+dated Jul 13 16:20 — Round-8-era, confirmed by direct query: 24/25
+navmesh regions have empty `boundary_node_ids`, so the entire
+funnel-upgrade/anchor-shortcut mechanism is structurally disabled in
+production (the Round 9 master finding, fixed in code Jul 16, never
+deployed). Every route the live webapp shows can only walk raw ring
+chords along region perimeters — the user's observation is literally
+correct for the deployed system. Fix: regenerate with the Round 13 fix
+below and deploy.
+
+**2. The current-code defect: navmesh regions attach to the rest of the
+graph at essentially one point, so routes can't cross *through* them to
+anywhere useful.** Probe C — (51.6400,3.8400) → (51.6150,3.9300),
+6,806m straight line across the Oosterschelde, start inside region
+idx 14, destination inside region idx 11: the engine returns **33,703m
+(4.95x)** at cost 1.14e10. The decisive measurement: a **pure-distance
+Dijkstra over the loaded in-memory graph (all soft penalties ignored,
+only `crosses_land`/`crosses_obstacle` hard exclusions — and the result
+is identical when even those are allowed)** still returns **27,024m**,
+using **zero anchor-shortcut and zero funnel-upgraded edges** anywhere
+along the path. So this is NOT a cost/penalty/route-choice problem in
+`routeiq` — the graph genuinely contains no shorter path. Direct SQL
+confirms why: region idx 14 (85 boundary nodes, ~5km of open water) has
+exactly **7 edges from its boundary set to the rest of the graph — all
+at its west side, only 1 reaching a skeleton node, zero eastward** —
+despite 85 skeleton nodes sitting in its own latitude band within
+~100-200m of its east boundary (well inside `snap_radius_m=500`).
+Attachment analysis across all 15 regions: **6 of 15 have a single
+distinct attachment area; most others have two.**
+
+**Mechanism, confirmed in code (`_stitch_component_pieces`,
+`nautical_routing_pipeline.py:1319`)**: `try_add`'s
+`if find(u) == find(v): return False` union-find rejection. A region's
+perimeter ring is one union-find group via its own ring edges; the
+moment its first connector merges it with the main network, **every
+subsequent candidate pair touching that region is rejected as
+"already connected"** — including the 85 eastward candidates Pass 0b's
+cross-type KNN correctly proposes. Every stitching pass guarantees
+*global connectivity only*, never *local adjacency density*. Rounds
+4/6 each fixed one instance of this class (the 30m/88m/94.8m gaps) by
+widening candidate selection — but candidate selection was never the
+bottleneck for this general form; the accept/reject rule is. This is
+the general defect those rounds were chasing instances of.
+
+**Secondary findings (real, distinct, not the cause of contour-following
+— the pure-distance proof above rules them out as the primary):**
+- **`min_depth=0` poisoning**: 15,280/61,385 (**25%**) of
+  `edge_kind_id=0` centerline edges carry `min_depth=0` (from
+  `_edge_attr_worker`'s `max(0.0, min(DRVAL1 sampled))` — the DEPARE
+  band *floor*, clamped at 0 for drying bands). Every such edge gets the
+  `+1,000,000 × edge-length` penalty for every real vessel — the source
+  of the recurring, misleading "depth 0.0m < required" warnings and the
+  1e10-scale route costs seen since Round 9. Worth its own round: the
+  charted band floor is not the same claim as "a vessel cannot pass
+  here" (DRVAL1=0 bands are 0-to-DRVAL2; tide can matter; the 5-point
+  sample takes the worst band touched anywhere along the edge).
+- **Penalty scaling bias**: `edgeCost = baseCost + penalty ×
+  max(1, edge.distance)` (`routing.ts`) means that when all
+  alternatives are penalized, many short penalized edges beat one long
+  one — a structural bias toward fine-grained contour walking in
+  constrained areas. Noted, not acted on.
+
+**Confirmed working — do not re-investigate**: `routeiq`'s
+`precomputeFunnelEdges` runs for 15/15 regions on the Round-9/10
+database (no empty-boundary warnings); same-region navmesh crossing
+(probe A, region idx 4 interior) returns ratio 1.18 with
+cost == distance and correct funnel behavior; in-memory anchor-shortcut
+edges carry sane attributes (`min_depth=depthCeilingM` 6.0,
+`max_air_draft=-1`, `distance_to_land=9999`).
+
+**Fix direction (pipeline, this repo)**: add a *local-adjacency
+guarantee* to `_stitch_component_pieces` — for each navmesh boundary
+node, ensure up to N (1-2) short cross-type connectors to nearby
+non-navmesh nodes within a modest radius exist, **regardless of
+union-find state**, capped per node (this bounds added edges at
+~O(boundary nodes), ~1,700 across all 15 regions), gated by the exact
+same `within(poly_m)`/`_crosses_land` (land + drying) checks every
+other stitch already uses. Then: full regeneration, re-probe (expect
+probe C to drop from 4.95x toward ~1.0-1.5x and to actually traverse
+anchor shortcuts), `routeiq` test suite, `loadGraph()` re-time,
+land-crossing strip-count sanity, deploy to the live server.
+
+#### Round 13 outcome — implemented, verified at full scale, deployed (uncommitted)
+
+**Implementation ("Pass 0c", `_stitch_component_pieces`)**: per the fix
+direction above — a cross-type KNN pass (reusing Pass 0b's KD-trees, both
+query directions) that adds connectors **without** the union-find gate,
+bounded by `MAX_CROSS_CONNECTORS_PER_NAVMESH_NODE = 2` per navmesh
+vertex (pre-existing cross-type edges count toward the cap), same
+`within(poly_m)`/`_crosses_land` gates and edge attrs as `try_add`.
+One real performance lesson hit on the way: the first run appeared to
+hang in component 1/344 and died — the containment checks against the
+giant Oosterschelde component polygon ran unprepared, and unlike the
+old passes this one no longer stops at first connectivity. Fixed with
+`shapely.prepared.prep(poly_m)`; the full rebuild then completed in
+**~5 min** (faster than Round 10's ~6.5 min).
+
+**Attachment before/after (identical region structure both builds —
+boundary counts match exactly, so the comparison is clean)**: total
+external edges from region boundary sets **135 → 2,395**; region idx 14
+(the verified worst case) went from 7 external edges / 1 skeleton link /
+west-side-only to **96 external / 90 to skeleton**, distributed around
+its perimeter. No region below 22 external edges (was 1).
+
+**Route probes (same scripts, `routeiq/scratch_round13/`)**:
+- **Probe C (6,806m cross-Oosterschelde crossing): 33,703m → 10,489m
+  (4.95x → 1.54x)**, cost 1.14e10 → 2.29e7, and the path now genuinely
+  traverses anchor-shortcut edges (pure-distance Dijkstra: 2 shortcuts,
+  1,702m of interior crossing). One small wart, noted not fixed: a 23m
+  `ring-raw+AIR` edge near the Zeelandbrug is crossed (sole source of
+  the remaining 2.29e7 cost) — tiny, warning-level, likely a ring edge
+  clipped by the fixed-span polygon; worth a look whenever bridge edge
+  tagging is next touched.
+- **Probe B (Oude-Tonge→Zierikzee)**: cost 1.41e10 → 1.35e9 (10x),
+  pure-distance optimum 61,847m → 50,761m and now uses a navmesh
+  shortcut. Engine distance went 62,498m → 68,207m — *expected*: with
+  penalties now avoidable, A* correctly trades distance to avoid
+  penalized edges (penalized meters on the chosen path dropped
+  14,131m → 1,350m). The remaining ~2.3x inflation on this scenario is
+  the already-documented separate issue-complex (inland-network
+  southward detour §5.2.2, `min_depth=0` poisoning above, lock
+  connectivity Round 10) — NOT navmesh crossing, which this round fixed.
+- `routeiq` suite 41/41; `loadGraph()` 1,716ms (same band as Round
+  9/10 — the +2,260 connector edges cost nothing measurable).
+
+**Deployed**: old live `zeeland.sqlite` (the stale Round-8 file, item 1
+above) backed up as `routeiq/data/zeeland_pre_round13.sqlite.bak`;
+`zeeland_round13.sqlite` installed as the live `zeeland.sqlite`;
+server restarted; startup log confirms the new build loads with zero
+empty-`boundary_node_ids` warnings (was 24/25).
+
+**Not done this round**: the `min_depth=0` fix (25% of centerline edges,
+see above) and probe B's inland-detour complex — both documented above
+as their own follow-ups. Pipeline change is **uncommitted**, left for
+review alongside this doc update.
+
+### Phase 2 Hardening, Rounds 14+15 — fairway/waterway ↔ navmesh connection (user-diagnosed, implemented, verified, deployed; uncommitted)
+
+**Trigger — two user observations, both checked against data before
+acting**: (1) "the water fairway crossing the navmesh does not intersect
+with the navmesh" — **confirmed, worse than stated**: in the Round 13
+build, 273 of 3,664 inland-waterway edges crossed the 15 navmesh
+regions and the 295 inland nodes involved had **zero** edges to any
+coastal/navmesh node (the §5.2.2 exclusion manifesting inside regions);
+(2) "not obvious the latest version still consumes the waterways —
+some appear missing" — **checked, nothing missing**: the inland network
+is byte-identical between the old and new deployed databases
+(7,347 edges / 3,716 nodes in both); what changed was coastal density
+(Round 9) plus the debug view's known 5,000-edge viewport cap. Fairway
+*polygons* never generate graph geometry at all (cost/classification/
+bridge-opening detection only) — the connection work targets
+`inland_waterways` lines.
+
+**Round 14 (`_inject_waterway_crossings` + `_connect_waterway_crossing`)**:
+where a waterway line crosses a navmesh piece's FINAL (post-simplify)
+boundary, the crossing point is inserted as a real ring vertex and
+seam-tagged (so it lands in `boundary_node_ids` and participates in
+routeiq's funnel/anchor machinery), then connected to that line's
+nearest inland vertex (≤250m normal / ≤500m logged fallback), land/
+drying-gated. Result: 71 crossing nodes across all 15 regions, 104
+connector edges. **Verified effective at graph level** (probe C
+pure-distance optimum 27,024m → 8,849m; probe B optimum → 36,635m,
+matching the pre-Round-4 historical best) — **but exposed a route-level
+regression**: the newly-opened direct corridor contained one 211m
+air-draft-flagged edge, and `getEdgePenalty`'s 1e6 × meters scaling made
+the engine prefer a 105km penalty-free detour. Held back from deploy;
+root-caused via a new hard-constraint cut analysis
+(`routeiq/scratch_round13/probe5–7.mjs`): exactly 3 violating edges
+separated the two sides, and the start side's inland frontier node sat
+**33m** from the end side's coastal skeleton node carrying the
+999-clearance Zeelandbrug opening chain — the general inland/coastal
+stitching exclusion again.
+
+**Round 15 (the §5.2.2 design decision, implemented)**:
+`_ensure_coastal_connectivity` now also includes inland nodes whose
+coordinates fall **inside** the coastal component polygon (strictly
+inside — an inland canal behind a lock is outside the coastal polygon by
+construction, so locks cannot be bypassed; `_crosses_land` still gates
+every connector), and `_stitch_component_pieces` gained **Pass 0d**
+(mirrors Pass 0c, keyed on `node_type=="inland"` vs everything else, ≤2
+connectors/node within 300m, no union-find gate). 3,146 of 3,716 inland
+nodes (85%) turned out to sit in open coastal water — RWS IENC waterway
+axes run straight through open water, confirming the type split was a
+source-layering artifact, not hydrography.
+
+**A real segfault found and fixed along the way** (two silent build
+deaths, root-caused via `python3 -X faulthandler`, exit 139 in
+`_triangle.triangulate` ← `build_navmesh_region`): Round 14's crossing
+injection could produce near-duplicate PSLG vertices (snap epsilon was
+0.01m and inserts from *different* lines were never deduped against
+each other) — the same C-level crash class as Round 7's sliver
+polygons, and geometry-nondeterministic (Round 14's own build got
+lucky). Fix: `WATERWAY_CROSSING_SNAP_M=1.0` snap-to-vertex/insert
+merging across lines, plus a final degenerate-ring-segment guard that
+skips injection for the piece (a segfault is uncatchable in-process —
+prevention only). Watcher lesson recorded: a completion watcher's
+`pgrep -f <pattern>` matches its own command line — key watchers on an
+always-written `EXIT_CODE:` log marker instead.
+
+**Verified (fresh full build, ~5.5min, exit 0)**:
+
+| | Round 13 (was deployed) | Round 14 | **Round 15 (deployed)** |
+|---|---|---|---|
+| Probe C hard-constraint (penalty-free) path | n/a | 105,430m | **8,232m** (1.21x unconstrained) |
+| Probe C engine | 10,489m (1.54x) | 105,671m — regression | **7,801m (1.15x), 0 penalized meters** |
+| Probe B engine | 68,207m | 128,840m | **37,274m (1.29x)** — matches the 36,946m pre-Round-4 historical best |
+| requires_lock edges | 200 | — | 200 (no lock bypass) |
+| tests / loadGraph | 41/41, 1.72s | — | **41/41, 1.94s** |
+
+Probe C's route now partly follows the actual waterway through the mesh
+area — the user's requested behavior. Deployed (previous live backed up
+as `routeiq/data/zeeland_pre_round15.sqlite.bak`; server restarted,
+30,008 nodes / 105,255 edges loaded cleanly). **Uncommitted**, same as
+Round 13.
+
+**Still open after Rounds 13–15** (unchanged list, now the clear top
+items): `min_depth=0` poisoning (probe B's remaining 1,279 penalized
+meters and every "depth 0.0m" warning), the `getEdgePenalty` 1e6×meters
+scaling (Round 14's regression showed how sharp its cliff is — any
+future data gap turns into a 10x detour), and the small 23m/106m
+air-flagged ring edges near the Zeelandbrug worth checking when bridge
+tagging is next touched.
+
 ---
 
 ## What's confirmed working from Phase 0
