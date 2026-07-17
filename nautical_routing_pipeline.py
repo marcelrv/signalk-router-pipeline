@@ -282,6 +282,25 @@ NAVMESH_BOUNDARY_SIMPLIFY_M = 5.0   # build_navmesh_region: a separate, coarser 
                                      # one, so exact-coordinate seam matching in build_navmesh_region
                                      # still works correctly on whatever seam vertices survive.
 
+# --- Round 14: inland-waterway x navmesh-region boundary crossings ---
+# Fix for the confirmed bug: _ensure_coastal_connectivity's candidate node set is
+# `node_type != "inland"`, so inland waterway nodes are structurally invisible to
+# every stitching pass (including Round 13's Pass 0c) -- a waterway line crossing
+# open navmesh water was a disconnected parallel network with zero edges to the
+# mesh. See _inject_waterway_crossings / build_navmesh_region.
+WATERWAY_CROSSING_DEDUPE_M = 50.0      # crossings from the same line closer than this are merged
+WATERWAY_CROSSING_SNAP_M = 1.0         # snap a crossing onto an existing ring vertex / earlier insert
+                                       # within this range instead of adding a new PSLG vertex --
+                                       # near-coincident vertices (two lines crossing the same spot,
+                                       # or a crossing millimeters from a ring vertex) produce
+                                       # knife-edge/duplicate segments that segfault
+                                       # _triangle.triangulate at the C level (confirmed via
+                                       # faulthandler on a real full-scale build; same crash class
+                                       # Round 7 hit with sliver polygons)
+WATERWAY_CROSSING_CAP_PER_LINE = 8     # sanity cap per (navmesh piece, line) -- multi-crossing braids exist
+WATERWAY_CONNECTOR_MAX_M = 250.0       # normal connector search radius to the nearest inland vertex
+WATERWAY_CONNECTOR_FALLBACK_MAX_M = 500.0  # widened radius for sparsely-digitized lines (logged)
+
 
 @dataclass
 class ClassificationConfig:
@@ -411,7 +430,9 @@ class NauticalRoutingPipeline:
         # _stitch_component_pieces's sampling despite the intent documented
         # there -- see that method's docstring for why this matters.
         self.navmesh_seam_node_ids: set = set()
-        
+        # Round 14 summary counters, logged once at the end of build_network.
+        self.waterway_crossing_stats = {"nodes": 0, "regions": 0, "edges": 0}
+
     def run_pipeline(self):
         self.parse_shapefiles()
         self.build_network()
@@ -597,6 +618,10 @@ class NauticalRoutingPipeline:
             logger.info(f"Coastal water: {len(polygons)} connected components split into "
                         f"skeleton={counts['skeleton']}, laned={counts['laned']}, "
                         f"navmesh={counts['navmesh']} pieces.")
+        wcs = self.waterway_crossing_stats
+        if wcs["regions"]:
+            logger.info(f"Inland-waterway x navmesh crossings: {wcs['nodes']} crossing nodes added "
+                        f"across {wcs['regions']} regions, {wcs['edges']} connector edges.")
         logger.info(f"Network built with {self.graph.number_of_nodes()} nodes and {self.graph.number_of_edges()} edges.")
 
     # ------------------------------------------------------------------
@@ -1066,6 +1091,224 @@ class NauticalRoutingPipeline:
             data["holes"] = np.array(holes, dtype=float)
         return data, ring_ranges
 
+    def _inject_waterway_crossings(self, poly_m, utm_crs):
+        """Where an `inland_waterways` line crosses this navmesh piece's FINAL
+        boundary (post-`NAVMESH_BOUNDARY_SIMPLIFY_M`, post-PSLG-budget-retry --
+        i.e. exactly the geometry `build_navmesh_region` is about to hand to
+        `_polygon_to_pslg`), insert the crossing as a genuine ring vertex. Because
+        nothing simplifies this geometry again afterward, the inserted point
+        survives untouched into the PSLG and its coordinate exact-matches the
+        seam set this method also returns -- unlike the width/depth seams (whose
+        seam_coord_set is computed on the PRE-simplify boundary and only survives
+        because simplify never *moves* a retained vertex), a freshly-interpolated
+        crossing point computed against a pre-simplify boundary would generally
+        NOT land on the post-simplify boundary at all, so this must run after all
+        simplification is finalized, not passed down from build_network like the
+        width/depth seams are.
+
+        Returns (poly_m_with_crossings, extra_seam_coords, crossing_records).
+        crossing_records is [(ring_idx, position_in_ring, inland_gdf_iloc, (x_m, y_m)), ...]
+        -- position_in_ring is an index into the OPEN (no duplicate closing point)
+        per-ring coordinate list, i.e. directly comparable to `_polygon_to_pslg`'s
+        ring_ranges once it's called on the returned polygon. The caller uses this,
+        once perimeter node ids exist, to add the waterway connector edge.
+        """
+        inland_gdf = self.gdfs.get("inland_waterways")
+        if inland_gdf is None or inland_gdf.empty:
+            return poly_m, set(), []
+
+        poly_wgs84 = gpd.GeoSeries([poly_m], crs=utm_crs).to_crs(self.CRS_WGS84).iloc[0]
+        try:
+            cand_idx = list(inland_gdf.sindex.query(poly_wgs84, predicate="intersects"))
+        except Exception:
+            cand_idx = list(range(len(inland_gdf)))
+        if not cand_idx:
+            return poly_m, set(), []
+
+        rings = [poly_m.exterior] + list(poly_m.interiors)
+        ring_coords: List[List[Tuple[float, float]]] = []
+        for ring in rings:
+            coords = list(ring.coords)
+            if len(coords) > 1 and coords[0] == coords[-1]:
+                coords = coords[:-1]
+            ring_coords.append(coords)
+
+        # inland_gdf_iloc -> [(ring_idx, (x, y)), ...] raw crossing hits.
+        per_line_hits = defaultdict(list)
+        for line_iloc in cand_idx:
+            line_wgs84 = inland_gdf.geometry.iloc[line_iloc]
+            if line_wgs84 is None or line_wgs84.is_empty:
+                continue
+            line_m = gpd.GeoSeries([line_wgs84], crs=self.CRS_WGS84).to_crs(utm_crs).iloc[0]
+            for ring_idx, ring in enumerate(rings):
+                try:
+                    inter = ring.intersection(line_m)
+                except Exception:
+                    continue
+                if inter.is_empty:
+                    continue
+                for g in getattr(inter, "geoms", [inter]):
+                    if g.geom_type == "Point":
+                        per_line_hits[line_iloc].append((ring_idx, (g.x, g.y)))
+                    # A LineString result (the waterway runs collinear with the
+                    # boundary for a stretch) has no single clean crossing point
+                    # to anchor a node on -- rare, deliberately skipped.
+
+        if not per_line_hits:
+            return poly_m, set(), []
+
+        vertex_hits = [defaultdict(list) for _ in rings]   # ring_idx -> orig_i -> [inland_gdf_iloc]
+        seg_inserts = [defaultdict(list) for _ in rings]   # ring_idx -> orig_seg_i -> [(t, (x,y), iloc)]
+        extra_seam_coords = set()
+
+        for line_iloc, hits in per_line_hits.items():
+            # Dedupe crossings from the SAME line within WATERWAY_CROSSING_DEDUPE_M
+            # of each other (typically 2 real crossings -- in/out -- per line per
+            # piece; near-tangential digitization noise can otherwise cluster).
+            kept = []
+            for ring_idx, (x, y) in hits:
+                if any(ri == ring_idx and math.hypot(x - kx, y - ky) < WATERWAY_CROSSING_DEDUPE_M
+                       for ri, (kx, ky) in kept):
+                    continue
+                kept.append((ring_idx, (x, y)))
+            if len(kept) > WATERWAY_CROSSING_CAP_PER_LINE:
+                logger.info(f"  Waterway crossing cap: inland_waterways row {line_iloc} crosses "
+                            f"one navmesh piece {len(kept)}x; capping to "
+                            f"{WATERWAY_CROSSING_CAP_PER_LINE}.")
+                kept = kept[:WATERWAY_CROSSING_CAP_PER_LINE]
+
+            for ring_idx, (x, y) in kept:
+                coords = ring_coords[ring_idx]
+                n = len(coords)
+                best_i, best_dist, best_t = None, None, 0.0
+                for i in range(n):
+                    ux, uy = coords[i]
+                    vx, vy = coords[(i + 1) % n]
+                    d = LineString([(ux, uy), (vx, vy)]).distance(Point(x, y))
+                    if best_dist is None or d < best_dist:
+                        seg_len2 = (vx - ux) ** 2 + (vy - uy) ** 2
+                        t = 0.0 if seg_len2 == 0 else ((x - ux) * (vx - ux) + (y - uy) * (vy - uy)) / seg_len2
+                        best_i, best_dist, best_t = i, d, t
+                if best_i is None or best_dist > 0.5:
+                    continue  # GEOS numerical edge case -- point should be on some segment.
+                ux, uy = coords[best_i]
+                vx, vy = coords[(best_i + 1) % n]
+                if math.hypot(x - ux, y - uy) < WATERWAY_CROSSING_SNAP_M:
+                    vertex_hits[ring_idx][best_i].append(line_iloc)
+                    extra_seam_coords.add((round(ux, 3), round(uy, 3)))
+                elif math.hypot(x - vx, y - vy) < WATERWAY_CROSSING_SNAP_M:
+                    vertex_hits[ring_idx][(best_i + 1) % n].append(line_iloc)
+                    extra_seam_coords.add((round(vx, 3), round(vy, 3)))
+                else:
+                    # Merge with any already-accepted insert on this ring (from
+                    # ANY line -- the per-line dedupe above can't see other
+                    # lines) within snap range: reuse the earlier point's exact
+                    # coordinates instead of adding a near-duplicate vertex.
+                    merged = False
+                    for si, inserts in seg_inserts[ring_idx].items():
+                        for t0, (px, py), _il in inserts:
+                            if math.hypot(x - px, y - py) < WATERWAY_CROSSING_SNAP_M:
+                                seg_inserts[ring_idx][si].append((t0, (px, py), line_iloc))
+                                extra_seam_coords.add((round(px, 3), round(py, 3)))
+                                merged = True
+                                break
+                        if merged:
+                            break
+                    if not merged:
+                        seg_inserts[ring_idx][best_i].append((best_t, (x, y), line_iloc))
+                        extra_seam_coords.add((round(x, 3), round(y, 3)))
+
+        if not extra_seam_coords:
+            return poly_m, set(), []
+
+        new_rings_coords = []
+        crossing_records = []
+        for ring_idx, coords in enumerate(ring_coords):
+            new_coords = []
+            for i, c in enumerate(coords):
+                new_coords.append(c)
+                pos = len(new_coords) - 1
+                for line_iloc in vertex_hits[ring_idx].get(i, []):
+                    crossing_records.append((ring_idx, pos, line_iloc, c))
+                for t, (x, y), line_iloc in sorted(seg_inserts[ring_idx].get(i, []), key=lambda r: r[0]):
+                    if new_coords[-1] == (x, y):
+                        # merged duplicate (same point, another line) -- record
+                        # against the already-inserted vertex, don't re-insert
+                        crossing_records.append((ring_idx, len(new_coords) - 1, line_iloc, (x, y)))
+                    else:
+                        crossing_records.append((ring_idx, len(new_coords), line_iloc, (x, y)))
+                        new_coords.append((x, y))
+            new_rings_coords.append(new_coords)
+
+        # Last-line-of-defense guard: a degenerate (near-zero) segment anywhere
+        # in the modified rings would segfault _triangle.triangulate at the C
+        # level, which try/except cannot catch -- skip injection for this piece
+        # entirely rather than risk the whole build.
+        for coords in new_rings_coords:
+            m = len(coords)
+            for i in range(m):
+                x1, y1 = coords[i]
+                x2, y2 = coords[(i + 1) % m]
+                if math.hypot(x2 - x1, y2 - y1) < 0.005:
+                    logger.warning("  Waterway crossing injection produced a degenerate ring segment; "
+                                   "skipping crossing injection for this navmesh piece.")
+                    return poly_m, set(), []
+
+        new_poly_m = Polygon(new_rings_coords[0], new_rings_coords[1:])
+        if not new_poly_m.is_valid or new_poly_m.is_empty:
+            logger.warning("  Waterway crossing insertion produced an invalid navmesh "
+                            "boundary; skipping crossings for this piece.")
+            return poly_m, set(), []
+
+        return new_poly_m, extra_seam_coords, crossing_records
+
+    def _connect_waterway_crossing(self, node_id, line_iloc, utm_crs, crossing_xy_m, line_m_cache):
+        """Connect a crossing-derived boundary node to the nearest inland node of
+        the SAME waterway line feature (`try_add`'s attrs, mirroring
+        `_stitch_component_pieces` -- see that method). Returns the number of
+        edges added (0 or 2).
+        """
+        inland_gdf = self.gdfs["inland_waterways"]
+        if line_iloc not in line_m_cache:
+            line_wgs84 = inland_gdf.geometry.iloc[line_iloc]
+            coords_wgs84 = list(line_wgs84.coords)
+            line_m = gpd.GeoSeries([line_wgs84], crs=self.CRS_WGS84).to_crs(utm_crs).iloc[0]
+            line_m_cache[line_iloc] = (coords_wgs84, np.array(line_m.coords))
+        coords_wgs84, coords_m = line_m_cache[line_iloc]
+
+        x, y = crossing_xy_m
+        d2 = (coords_m[:, 0] - x) ** 2 + (coords_m[:, 1] - y) ** 2
+        nearest_idx = int(np.argmin(d2))
+        nearest_dist_m = math.sqrt(d2[nearest_idx])
+
+        if nearest_dist_m > WATERWAY_CONNECTOR_FALLBACK_MAX_M:
+            logger.info(f"  Waterway crossing: nearest inland vertex of row {line_iloc} is "
+                        f"{nearest_dist_m:.0f}m away (> {WATERWAY_CONNECTOR_FALLBACK_MAX_M:.0f}m); "
+                        f"skipping connector.")
+            return 0
+        if nearest_dist_m > WATERWAY_CONNECTOR_MAX_M:
+            logger.info(f"  Waterway crossing: nearest inland vertex of row {line_iloc} is "
+                        f"{nearest_dist_m:.0f}m away (> {WATERWAY_CONNECTOR_MAX_M:.0f}m normal radius, "
+                        f"within {WATERWAY_CONNECTOR_FALLBACK_MAX_M:.0f}m fallback); connecting anyway.")
+
+        inland_lon, inland_lat = coords_wgs84[nearest_idx]
+        inland_node_id = self._get_or_create_node(inland_lon, inland_lat, "inland")
+        if inland_node_id == node_id:
+            return 0
+        crossing_lon = self.graph.nodes[node_id]["lon"]
+        crossing_lat = self.graph.nodes[node_id]["lat"]
+        candidate_wgs84 = LineString([(crossing_lon, crossing_lat), (inland_lon, inland_lat)])
+        if self._crosses_land(candidate_wgs84):
+            logger.info(f"  Waterway crossing: connector to inland row {line_iloc} crosses land; skipping.")
+            return 0
+        if self.graph.has_edge(node_id, inland_node_id):
+            return 0
+        attrs = dict(edge_type="coastal", edge_kind_id=EDGE_KIND_NAVMESH_BOUNDARY,
+                     source_tier=DEFAULT_SOURCE_TIER, source_id=None)
+        self.graph.add_edge(node_id, inland_node_id, **attrs)
+        self.graph.add_edge(inland_node_id, node_id, **attrs)
+        return 2
+
     def build_navmesh_region(self, poly_m, utm_crs, seam_coord_set,
                              source_tier=DEFAULT_SOURCE_TIER, source_id=None):
         """Triangulate one wide, navmesh-eligible water sub-polygon (already in
@@ -1123,6 +1366,16 @@ class NauticalRoutingPipeline:
                         f"{NAVMESH_PSLG_BUDGET}); retrying with simplify tolerance "
                         f"{simplify_tol:.1f}m.")
 
+        # Round 14: crossing points MUST be computed against this exact poly_m --
+        # the geometry `pslg`/`ring_ranges` above were just derived from, and
+        # nothing simplifies it again after this point -- see
+        # _inject_waterway_crossings' docstring for why an earlier (pre-simplify)
+        # boundary won't do.
+        poly_m, extra_seam_coords, crossing_records = self._inject_waterway_crossings(poly_m, utm_crs)
+        if crossing_records:
+            pslg, ring_ranges = self._polygon_to_pslg(poly_m)
+            seam_coord_set = seam_coord_set | extra_seam_coords
+
         max_area = (NAVMESH_TARGET_EDGE_M ** 2) * 0.433
         try:
             result = _triangle.triangulate(pslg, f"pq28a{max_area:.1f}n")
@@ -1175,6 +1428,23 @@ class NauticalRoutingPipeline:
                 if u != v and not self.graph.has_edge(u, v):
                     self.graph.add_edge(u, v, **attrs)
                     self.graph.add_edge(v, u, **attrs)
+
+        if crossing_records:
+            line_m_cache: Dict[int, Tuple[list, np.ndarray]] = {}
+            crossing_node_ids = set()
+            edges_added = 0
+            for ring_idx, pos_in_ring, line_iloc, xy_m in crossing_records:
+                start, count = ring_ranges[ring_idx]
+                global_idx = start + pos_in_ring
+                cnode_id = perimeter_node_ids[global_idx]
+                if cnode_id is None:
+                    continue
+                crossing_node_ids.add(cnode_id)
+                edges_added += self._connect_waterway_crossing(cnode_id, line_iloc, utm_crs, xy_m, line_m_cache)
+            if crossing_node_ids:
+                self.waterway_crossing_stats["regions"] += 1
+                self.waterway_crossing_stats["nodes"] += len(crossing_node_ids)
+                self.waterway_crossing_stats["edges"] += edges_added
 
         boundary_geom_wgs84 = gpd.GeoSeries([poly_m], crs=utm_crs).to_crs(self.CRS_WGS84).iloc[0]
         self.navmesh_region_rows.append({
@@ -1310,6 +1580,18 @@ class NauticalRoutingPipeline:
                               crs=self.CRS_WGS84).to_crs(utm)
         coords_m = np.column_stack([pts_m.x.to_numpy(), pts_m.y.to_numpy()])
         poly_m = gpd.GeoSeries([component_polygon_wgs84], crs=self.CRS_WGS84).to_crs(utm).iloc[0].buffer(2.0)
+        # Prepared geometry for the containment gate: `line.within(poly_m)`
+        # against a full-component water polygon (the Oosterschelde component's
+        # exterior+island rings carry an enormous vertex count) re-walks that
+        # entire boundary per candidate. shapely.prepared builds the polygon's
+        # edge index once, making each `poly_prep.contains(line)` (exactly
+        # equivalent to `line.within(poly_m)`, since a.within(b) <=>
+        # b.contains(a)) cheap. Pass 0c below no longer stops at first
+        # connectivity, so it evaluates orders of magnitude more candidates
+        # than try_add's union-find-gated passes ever did -- without this,
+        # a full Zeeland run stalled indefinitely inside component 1.
+        from shapely.prepared import prep
+        poly_prep = prep(poly_m)
 
         added = 0
 
@@ -1319,7 +1601,7 @@ class NauticalRoutingPipeline:
             if find(u) == find(v):
                 return False
             candidate_m = LineString([coords_m[i], coords_m[j]])
-            if not candidate_m.within(poly_m):
+            if not poly_prep.contains(candidate_m):
                 return False
             if self._crosses_land(LineString([coords_wgs84[i], coords_wgs84[j]])):
                 return False
@@ -1453,6 +1735,230 @@ class NauticalRoutingPipeline:
                     if np.linalg.norm(coords_m[gi] - coords_m[gj]) > snap_radius_m:
                         continue
                     try_add(gi, gj)
+
+            # Pass 0c: LOCAL adjacency guarantee for navmesh perimeter
+            # vertices -- unlike every pass above (and try_add's own
+            # `find(u) == find(v)` guard), this one deliberately does NOT
+            # stop once the region is globally connected. Confirmed on a
+            # real full-scale Zeeland build: region idx 14 (85 boundary
+            # nodes ringing ~5km of open Oosterschelde) ended up with
+            # exactly 7 edges out to the rest of the graph, every one of
+            # them on the region's west side, despite 85 skeleton nodes
+            # sitting only 100-200m to its east -- well inside
+            # snap_radius_m. The reason: the moment Pass 0b's first
+            # west-side connector fires, union() merges the ENTIRE 85-node
+            # perimeter ring (already one union-find group via its own ring
+            # edges) into the main component in one step. Every other
+            # genuinely-nearby eastward candidate Pass 0b considers after
+            # that is then rejected by try_add as "already connected", even
+            # though none of those pairs share an actual edge. Global
+            # connectivity was satisfied by one pinch point, but the region
+            # still routes like a bag with a single drawstring: a real
+            # route crossing it has to walk the whole boundary ring out to
+            # that one point and back. A pure-distance Dijkstra over the
+            # resulting graph (ignoring all soft routing penalties) still
+            # returned 4x the straight-line distance for a crossing through
+            # this exact region -- proof this is a missing-edge defect, not
+            # a routing-cost one.
+            #
+            # The fix: for each navmesh vertex, add cross-type connectors
+            # even when already unified, bounded by a per-node cap on
+            # cross-type external connectors (pre-existing ones count
+            # toward the cap too, so already-well-attached nodes are
+            # skipped after one O(degree) check) instead of a union-find
+            # check. This keeps the pass from re-creating the "thousands of
+            # spurious chords" problem Pass 0's docstring warns about,
+            # while still giving every perimeter vertex a real chance at
+            # its own nearest cross-type neighbour rather than only the
+            # first vertex to get merged.
+            MAX_CROSS_CONNECTORS_PER_NAVMESH_NODE = 2
+
+            def _existing_cross_connector_count(node_id) -> int:
+                return sum(
+                    1 for nbr in self.graph.neighbors(node_id)
+                    if self.graph.nodes[nbr].get("node_kind_id", NODE_KIND_POINT) != NODE_KIND_NAVMESH_VERTEX
+                )
+
+            cross_count = {ids[gi]: _existing_cross_connector_count(ids[gi]) for gi in navmesh_idx}
+
+            def try_add_local(i: int, j: int) -> bool:
+                """Same safety gates and edge attrs as try_add, but WITHOUT
+                the union-find gate -- see the Pass 0c comment above."""
+                nonlocal added
+                u, v = ids[i], ids[j]
+                if self.graph.has_edge(u, v):
+                    return False
+                candidate_m = LineString([coords_m[i], coords_m[j]])
+                if not poly_prep.contains(candidate_m):
+                    return False
+                if self._crosses_land(LineString([coords_wgs84[i], coords_wgs84[j]])):
+                    return False
+                attrs = dict(edge_type="coastal", edge_kind_id=EDGE_KIND_NAVMESH_BOUNDARY,
+                             source_tier=DEFAULT_SOURCE_TIER, source_id=None)
+                self.graph.add_edge(u, v, **attrs)
+                self.graph.add_edge(v, u, **attrs)
+                union(u, v)
+                added += 2
+                return True
+
+            # Direction A: each navmesh vertex -> its k nearest cross-type
+            # neighbours (cKDTree.query already returns them nearest-first),
+            # stopping as soon as that vertex's own cap is met. Reuses the
+            # other_tree/navmesh_coords built for Pass 0b above.
+            k_cross = min(6, len(other_idx))
+            _, nn_local = other_tree.query(navmesh_coords, k=k_cross)
+            if k_cross == 1:
+                nn_local = nn_local.reshape(-1, 1)
+            for local_i, neighbors in enumerate(nn_local):
+                if local_i and local_i % 2000 == 0:
+                    logger.info(f"  Stitch Pass 0c (local adjacency): {local_i}/{len(navmesh_idx)} "
+                                f"navmesh vertices processed, {added} stitch edges added so far.")
+                gi = navmesh_idx[local_i]
+                u = ids[gi]
+                if cross_count[u] >= MAX_CROSS_CONNECTORS_PER_NAVMESH_NODE:
+                    continue
+                for local_j in neighbors:
+                    if cross_count[u] >= MAX_CROSS_CONNECTORS_PER_NAVMESH_NODE:
+                        break
+                    gj = other_idx[int(local_j)]
+                    if np.linalg.norm(coords_m[gi] - coords_m[gj]) > snap_radius_m:
+                        continue
+                    if try_add_local(gi, gj):
+                        cross_count[u] += 1
+
+            # Direction B (symmetric): each non-navmesh node -> its k
+            # nearest navmesh vertices. Direction A alone caps how many
+            # external connectors each navmesh vertex GAINS, but a node's
+            # own k-nearest-neighbour list is still just one node's view --
+            # without also querying from the other side, an "other" node
+            # that sits equidistant between two perimeter vertices might
+            # only ever appear in one of their neighbour lists, silently
+            # leaving one side under-attached even though a valid connector
+            # exists. Querying from both directions and letting each side's
+            # own cap gate it is what actually spreads attachment points
+            # around the full perimeter rather than clustering them near
+            # whichever "other" nodes happen to be geometrically central.
+            k_navmesh_b = min(6, len(navmesh_idx))
+            _, nn_local_b = navmesh_tree.query(other_coords, k=k_navmesh_b)
+            if k_navmesh_b == 1:
+                nn_local_b = nn_local_b.reshape(-1, 1)
+            for local_i, neighbors in enumerate(nn_local_b):
+                if local_i and local_i % 5000 == 0:
+                    logger.info(f"  Stitch Pass 0c (local adjacency, direction B): {local_i}/{len(other_idx)} "
+                                f"non-navmesh nodes processed, {added} stitch edges added so far.")
+                gi = other_idx[local_i]
+                for local_j in neighbors:
+                    gj = navmesh_idx[int(local_j)]
+                    u = ids[gj]
+                    if cross_count[u] >= MAX_CROSS_CONNECTORS_PER_NAVMESH_NODE:
+                        continue
+                    if np.linalg.norm(coords_m[gi] - coords_m[gj]) > snap_radius_m:
+                        continue
+                    if try_add_local(gj, gi):
+                        cross_count[u] += 1
+
+        # Pass 0d (Round 15, NEXT_PHASES.md §5.2.2): LOCAL adjacency guarantee for
+        # in-polygon inland nodes, generalizing Pass 0c to a second cross-type
+        # pairing (inland vs everything else) rather than widening Pass 0c's own
+        # navmesh-vs-other split to a three-way one -- keeping the two passes
+        # separate lets each keep its own cap/radius tuned to its own real gap
+        # (Pass 0c: 100-200m against a big navmesh perimeter's own crowding;
+        # this one: §5.2.2's narrower ~300m inland/coastal physical-interface
+        # radius) without the cross terms interacting.
+        #
+        # _ensure_coastal_connectivity only ever adds an inland node to `ids`
+        # when its coordinate falls INSIDE this component's own coastal_water
+        # polygon -- per §5.2.2's physically-grounded rule, an inland-typed
+        # vertex sitting in what's charted as open coastal water is a
+        # source-layering artifact (the inland waterway line-work happens to run
+        # through/near a stretch also covered by the coastal polygon), not a
+        # real barrier, so linking it locally to nearby coastal nodes is safe.
+        # An inland node behind a lock or up a canal reach never satisfies that
+        # containment test in the caller, so it never reaches this pass -- this
+        # cannot manufacture a lock bypass. Confirmed real gap this closes: an
+        # inland waterway node sitting 33m from a coastal skeleton node, with no
+        # edge between them, forced a hard-constrained route into a ~100km
+        # detour around a bridge whose direct opening required an air-draft
+        # violation (Round 14 probe finding).
+        inland_idx = [i for i, n in enumerate(ids) if self.graph.nodes[n].get("node_type") == "inland"]
+        noninland_idx = [i for i in range(len(ids)) if i not in set(inland_idx)]
+        if inland_idx and noninland_idx:
+            from scipy.spatial import cKDTree
+            inland_coords = coords_m[inland_idx]
+            noninland_coords = coords_m[noninland_idx]
+            inland_tree = cKDTree(inland_coords)
+            noninland_tree = cKDTree(noninland_coords)
+
+            MAX_LOCAL_CONNECTORS_PER_INLAND_NODE = 2
+            INLAND_LOCAL_RADIUS_M = 300.0
+
+            def _existing_noninland_count(node_id) -> int:
+                return sum(
+                    1 for nbr in self.graph.neighbors(node_id)
+                    if self.graph.nodes[nbr].get("node_type") != "inland"
+                )
+
+            inland_cross_count = {ids[gi]: _existing_noninland_count(ids[gi]) for gi in inland_idx}
+
+            def try_add_inland_local(i: int, j: int) -> bool:
+                """Same safety gates/attrs as try_add_local -- see Pass 0c above."""
+                nonlocal added
+                u, v = ids[i], ids[j]
+                if self.graph.has_edge(u, v):
+                    return False
+                candidate_m = LineString([coords_m[i], coords_m[j]])
+                if not poly_prep.contains(candidate_m):
+                    return False
+                if self._crosses_land(LineString([coords_wgs84[i], coords_wgs84[j]])):
+                    return False
+                attrs = dict(edge_type="coastal", edge_kind_id=EDGE_KIND_NAVMESH_BOUNDARY,
+                             source_tier=DEFAULT_SOURCE_TIER, source_id=None)
+                self.graph.add_edge(u, v, **attrs)
+                self.graph.add_edge(v, u, **attrs)
+                union(u, v)
+                added += 2
+                return True
+
+            # Direction A: each inland node -> its k nearest non-inland neighbours,
+            # stopping as soon as that node's own cap is met.
+            k_cross = min(6, len(noninland_idx))
+            _, nn_local = noninland_tree.query(inland_coords, k=k_cross)
+            if k_cross == 1:
+                nn_local = nn_local.reshape(-1, 1)
+            for local_i, neighbors in enumerate(nn_local):
+                gi = inland_idx[local_i]
+                u = ids[gi]
+                if inland_cross_count[u] >= MAX_LOCAL_CONNECTORS_PER_INLAND_NODE:
+                    continue
+                for local_j in neighbors:
+                    if inland_cross_count[u] >= MAX_LOCAL_CONNECTORS_PER_INLAND_NODE:
+                        break
+                    gj = noninland_idx[int(local_j)]
+                    if np.linalg.norm(coords_m[gi] - coords_m[gj]) > INLAND_LOCAL_RADIUS_M:
+                        continue
+                    if try_add_inland_local(gi, gj):
+                        inland_cross_count[u] += 1
+
+            # Direction B (symmetric): each non-inland node -> its k nearest inland
+            # nodes -- same rationale as Pass 0c's Direction B: a node's own
+            # k-nearest-neighbour list is only one side's view, so an inland node
+            # equidistant between two coastal nodes might not appear in either
+            # coastal node's own top-k unless queried from that side too.
+            k_inland = min(6, len(inland_idx))
+            _, nn_local_b = inland_tree.query(noninland_coords, k=k_inland)
+            if k_inland == 1:
+                nn_local_b = nn_local_b.reshape(-1, 1)
+            for local_i, neighbors in enumerate(nn_local_b):
+                gi = noninland_idx[local_i]
+                for local_j in neighbors:
+                    gj = inland_idx[int(local_j)]
+                    u = ids[gj]
+                    if inland_cross_count[u] >= MAX_LOCAL_CONNECTORS_PER_INLAND_NODE:
+                        continue
+                    if np.linalg.norm(coords_m[gi] - coords_m[gj]) > INLAND_LOCAL_RADIUS_M:
+                        continue
+                    if try_add_inland_local(gj, gi):
+                        inland_cross_count[u] += 1
 
         # Pass 1: cheap radius-limited KD-tree pass, handles the common case of a
         # small local gap between two adjacent pieces. SKIPPED for large node counts:
@@ -2188,6 +2694,27 @@ class NauticalRoutingPipeline:
         if len(coastal_nodes) < 2:
             return
 
+        # Round 15 (NEXT_PHASES.md §5.2.2): inland nodes whose coordinate falls
+        # INSIDE a coastal_water component's own polygon get a shot at this
+        # component's stitch pass too -- an inland-typed vertex sitting in what's
+        # charted as open coastal water is a source-layering artifact (the
+        # inland_waterways line-work happens to run through/near a stretch also
+        # covered by coastal_water), not a real barrier. Scoped to actual polygon
+        # CONTAINMENT, not merely stitch-radius proximity, so an inland canal
+        # reach behind a lock (never inside a coastal_water polygon) can never
+        # reach this pass -- can't manufacture a lock bypass. The connectivity
+        # itself is still gated by _stitch_component_pieces' own
+        # within(poly_m)/_crosses_land checks (its Pass 0d, mirroring Pass 0c) --
+        # this only changes the candidate list.
+        inland_nodes = [n for n, d in self.graph.nodes(data=True) if d.get("node_type") == "inland"]
+        if inland_nodes:
+            inland_points = gpd.GeoSeries(
+                [Point(self.graph.nodes[n]["lon"], self.graph.nodes[n]["lat"]) for n in inland_nodes],
+                index=inland_nodes, crs=self.CRS_WGS84)
+            inland_sindex = inland_points.sindex
+        else:
+            inland_points, inland_sindex = None, None
+
         # Scope the stitch pass to each ORIGINAL connected water body separately,
         # rather than unioning/buffering the whole dataset's coastal water in one
         # call: _stitch_component_pieces' own docstring says it only ever reconnects
@@ -2202,17 +2729,35 @@ class NauticalRoutingPipeline:
         sindex = node_points.sindex
 
         total_added = 0
+        total_inland_candidates = 0
         for i, component in enumerate(components):
             if (i + 1) % 20 == 0 or i == 0:
                 logger.info(f"  Coastal connectivity: component {i + 1}/{len(components)}...")
             probe = component.buffer(0.001)  # ~100m in degrees; generous spatial pre-filter only
-            candidates = node_points.index[sindex.query(probe, predicate="intersects")]
-            if len(candidates) < 2:
+            candidates = list(node_points.index[sindex.query(probe, predicate="intersects")])
+
+            inland_candidates = []
+            if inland_sindex is not None:
+                # Cheap bbox prefilter first (sindex, symmetric predicate), then an
+                # exact vectorized containment test on the (small) surviving set --
+                # same two-stage pattern build_navmesh_placeholder's _in_poly_coords
+                # already uses for point-in-polygon filtering elsewhere in this file.
+                bbox_idx = inland_points.index[inland_sindex.query(component, predicate="intersects")]
+                if len(bbox_idx):
+                    xs = np.array([self.graph.nodes[n]["lon"] for n in bbox_idx])
+                    ys = np.array([self.graph.nodes[n]["lat"] for n in bbox_idx])
+                    inside = shapely.contains_xy(component, xs, ys)
+                    inland_candidates = [n for n, keep in zip(bbox_idx, inside) if keep]
+                    total_inland_candidates += len(inland_candidates)
+
+            all_candidates = candidates + inland_candidates
+            if len(all_candidates) < 2:
                 continue
-            total_added += self._stitch_component_pieces(list(candidates), component, snap_radius_m=500.0)
+            total_added += self._stitch_component_pieces(all_candidates, component, snap_radius_m=500.0)
 
         logger.info(f"Final coastal connectivity pass: added {total_added} stitching edges "
-                    f"across {len(components)} components.")
+                    f"across {len(components)} components ({total_inland_candidates} in-polygon "
+                    f"inland-node candidates included).")
 
     def _compute_node_depths(self):
         depare_gdf = self.gdfs.get("depth_areas", gpd.GeoDataFrame())
