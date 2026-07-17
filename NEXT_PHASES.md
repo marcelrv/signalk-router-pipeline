@@ -3008,3 +3008,16 @@ side is `routeiq`'s `feature-bridge-lock-waits.md`, not this repo).
   unmodified runtime" compatibility bar for Phase 1; Phase 2's actual
   target for the funnel-algorithm implementation
 - `routeiq/test/zeelandbrug_test.ts` — manual validation target, unchanged
+
+### Phase 2 Hardening, Round 18 — multi-scale DEPARE sampling + obstruction downgrading (committed 9e0d45e; see routeiq's ROUTEIQ_NEXT_PHASES.md Rounds 18+19 for the full cross-repo picture)
+
+Puerto Rico pilot (NOAA ENC us-caribbean, 154 cells) built and deployed
+alongside Zeeland. Two data-scaling defects found and fixed — the
+first-containing-polygon DEPARE sampler under NOAA's overlapping cell
+pyramid (65.7% of PR edges min_depth=0 -> 17.3%), and obstruction-point
+hard blocks severing the north coast (crosses_obstacle 3,990 -> 12, San
+Juan-Fajardo NO ROUTE -> routable). Zeeland re-verified: no structural
+regression; its residual shallow flags are genuine charted depth (the
+"min_depth=0 poisoning" backlog item is hereby CLOSED for the sampling
+component; what remains is real data, correctly warned, and correctly
+priced since routeiq's Round 19 penalty rescale).
