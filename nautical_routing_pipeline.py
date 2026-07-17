@@ -93,6 +93,7 @@ def _edge_attr_worker(edge_chunk):
     fairways_gdf = gdfs.get('fairways', gpd.GeoDataFrame())
     locks_gdf = gdfs.get('locks', gpd.GeoDataFrame())
     obstacles_gdf = gdfs.get('obstacles', gpd.GeoDataFrame())
+    obstacles_soft_gdf = gdfs.get('obstacles_soft', gpd.GeoDataFrame())
 
     results = {}
     for u, v, u_lon, u_lat, v_lon, v_lat, edge_type, is_opening_bridge_edge, requires_lock in edge_chunk:
@@ -114,17 +115,32 @@ def _edge_attr_worker(edge_chunk):
                         attrs['min_depth'] = min_val
                         attrs['drval1'] = min_val
                     else:
+                        # NOAA ships a multi-scale cell pyramid (harbor/approach/coastal/
+                        # overview covering the SAME water); the preprocessor merges every
+                        # cell's DEPARE into one layer, so a sample point routinely falls
+                        # inside several containing candidate polygons at once -- one per
+                        # scale. Taking the FIRST containing polygon in iteration order was
+                        # effectively random cell selection (whichever scale's polygon
+                        # happened to sort first), which is how 65.7% of PR edges ended up
+                        # min_depth=0: a coarse overview cell's shallow/unsurveyed 0-X band
+                        # frequently "won" over a finer harbor cell's real 18.2m band for the
+                        # same point. Fix: among ALL containing candidates, take the MAXIMUM
+                        # DRVAL1 -- the finest cell subdivides a coarse band into deeper
+                        # sub-bands, so the deepest containing claim is the most detailed one.
+                        # Genuine drying stays negative only where every containing band is
+                        # drying (there's no deeper containing claim to override it with).
                         sampled = []
                         for i in range(5):
                             f = i / 4.0
                             pt = Point(u_lon + f*(v_lon-u_lon), u_lat + f*(v_lat-u_lat))
-                            found = None
+                            best = None
                             for _, row in candidates.iterrows():
                                 geom = row.geometry
                                 if geom is not None and geom.contains(pt):
-                                    found = row['DRVAL1']
-                                    break
-                            sampled.append(float(found) if pd.notna(found) else 99.0)
+                                    val = row['DRVAL1']
+                                    if pd.notna(val) and (best is None or float(val) > best):
+                                        best = float(val)
+                            sampled.append(best if best is not None else 99.0)
                         min_val = min(sampled)
                         attrs['min_depth'] = max(0.0, float(min_val))
                         attrs['drval1'] = min_val if min_val < 99.0 else None
@@ -221,6 +237,21 @@ def _edge_attr_worker(edge_chunk):
                 intersecting = obs_candidates[obs_candidates.intersects(edge_geom)]
                 if not intersecting.empty:
                     attrs['crosses_obstacle'] = 1
+
+        # Soft obstruction-point depth constraint (Round 18 Fix 2) — the
+        # VALSOU/WATLEV-downgraded subset of obstructions_points that
+        # _build_obstacle_layer routed to "obstacles_soft" instead of the hard
+        # "obstacles" layer above. These aren't dropped from routing consideration
+        # entirely: fold the charted sounding (or the conservative WATLEV==3/4
+        # default of 0.0m — see _obstruction_depth_disposition) into min_depth,
+        # same exemption for opening-bridge/lock-crossing edges as the hard check.
+        if not is_opening_bridge_edge and not requires_lock and not obstacles_soft_gdf.empty:
+            soft_candidates = _candidates_by_bounds_static(obstacles_soft_gdf, edge_geom)
+            if not soft_candidates.empty:
+                soft_intersecting = soft_candidates[soft_candidates.intersects(edge_geom)]
+                if not soft_intersecting.empty:
+                    soft_min = float(soft_intersecting['_depth_constraint'].min())
+                    attrs['min_depth'] = min(attrs['min_depth'], soft_min)
 
         results[(u, v)] = attrs
     return results
@@ -398,6 +429,74 @@ def _is_entry_prohibited(row):
                 return True
     return False
 
+def _obstruction_depth_disposition(row):
+    """S-57-grounded classification of a single feature from the raw
+    `obstructions_points` layer (OBJL 86) into hard-block vs depth-constraint.
+
+    NOAA-scale charts carry thousands of these (2,835 for the Puerto Rico
+    build vs 3 genuine obstructions in the Zeeland pilot) -- hard-blocking
+    every one of them (the pre-Round-18 behavior) shreds coastal
+    connectivity (1,161 obstacle-blocked edges, San Juan<->Fajardo
+    unroutable) for features that a shallow-draft vessel can often safely
+    cross.
+
+    - `VALSOU` (charted least depth over the obstruction) present, any
+      `WATLEV`: not a hard block -- fold the sounding into the edge's
+      `min_depth` (`min(min_depth, VALSOU)`) so a deep-draft ship is
+      stopped but a shallow-draft one is not. This is the normal case for
+      a swept/surveyed wreck or obstruction and takes priority over WATLEV
+      below (a feature with a real sounding is by definition not "always
+      dry" -- soundings aren't taken on land).
+    - No `VALSOU` and `WATLEV == 3` (always under water): still a real
+      hazard -- this is the dominant case in the PR data (1,928 of 2,835
+      features, unswept rocks/wrecks with no sounding) -- but hard-
+      blocking every single one is exactly the connectivity-shredding
+      defect this function exists to fix. Route around it via a
+      conservative default depth constraint instead (0.0m) rather than a
+      hard block: deep-draft routing avoids the edge (min_depth=0 fails
+      any real draft check) while the edge stays usable for the warning
+      system instead of vanishing from the graph outright.
+    - No `VALSOU` and `WATLEV` in {1 (partly submerged), 2 (always dry),
+      5 (awash)}, or `WATLEV` missing/unrecognized (e.g. 7="floating" —
+      not covered by the brief's dry/awash/underwater/covers-uncovers
+      set, so treated with the same conservative fallback as unknown):
+      keep the existing hard block -- there is no depth number to route
+      around, and the feature is a genuine surface/near-surface hazard
+      that isn't well modeled as "min_depth=0 but otherwise passable".
+    - No `VALSOU` and `WATLEV == 4` (covers/uncovers): same conservative
+      depth-constraint treatment as WATLEV==3, not a hard block. This is
+      not explicitly called out in the WATLEV list above, but it matches
+      this codebase's own established precedent for exactly this
+      situation -- charted DEPARE drying/intertidal bands (DRVAL1 < 0.0)
+      are handled elsewhere as a depth constraint (clamped to 0.0 in
+      min_depth), never a hard block (see the Round 9 "DEPARE-drying gap"
+      fix referenced in NEXT_PHASES.md) -- and "covers and uncovers" is
+      the same tidal-varying category as a drying flat, not a permanent
+      surface obstruction like "always dry"/"awash". 887 of PR's 2,835
+      obstruction points (31%) carry WATLEV==4, so this reading matters
+      materially; verified against the route probes, not just asserted.
+
+    Returns (is_hard_block: bool, depth_constraint_m: float | None).
+    """
+    valsou = _s57_get_val(row, 'VALSOU')
+    if _is_valid(valsou):
+        try:
+            return False, float(valsou)
+        except (TypeError, ValueError):
+            pass  # not a real number -- fall through to WATLEV handling
+
+    watlev = _s57_get_val(row, 'WATLEV')
+    try:
+        watlev_i = int(float(watlev)) if _is_valid(watlev) else None
+    except (TypeError, ValueError):
+        watlev_i = None
+
+    if watlev_i in (3, 4):
+        return False, 0.0
+    # 1 (partly submerged), 2 (always dry), 5 (awash), or missing/unrecognized
+    # (including 7="floating"): conservative default, unchanged hard block.
+    return True, None
+
 class NauticalRoutingPipeline:
     def __init__(self, data_paths: Dict[str, str], db_path: str,
                  country: str = "", region_name: str = "", description: str = "",
@@ -509,13 +608,44 @@ class NauticalRoutingPipeline:
         # (obstructions_points.geojson). Read it from there — the old code read a
         # non-existent "obstructions" key, so obstructions never entered the layer.
         # This method then overwrites self.gdfs["obstacles"] with the merged result.
+        #
+        # Round 18: a NOAA-scale build carries thousands of these points (2,835 for
+        # Puerto Rico vs Zeeland's 3 genuine obstructions), each of which previously
+        # hard-blocked (crosses_obstacle=1) every edge it touched — 1,161
+        # obstacle-blocked edges, enough to make San Juan<->Fajardo unroutable.
+        # Split into a hard-block subset (kept in this "obstacles" hard layer,
+        # unchanged behavior) and a soft depth-constraint subset (a separate
+        # "obstacles_soft" layer consumed in _edge_attr_worker to fold into
+        # min_depth instead of hard-blocking) via _obstruction_depth_disposition's
+        # S-57-grounded VALSOU/WATLEV rules — see that function's docstring.
+        soft_obstacle_gdf = gpd.GeoDataFrame(geometry=[], crs=self.CRS_WGS84)
         obstrn = self.gdfs.get("obstacles", gpd.GeoDataFrame())
         if not obstrn.empty:
-            buf_metric = obstrn.to_crs(self.CRS_METRIC)
-            buf_metric["geometry"] = buf_metric.geometry.buffer(OBSTACLE_BUFFER_METERS)
-            buf_wgs84 = buf_metric.to_crs(self.CRS_WGS84)
-            buf_wgs84["_layer"] = "obstructions"
-            obstacle_parts.append(buf_wgs84)
+            disposition = obstrn.apply(_obstruction_depth_disposition, axis=1)
+            is_hard = disposition.apply(lambda t: t[0])
+            depth_constraint = disposition.apply(lambda t: t[1])
+
+            hard_obstrn = obstrn[is_hard].copy()
+            if not hard_obstrn.empty:
+                buf_metric = hard_obstrn.to_crs(self.CRS_METRIC)
+                buf_metric["geometry"] = buf_metric.geometry.buffer(OBSTACLE_BUFFER_METERS)
+                buf_wgs84 = buf_metric.to_crs(self.CRS_WGS84)
+                buf_wgs84["_layer"] = "obstructions"
+                obstacle_parts.append(buf_wgs84)
+
+            soft_obstrn = obstrn[~is_hard].copy()
+            if not soft_obstrn.empty:
+                soft_obstrn["_depth_constraint"] = depth_constraint[~is_hard]
+                buf_metric = soft_obstrn.to_crs(self.CRS_METRIC)
+                buf_metric["geometry"] = buf_metric.geometry.buffer(OBSTACLE_BUFFER_METERS)
+                soft_obstacle_gdf = buf_metric.to_crs(self.CRS_WGS84)
+                soft_obstacle_gdf["_layer"] = "obstructions_soft"
+            logger.info(
+                f"  Obstruction points: {len(obstrn)} total, "
+                f"{len(hard_obstrn)} hard-block, {len(soft_obstrn)} depth-constrained"
+            )
+        self.gdfs["obstacles_soft"] = soft_obstacle_gdf
+        self.gdfs_metric["obstacles_soft"] = soft_obstacle_gdf.to_crs(self.CRS_METRIC) if not soft_obstacle_gdf.empty else gpd.GeoDataFrame(geometry=[], crs=self.CRS_METRIC)
 
         if not obstacle_parts:
             self.gdfs["obstacles"] = gpd.GeoDataFrame(geometry=[], crs=self.CRS_WGS84)
@@ -2827,6 +2957,7 @@ class NauticalRoutingPipeline:
             "fairways": highways_gdf,
             "locks": self.gdfs.get("locks", gpd.GeoDataFrame()),
             "obstacles": self.gdfs.get("obstacles", gpd.GeoDataFrame()),
+            "obstacles_soft": self.gdfs.get("obstacles_soft", gpd.GeoDataFrame()),
         }
         for gdf in worker_gdfs.values():
             if not gdf.empty:
