@@ -11,7 +11,7 @@ trim boundary-crossing polygons.
 
 Example:
     python clip_pilot_data.py \
-        --input-dir /home/node/signalkdev/routeiq/output_geojson \
+        --input-dir /home/node/signalkdev/signalk-routeiq/output_geojson \
         --bbox "3.2,51.2,4.3,51.7" \
         --output-dir ./data/zeeland_clip
 """
@@ -58,7 +58,7 @@ def clip_layer(path: str, bbox_tuple, clip_box, out_path: str):
 
 def main():
     ap = argparse.ArgumentParser(description="Clip pipeline GeoJSON layers to a pilot bbox.")
-    ap.add_argument("--input-dir", default="/home/node/signalkdev/routeiq/output_geojson",
+    ap.add_argument("--input-dir", default="/home/node/signalkdev/signalk-routeiq/output_geojson",
                     help="Directory of the full-coverage GeoJSON layers.")
     ap.add_argument("--bbox", default="3.2,51.2,4.3,51.7",
                     help='"min_lon,min_lat,max_lon,max_lat" (default: Zeeland pilot).')
