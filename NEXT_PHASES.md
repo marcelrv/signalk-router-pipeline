@@ -3021,3 +3021,20 @@ regression; its residual shallow flags are genuine charted depth (the
 "min_depth=0 poisoning" backlog item is hereby CLOSED for the sampling
 component; what remains is real data, correctly warned, and correctly
 priced since routeiq's Round 19 penalty rescale).
+
+### Phase 2 Hardening, Round 21 — Issue G fixed (committed 1e327ae); Zeelandbrug air-edges confirmed correct data; BACKLOG CLEARED
+
+Issue G: the depth-split closing's hole-filling now re-punches genuine
+enclosed separators — candidates scoped to the pre-closing mask's own
+interior rings (cannot change piece count, so Round 8's fragmentation
+fix cannot regress), re-punched on charted-drying coverage >=50% OR
+3m-erosion survival. Yerseke: 0 -> 14/15 holes survive (99.9% by area).
+NOTE a measurement correction: Round 9's "30 holes/1 survives" figures
+came from a bbox-clipped query that doesn't match production's
+per-piece scope; the faithful numbers were 15 holes/0 survivors.
+The Zeelandbrug air-flagged ring edges (Round 13 note) were verified as
+genuine VERCLR=11.0 fixed-span intersections — correct data, no change.
+With Rounds 13-21 all committed and deployed (multi-region Zeeland
+round21 + Puerto Rico r18), the Phase 2 Hardening correctness backlog
+is cleared; further work proceeds per PHASE_3_DESIGN.md /
+PHASE_4_DESIGN.md.
