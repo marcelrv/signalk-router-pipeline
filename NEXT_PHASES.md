@@ -3038,3 +3038,54 @@ With Rounds 13-21 all committed and deployed (multi-region Zeeland
 round21 + Puerto Rico r18), the Phase 2 Hardening correctness backlog
 is cleared; further work proceeds per PHASE_3_DESIGN.md /
 PHASE_4_DESIGN.md.
+
+### Phase 2 Hardening, Round 22 — Puerto Rico issue collection (documented, NOT fixed; next round's brief)
+
+User-reported after the PR deploy, investigated and measured this
+session; per the collection-first discipline, nothing below is fixed.
+
+**PR-A — the whole ocean is ONE navmesh region, and it is the root of
+everything else here.** `navmesh_regions` rowid=3 spans the entire
+dataset extent (lat 17.17-19.01, lon -68.10..-64.37) with 8,313
+vertices / **8,118 boundary_node_ids** — 1.6x the worst region ever
+seen (Zeeland's pre-Round-9 4,999-node outlier that cost 198s). NOAA
+coverage makes the open ocean around the island one huge connected
+deep polygon; nothing in classification caps a navmesh region's
+extent. Measured consequences:
+- `loadGraph()` for PR alone: **76.6s** (Zeeland: 1.7s) — the
+  precompute's ring upgrades + anchor/boundary shortcuts run corridor
+  searches across a triangle mesh spanning ~400km. This is the user's
+  observed slow Signal K startup (every plugin restart pays it), and
+  the likely mechanism behind the reported route "timeout": the exact
+  reported route (18.4458,-67.2748 -> 3 vias -> 18.0328,-65.3357)
+  completes in **0.1s / 242.9km / zero warnings** once the graph is
+  loaded — the engine is fine; requests arriving during the ~78s
+  post-restart load window are what times out.
+- **Fix direction (design decision needed)**: cap navmesh region
+  extent — e.g. clip navmesh eligibility to a coastal band (N km from
+  land) and/or tile oversized deep polygons before build_navmesh_region;
+  open ocean beyond the band arguably needs no mesh at all (nothing to
+  route around). Alternatively/additionally split by the same
+  width-re-filter machinery Round 8 added. Re-measure loadGraph after.
+**PR-B — "large land-overlapping navmeshes" (screenshot, Ceiba/
+Roosevelt Roads airport): display artifact, not data.** Verified: NO
+DB edge chord >2km crosses the airport bbox, and NO coastal_water
+polygon covers the airport point — the parallel orange dashed lines
+are (by elimination) region 3's in-memory anchor/boundary shortcut
+edges rendered as straight chords because `/graph/edges` still omits
+`path_points` (the long-documented §5.3 gap), at 8,118-boundary-node
+scale. Fixing PR-A shrinks this dramatically; carrying `path_points`
+through `getEdgesInBBox`/the debug overlay (§5.3's own fix) finishes it.
+**PR-C — map-edge / cross-map mesh connection (user question, design
+item for Phase 3e).** Today: region boundaries at the data edge simply
+follow the ENC coverage limit — nodes/edges stop there; nothing marks
+them as artificial. Multiple loaded databases are merged into one
+in-memory graph, but NO mechanism stitches nodes across database
+borders (only an exact 5-decimal coordinate collision would connect,
+which adjacent independent builds won't produce). Adjacent-region
+tiling (e.g. NL + DE/BE, or PR + USVI) therefore cannot route across
+the seam yet. Design direction for `PHASE_3_DESIGN.md` §3e: stamp
+data-edge boundary nodes as such during build (they're identifiable —
+they lie on the coverage envelope), and add a load-time cross-database
+stitching pass in routeiq (same local-adjacency principles as Pass
+0c/0d, scoped to edge-stamped nodes within a small radius across DBs).
