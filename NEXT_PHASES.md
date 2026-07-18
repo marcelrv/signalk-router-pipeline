@@ -3089,3 +3089,32 @@ data-edge boundary nodes as such during build (they're identifiable —
 they lie on the coverage envelope), and add a load-time cross-database
 stitching pass in routeiq (same local-adjacency principles as Pass
 0c/0d, scoped to edge-stamped nodes within a small radius across DBs).
+
+### Phase 2 Hardening, Round 23 — ocean-region tiling + real edge geometry in the debug view (both verified, committed, deployed)
+
+**23a (this repo, 7aa98d9)**: `_tile_navmesh_piece` splits oversized
+navmesh pieces on a shared-cut-line grid (bit-identical seam coords ->
+shared graph nodes; seams join both tiles' `boundary_node_ids`). Tuned
+by a real 30/15/10km sweep — routeiq's fixed 40-anchor cap makes
+per-region cost scale with extent, so 10km shipped: PR 1 giant region
+(8,118 boundary nodes) -> 763 regions (max 219), loadGraph 76.6s ->
+8.8s (independently re-measured), server startup-to-ready now 32s for
+BOTH regions. Zeeland: two pieces now tile (15->26 regions), all
+probes pass. Documented trade-off: open-ocean routes pay a monotonic
+seam-crossing optimality cost (+10.6% on the 243km west-PR reference
+at 10km vs +1.3% at 30km); recoverable via routeiq anchor/hierarchy
+work (Phase 3f) — the tile constant is a single knob if the trade-off
+should be revisited. DB size 33->52MB: fully accounted as
+navmesh_regions JSON (2.3x vertices/2.6x triangles from much more
+total boundary length), not a leak.
+
+**23b (routeiq, merge 48b2da5)**: `getEdgesInBBox`/`/graph/edges` now
+carry `path_points`; the debug overlay draws real edge geometry.
+Verified on the Ceiba viewport: 184 edges whose chords cross the
+airport all have real polylines avoiding it — Round 22's PR-B
+"land-overlapping navmesh" closes as fixed-at-the-root (it was always
+in-memory funnel edges with stripped geometry). Dense viewports pay
+~+89% payload (field present only when non-empty).
+
+Round 22 status: PR-A and PR-B closed by this round; PR-C (cross-map
+stitching) remains the open Phase 3e design item.
