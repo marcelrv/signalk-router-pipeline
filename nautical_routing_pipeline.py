@@ -17,7 +17,7 @@ import geopandas as gpd
 import networkx as nx
 import shapely
 from shapely.geometry import Point, LineString, Polygon, MultiPoint, MultiLineString, MultiPolygon, mapping, box
-from shapely.ops import triangulate, unary_union
+from shapely.ops import triangulate, unary_union, polygonize
 from pyproj import Geod
 
 # Phase 0 navmesh-hybrid skeleton extraction (Step C). Hard deps per requirements.txt.
@@ -340,6 +340,47 @@ NAVMESH_BOUNDARY_SIMPLIFY_M = 5.0   # build_navmesh_region: a separate, coarser 
                                      # moves a retained
                                      # one, so exact-coordinate seam matching in build_navmesh_region
                                      # still works correctly on whatever seam vertices survive.
+NAVMESH_TILE_MAX_EXTENT_M = 10_000  # build_network: a navmesh-eligible deep piece whose bbox
+                                     # extent (or post-NAVMESH_BOUNDARY_SIMPLIFY_M boundary vertex
+                                     # count) exceeds this gets tiled into a grid of pieces at most
+                                     # this wide/tall (in the piece's own local UTM CRS) before
+                                     # build_navmesh_region ever sees it. Round 22 measured Puerto
+                                     # Rico's open-ocean coastal_water component as ONE navmesh_regions
+                                     # row spanning the whole dataset (lat 17.17-19.01, lon
+                                     # -68.10..-64.37, ~400km wide) with 8,313 vertices / 8,118
+                                     # boundary_node_ids -- 1.6x Zeeland's worst pre-Round-9 outlier
+                                     # (4,999 nodes, 198s) -- and traced routeiq's loadGraph() cost
+                                     # for PR alone to 76.6s (Zeeland: 1.7s), because the funnel/anchor
+                                     # precompute runs corridor searches across the whole triangle mesh.
+                                     # Round 23a swept 30km/15km/10km on a real PR rebuild + instrumented
+                                     # routeiq loadGraph(): 30km -> 117 regions/18.1s, 15km -> 375
+                                     # regions/10.3s, 10km -> 763 regions/8.8s. The dominant cost isn't
+                                     # region COUNT but routeiq's addAnchorShortcutEdges: any region with
+                                     # >DEFAULT_MAX_ANCHORS(40) boundary_node_ids pays a FIXED O(40^2)
+                                     # pairwise-funnel cost regardless of how much over 40 it is, and each
+                                     # such search's cost scales with that region's own physical extent --
+                                     # so smaller tiles both raised the count of >40-boundary regions AND
+                                     # shrank each one's search cost, netting a win each step down (this is
+                                     # NOT a general rule -- don't assume smaller is always faster without
+                                     # re-measuring). 10km was the smallest step tried and the only one
+                                     # clearing the <10s target with margin; going smaller was not tried
+                                     # (diminishing returns were already visible: 30->15km halved load
+                                     # time, 15->10km only trimmed another ~15%, while probe_pr_timeout's
+                                     # measured route distance crept up with tile count -- 30km +1.3%,
+                                     # 15km +7.3%, 10km +10.6% over the 242.9km baseline, all fast/no
+                                     # NO-ROUTE -- extra tile seams cost a little routing optimality, so
+                                     # this constant trades that off against load time and shouldn't be
+                                     # lowered further without re-checking both numbers). 10km keeps a
+                                     # tile's own boundary_node_ids in the low hundreds even for open
+                                     # ocean, comfortably under the ~1,500 NAVMESH_TILE_MAX_VERTICES gate
+                                     # below, at the cost of ~750 small, cheap tiles for a piece PR's size
+                                     # -- each triangulated and stitched exactly like any other navmesh
+                                     # region.
+NAVMESH_TILE_MAX_VERTICES = 1_500   # build_network: second (OR'd) tiling gate -- a piece can be
+                                     # narrower than NAVMESH_TILE_MAX_EXTENT_M in bbox terms yet still
+                                     # carry a very dense boundary (many islands/reefs), so also tile
+                                     # whenever the post-NAVMESH_BOUNDARY_SIMPLIFY_M boundary vertex
+                                     # count alone would exceed this, independent of raw extent.
 
 # --- Round 14: inland-waterway x navmesh-region boundary crossings ---
 # Fix for the confirmed bug: _ensure_coastal_connectivity's candidate node set is
@@ -757,9 +798,24 @@ class NauticalRoutingPipeline:
                     # boundary_node_ids on both, not just the width seam.
                     depth_seam_coords = self._seam_coord_set(depth_seam_m)
                     combined_seam_coords = seam_coords | depth_seam_coords
+                    tile_reclassified = []
                     for deep_piece_m in self._explode_polygonal(deep_m):
-                        counts["navmesh"] += 1
-                        navmesh_pieces.append((deep_piece_m, utm, combined_seam_coords))
+                        tiles, reclassified = self._tile_navmesh_piece(
+                            deep_piece_m, NAVMESH_TILE_MAX_EXTENT_M, cfg.min_navmesh_radius_m)
+                        for tile_poly_m, tile_seam_coords in tiles:
+                            counts["navmesh"] += 1
+                            navmesh_pieces.append((tile_poly_m, utm, combined_seam_coords | tile_seam_coords))
+                        tile_reclassified.extend(reclassified)
+                    if tile_reclassified:
+                        # A tile-grid cut produced a fragment too thin to be genuinely
+                        # navmesh-eligible any more (Round 8's width-re-filter pattern,
+                        # see _tile_navmesh_piece) -- fold it back into the shallow/
+                        # skeleton path exactly like _split_deep_shallow's own re-filter.
+                        reclass_union_m = self._clean_polygonal(unary_union(tile_reclassified))
+                        reclass_wgs84 = gpd.GeoSeries([reclass_union_m], crs=utm).to_crs(self.CRS_WGS84).iloc[0]
+                        reclass_kind = self.classify_water_body(reclass_wgs84, False, depth_gdf, fairway_gdf, cfg)
+                        counts[reclass_kind] += len(self._explode_polygonal(reclass_union_m))
+                        skeleton_pieces.append(reclass_wgs84)
                     if not shallow_m.is_empty:
                         shallow_wgs84 = gpd.GeoSeries([shallow_m], crs=utm).to_crs(self.CRS_WGS84).iloc[0]
                         shallow_kind = self.classify_water_body(shallow_wgs84, False, depth_gdf, fairway_gdf, cfg)
@@ -1066,6 +1122,114 @@ class NauticalRoutingPipeline:
             except Exception:
                 depth_seam = Polygon()
         return deep, shallow, depth_seam
+
+    def _tile_navmesh_piece(self, poly_m, max_extent_m: float, min_navmesh_radius_m: float):
+        """Round 23a: cap a navmesh-eligible piece's extent by splitting it into a
+        regular grid of tiles no larger than `max_extent_m` per side, when the piece
+        exceeds `NAVMESH_TILE_MAX_EXTENT_M` (bbox extent) and/or
+        `NAVMESH_TILE_MAX_VERTICES` (post-`NAVMESH_BOUNDARY_SIMPLIFY_M` boundary
+        vertex count) -- see those constants' comments for the measured PR
+        motivation (one 400km-wide, 8,118-boundary-node region -> 76.6s loadGraph()).
+
+        Every surviving tile is meant to flow through the normal
+        `build_navmesh_region` path exactly like an untiled piece; the only extra
+        contract is that adjacent tiles MUST end up with bit-identical coordinates
+        along their shared cut line, or `_get_or_create_node`'s 5-decimal coordinate
+        dedupe won't merge them into the same graph node and the tile seam won't
+        connect. That's why the grid cut is done as ONE `unary_union` of the piece's
+        own boundary rings together with every grid line, followed by ONE
+        `polygonize()` call, rather than N independent `poly_m.intersection(box_i)`
+        calls per cell: a single noding pass computes each cut-line/coastline (or
+        cut-line/cut-line) intersection point exactly once and both adjoining faces
+        reuse that same computed vertex, whereas two separate GEOS calls computing
+        "the same" intersection independently are not guaranteed to land on
+        identical floating-point coordinates.
+
+        Returns (tiles, reclassified):
+        - tiles: [(tile_poly_m, tile_seam_coords), ...] -- tile_seam_coords is the
+          subset of that tile's own boundary coordinates lying on an internal grid
+          cut line (rounded to the same 3-decimal-metre precision
+          `build_navmesh_region` matches `seam_coord_set` against), for the caller
+          to union into the piece's existing width/depth seam set so tile-seam
+          vertices get tagged `boundary_node_ids` on BOTH adjacent tiles, same as
+          any other seam.
+        - reclassified: [poly_m, ...] tile fragments that failed the
+          `min_navmesh_radius_m` disk test (Round 8's width-re-filter pattern) --
+          for the caller to fold back into the skeleton/shallow path. Deliberately
+          a whole-tile pass/fail test (`buffer(-radius).is_empty`) rather than
+          Round 8's full wide/narrow buffer(-r).buffer(+r) RECONSTRUCTION: that
+          reconstruction is a morphological open, which subtly perturbs straight
+          edges/corners with buffer-approximation noise -- fine for Round 8's
+          purpose (isolating a genuinely narrow appendage), but here it would
+          silently break the exact-coordinate seam match this tiling depends on
+          for cross-tile connectivity. A single grid cell is small enough to treat
+          as one unit: for open-ocean tiling it will essentially always wholly
+          pass; the rare wholly-thin case (an edge tile that's mostly a ragged
+          sliver of original coastline) is exactly what this test is for.
+        """
+        minx, miny, maxx, maxy = poly_m.bounds
+        width, height = maxx - minx, maxy - miny
+
+        simplified = self._clean_polygonal(poly_m.buffer(0).simplify(NAVMESH_BOUNDARY_SIMPLIFY_M))
+        nverts = sum(len(p.exterior.coords) - 1 + sum(len(ring.coords) - 1 for ring in p.interiors)
+                     for p in self._explode_polygonal(simplified))
+        needs_tiling = (width > max_extent_m or height > max_extent_m
+                        or nverts > NAVMESH_TILE_MAX_VERTICES)
+        if not needs_tiling:
+            return [(poly_m, set())], []
+
+        nx = max(1, math.ceil(width / max_extent_m))
+        ny = max(1, math.ceil(height / max_extent_m))
+        if nx <= 1 and ny <= 1:
+            # Vertex-count-only trigger with a bbox already under max_extent_m: a grid
+            # split would just hand back the same single piece (nx=ny=1) -- nothing
+            # to gain here. build_navmesh_region's own NAVMESH_PSLG_BUDGET retry/
+            # simplify loop is the fallback for an over-dense boundary this small.
+            return [(poly_m, set())], []
+
+        xs = [minx + i * width / nx for i in range(nx + 1)]
+        ys = [miny + j * height / ny for j in range(ny + 1)]
+        pad = max(width, height) * 0.01 + 10.0  # past the bbox so a grid line fully crosses it
+        grid_lines = [LineString([(x, miny - pad), (x, maxy + pad)]) for x in xs[1:-1]]
+        grid_lines += [LineString([(minx - pad, y), (maxx + pad, y)]) for y in ys[1:-1]]
+
+        boundary_lines = [poly_m.exterior] + list(poly_m.interiors)
+        try:
+            noded = unary_union(boundary_lines + grid_lines)
+            raw_faces = list(polygonize(noded))
+        except Exception as exc:
+            logger.warning(f"  Navmesh tiling failed to node/polygonize a piece ({exc}); "
+                            f"leaving it untiled.")
+            return [(poly_m, set())], []
+
+        raw_tiles = [f for f in raw_faces
+                     if not f.is_empty and f.representative_point().within(poly_m)]
+        if not raw_tiles:
+            logger.warning("  Navmesh tiling produced no tiles inside the original piece; "
+                            "leaving it untiled.")
+            return [(poly_m, set())], []
+
+        grid_x_set = {round(x, 3) for x in xs[1:-1]}
+        grid_y_set = {round(y, 3) for y in ys[1:-1]}
+
+        tiles, reclassified = [], []
+        for face in raw_tiles:
+            for sub_tile in self._explode_polygonal(self._clean_polygonal(face.buffer(0))):
+                if sub_tile.is_empty:
+                    continue
+                if sub_tile.buffer(-min_navmesh_radius_m, quad_segs=16).is_empty:
+                    reclassified.append(sub_tile)
+                    continue
+                tile_seam = {(round(x, 3), round(y, 3)) for x, y in shapely.get_coordinates(sub_tile)
+                             if round(x, 3) in grid_x_set or round(y, 3) in grid_y_set}
+                tiles.append((sub_tile, tile_seam))
+
+        if not tiles and not reclassified:
+            return [(poly_m, set())], []
+        logger.info(f"  Navmesh tiling: {width/1000:.0f}x{height/1000:.0f}km piece "
+                    f"({nverts} boundary verts) -> {nx}x{ny} grid -> {len(tiles)} tiles"
+                    + (f", {len(reclassified)} sub-threshold fragments reclassified" if reclassified else "") + ".")
+        return tiles, reclassified
 
     def classify_water_body(self, polygon, is_wide: bool, depth_gdf, fairway_gdf,
                             config) -> Literal["navmesh", "skeleton", "laned"]:
