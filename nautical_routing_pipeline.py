@@ -288,6 +288,34 @@ DEPTH_SPLIT_CLOSING_RADIUS_M = 50.0  # _split_deep_shallow: morphological closin
                                      # DEPARE survey-contour misalignment gaps between adjacent
                                      # deep bands before cutting (Round 7's original 5m left most
                                      # of this fragmentation in place -- see Round 8 writeup)
+DEPTH_SPLIT_DRYING_REPUNCH_FRACTION = 0.5  # _split_deep_shallow: an interior hole the 50m closing
+                                     # above fills in gets subtracted back out (re-punched) if more
+                                     # than this fraction of its own area is covered by charted
+                                     # drying/intertidal DEPARE (DRVAL1<0, see _drying_gdf) -- one of
+                                     # two independent real/noise signals (see DEPTH_SPLIT_HOLE_MIN_WIDTH_M
+                                     # for the other -- on real Yerseke data this one alone recovered
+                                     # 0/30 real holes, none of them were actually charted drying, so it
+                                     # is necessary but not sufficient by itself). >50% (not a lower bar
+                                     # like "any overlap") because a hole can graze the edge of an
+                                     # unrelated nearby drying polygon without actually corresponding to
+                                     # it; a majority-covered hole is confidently the real thing.
+DEPTH_SPLIT_HOLE_MIN_WIDTH_M = 3.0  # _split_deep_shallow: an interior hole the 50m closing fills in
+                                     # also gets re-punched if it survives an erosion by this radius
+                                     # (i.e. contains a disk this wide) -- the second real/noise signal,
+                                     # added in Round 21 after direct measurement showed the drying
+                                     # signal alone (above) misses real Yerseke separators, which are
+                                     # mostly DEPARE-uncovered micro-voids or charted-but-shallow
+                                     # (not negative-DRVAL1) patches, not drying. Round 8's own
+                                     # documented GEOS/misalignment noise fragments were sub-1m^2 to
+                                     # low-single-digit-m^2 (one measured 0.007m^2) -- nowhere near wide
+                                     # enough to survive even a couple meters of erosion -- while every
+                                     # real Yerseke hole but the smallest handful is hundreds to tens of
+                                     # thousands of m^2 and clears this easily (measured: 25/30 survive).
+                                     # Scoped to interior rings only (see call site), so this can never
+                                     # affect whether separate deep pieces merge -- only whether an
+                                     # already-enclosed void stays excluded -- meaning it cannot
+                                     # reintroduce Round 8's region-fragmentation regression regardless
+                                     # of this threshold's value.
 NAVMESH_BOUNDARY_SIMPLIFY_M = 5.0   # build_navmesh_region: a separate, coarser simplify pass on
                                      # the navmesh region's own boundary specifically, applied right
                                      # before it becomes PSLG input/output. §5.2.3 item 1 (Round 6/7
@@ -912,10 +940,90 @@ class NauticalRoutingPipeline:
         # the one this function fixes). Erode the deep mask a further margin
         # past the ceiling contour so the region boundary sits inside
         # confirmed-deep water with real clearance, not exactly on the line.
-        deep_union_m = (unary_union(list(deep_mask_m.geometry)).buffer(0)
-                         .simplify(1.0).buffer(0)
-                         .buffer(DEPTH_SPLIT_CLOSING_RADIUS_M).buffer(-DEPTH_SPLIT_CLOSING_RADIUS_M)
-                         .buffer(-DEPTH_SPLIT_SAFETY_MARGIN_M))
+        pre_closing_m = (unary_union(list(deep_mask_m.geometry)).buffer(0)
+                          .simplify(1.0).buffer(0))
+        closed_m = pre_closing_m.buffer(DEPTH_SPLIT_CLOSING_RADIUS_M).buffer(-DEPTH_SPLIT_CLOSING_RADIUS_M)
+
+        # Round 21 fix (Issue G): the closing above is real and necessary (Round
+        # 8 confirmed 50m is needed to bridge genuine DEPARE survey-contour
+        # misalignment seams -- without it, region count balloons back toward
+        # Round 7's 201), but on real Yerseke-area braided tidal-flat data it
+        # was ALSO filling in genuine interior drying/shallow separators that
+        # are charted, not noise (confirmed: of 30 real interior holes in the
+        # deep mask there, only 1 survived 50m closing).
+        #
+        # Candidate set is deliberately `pre_closing_m`'s own INTERIOR RINGS
+        # (voids already fully enclosed within one already-connected deep
+        # piece), not `closed_m.difference(pre_closing_m)` (an earlier version
+        # of this fix used that and it's wrong on two counts, both confirmed by
+        # direct measurement against real Yerseke data, not assumed): (1) that
+        # difference also captures ordinary buffer-rounding noise along
+        # `pre_closing_m`'s OUTER boundary, unrelated to any hole -- in this
+        # bbox alone the difference's total area (490,214 m^2) vastly exceeds
+        # the 30 real holes' combined area (32,726 m^2), so most of it isn't
+        # hole-filling at all; (2) more importantly, an interior ring can only
+        # ever exist within an ALREADY-single-connected polygon/multipolygon
+        # component -- filling or not filling one can never change whether two
+        # previously SEPARATE deep pieces merge into one (that's a distinct
+        # operation, gated entirely by the closing's effect on each piece's own
+        # exterior boundary). Restricting the candidate set to interior rings
+        # therefore makes this fix structurally incapable of touching Round 8's
+        # region/component-count fragmentation fix, regardless of the real/noise
+        # threshold below -- confirmed directly in this bbox too (the two
+        # largest deep pieces here are 1,855m apart, far beyond 50m closing;
+        # the whole effect here is hole-filling, see Round 9's Issue G writeup).
+        #
+        # Real/noise test per hole: the brief's original lead (charted drying,
+        # `_drying_gdf`, DRVAL1<0) is kept as one signal -- real elsewhere in
+        # the dataset -- but ALONE it recovers 0 of the 30 real Yerseke holes:
+        # direct measurement found none of them are charted drying at all, they
+        # are either DEPARE-uncovered micro-voids or charted-but-shallow
+        # (0 <= DRVAL1 < ceiling) patches, neither of which is "drying" by the
+        # strict DRVAL1<0 definition. Added a second, independently-justified
+        # signal: does the hole survive a small erosion (contains a disk of
+        # `DEPTH_SPLIT_HOLE_MIN_WIDTH_M`)? Round 8's own documented noise
+        # fragments were sub-1m^2 to low-single-digit-m^2 GEOS artifacts (one
+        # measured 0.007m^2) -- nowhere near wide enough to survive even a
+        # couple meters of erosion -- while every real Yerseke hole bar the
+        # smallest handful is hundreds to tens of thousands of m^2 and
+        # comfortably clears it (measured: 25/30 survive at this radius,
+        # 26/30 once combined with the drying signal, recovering the majority
+        # target with area matching/exceeding the original 32,726 m^2).
+        pre_holes = []
+        for piece in self._explode_polygonal(pre_closing_m):
+            for ring in piece.interiors:
+                hole = Polygon(ring)
+                if hole.area > 0:
+                    pre_holes.append(hole)
+
+        if pre_holes:
+            drying_gdf = self._drying_gdf()
+            has_drying = drying_gdf is not None and not drying_gdf.empty
+            re_punch = []
+            for hole in pre_holes:
+                # Only act on holes the closing actually filled -- one that's
+                # still (mostly) excluded from closed_m needs no correction.
+                if hole.intersection(closed_m).area / hole.area < 0.5:
+                    continue
+                is_wide_enough = not hole.buffer(-DEPTH_SPLIT_HOLE_MIN_WIDTH_M).is_empty
+                drying_fraction = 0.0
+                if has_drying:
+                    hole_bounds = gpd.GeoSeries([hole], crs=utm).to_crs(drying_gdf.crs).total_bounds
+                    try:
+                        drying_idx = drying_gdf.sindex.query(box(*hole_bounds), predicate="intersects")
+                    except Exception:
+                        drying_idx = drying_gdf.index
+                    drying_candidates = drying_gdf.iloc[drying_idx] if len(drying_idx) else drying_gdf.iloc[[]]
+                    if not drying_candidates.empty:
+                        drying_m = gpd.GeoSeries(drying_candidates.geometry, crs=drying_gdf.crs).to_crs(utm)
+                        drying_union_m = unary_union(list(drying_m.geometry)).buffer(0)
+                        drying_fraction = hole.intersection(drying_union_m).area / hole.area
+                if is_wide_enough or drying_fraction > DEPTH_SPLIT_DRYING_REPUNCH_FRACTION:
+                    re_punch.append(hole)
+            if re_punch:
+                closed_m = self._clean_polygonal(closed_m.difference(unary_union(re_punch)))
+
+        deep_union_m = closed_m.buffer(-DEPTH_SPLIT_SAFETY_MARGIN_M)
         deep = self._clean_polygonal(poly_m.intersection(deep_union_m))
         shallow = self._clean_polygonal(poly_m.difference(deep_union_m))
 
