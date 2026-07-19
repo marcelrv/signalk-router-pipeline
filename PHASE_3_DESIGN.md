@@ -52,6 +52,20 @@ layer-per-concern convention):
   node placement idea from the Phase 2 Hardening Round 5 investigation
   (see `NEXT_PHASES.md` §5.5) — see below.
 
+**Inherited Phase 2 leftover, assigned here by explicit decision
+(2026-07-20)**: the Round 9 finding that ~4.6% of long (>150m)
+inland-waterways centerline edges genuinely cross land (55/1,189 in the
+Zeeland build at the time; `_build_inland_network` takes source line
+topology as-is with no land check) was deliberately deferred because
+naively stripping them could fragment the inland network. Handle it as
+part of this sub-phase's inland-network rework: when OSM fusion touches
+the inland layer anyway, add the land-crossing audit for inland
+centerline edges WITH a repair mechanism (split/reroute the crossing
+segment along OSM/ENC water geometry, or strip only where an alternative
+connection exists) — Round 10's lock-crossing connectivity now provides
+the lock-interruption piece that was missing when this was first
+deferred.
+
 **Conflation strategy — additive to gaps, never overrides tier 1/2**:
 1. Compute the union of all tier-1/2 (ENC/IENC-sourced) `coastal_water`/
    `inland_waterways` coverage for the region.
