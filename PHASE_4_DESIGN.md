@@ -129,6 +129,70 @@ of them.
 5. `GET .../databases/loaded` endpoint + webapp polling/indicator.
 6. Config schema additions, `dynamicLoading` default `false`.
 
+### 4a.1 Interplay with cross-database stitching (Round 22's PR-C / §3e)
+
+Designed 2026-07-19, when 4a implementation started, because dynamic
+loading changes what a correct stitching mechanism must look like: with
+regions coming and going at runtime, stitching cannot be a one-shot
+load-time pass over "all databases, once" any more than graph loading
+can.
+
+**Ground facts** (verified in `routeiq/src/database.ts`/`db-worker.ts`):
+node IDs are coordinate-hash-derived, so two independently built
+adjacent databases share a node only on an exact 5-decimal coordinate
+collision — never in practice; today the merged in-memory graph simply
+contains two disconnected node sets side by side. Any fix is therefore
+*synthetic runtime edges between nearby nodes of different databases* —
+never written into either `.sqlite` (databases must stay independently
+replaceable/re-downloadable), same in-memory-only convention as the
+funnel anchor-shortcut edges.
+
+**Design**:
+
+1. **Candidate nodes.** Long-term (§3e, pipeline side): stamp
+   "data-edge boundary nodes" at build time — nodes lying on the ENC
+   coverage envelope are identifiable during generation and get a flag.
+   Interim (routeiq side, lets stitching ship without any pipeline/
+   schema change): a node is a candidate iff it lies within
+   `stitchBandM` (~250 m) of its own database's `metadata`
+   `boundary_geometry` envelope — computable per database at load time
+   from data already in the coverage index, bbox-prefiltered so the
+   point-to-envelope tests only run near the rim.
+2. **Pairing pass.** For each pair of loaded databases whose coverage
+   envelopes come within `stitchRadiusM` (~500 m) of each other: KNN
+   across the two candidate sets, cap ≤2 connectors per node (the Pass
+   0c/0d convention), gate each connector through the existing runtime
+   line-of-sight land check (`isLineCrossingLand` sampling — build-time
+   polygon data isn't available at runtime, sampling is the available
+   equivalent of the pipeline's `_crosses_land` gate). Connector
+   attributes: conservative — distance-based cost, `min_depth` = min of
+   the two endpoint node depths, short by construction (≤`stitchRadiusM`)
+   so attribute uncertainty stays bounded. Expect Round-23-style modest
+   seam inflation on crossing routes; acceptable, revisit via 3f.
+3. **Dynamic-loading bookkeeping — the part 4a makes mandatory.** Every
+   stitch edge is registered with its `{dbIndexA, dbIndexB}` provenance
+   in a separate registry (NOT mixed anonymously into `edgesBySource`
+   bookkeeping-free the way DB rows are). Loading a region stitches only
+   the new database against each already-loaded neighbor (incremental,
+   cost scales with the new region's rim, not the whole world). Evicting
+   a region removes exactly the stitch edges whose provenance references
+   it. This registry is why stitching should land *after* 4a's per-file
+   load/evict plumbing exists — built the other way round, a one-shot
+   stitcher would have to be rewritten immediately.
+4. **Route-triggered loads must include transit regions.** Trigger 2 as
+   written loads regions containing start/end/waypoints — necessary but
+   not sufficient once cross-database routes exist: a route from region
+   A to region C *through* region B needs B loaded even though no
+   waypoint touches it. The on-demand check must therefore load every
+   `not_loaded` region whose coverage intersects the route's search bbox
+   (the same start-end-chord + `adaptiveMargin` bbox `tryRouteSegment`
+   already computes), not just waypoint containment.
+
+**Sequencing**: 4a tasks 1-2 (peek + per-file load/evict) → stitching
+registry + interim envelope-band stitcher (routeiq-only) → 4a tasks 3-5
+(triggers/API) → §3e's build-time stamped candidates as a later
+precision upgrade that only changes step 1's candidate selection.
+
 **Explicitly out of scope for this sub-phase**: auto-*downloading* a
 region the vessel approaches that isn't on disk yet at all. That's a
 plausible future extension of the same position-awareness (trigger 1's
