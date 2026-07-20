@@ -1,10 +1,27 @@
 import os
+import re
 import glob
 import logging
 import warnings
 import argparse
 import geopandas as gpd
 import pandas as pd
+
+# NOAA/IHO S-57 cell naming: <2-letter producer><1-digit usage band><4-char cell id>.000
+# Usage band 1 = "overview" (ocean passage planning, ~1:1.5M+), 2 = "general" (~1:350k-1.5M).
+# These are coarse, simplified charts meant for offshore routing, not per-vessel coastal/
+# harbor detail — but NOAA bundles a handful of them into every state ZIP (e.g. US2EC02M
+# covers the entire Atlantic seaboard, US1GC09M covers the entire Gulf of Mexico). Merging
+# their DEPARE/coastal_water polygons in alongside real harbor/approach charts (bands 3-6)
+# creates water-body components spanning thousands of km, which blows up navmesh
+# triangulation memory (confirmed: a single US1GC09M cell produced a "3134x1978km piece"
+# that OOM-killed the pipeline on a 281-cell SC+GA build). Skip bands 1-2 by default.
+_OVERVIEW_BAND_RE = re.compile(r'^[A-Za-z]{2}([1-6])', re.IGNORECASE)
+
+
+def _usage_band(file_path: str) -> str | None:
+    m = _OVERVIEW_BAND_RE.match(os.path.basename(file_path))
+    return m.group(1) if m else None
 
 # Suppress fiona warnings about missing layers in specific .000 files
 warnings.filterwarnings("ignore", category=RuntimeWarning)
@@ -13,9 +30,10 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 class ENCToGeoJSONPreprocessor:
-    def __init__(self, enc_directory: str, output_directory: str):
+    def __init__(self, enc_directory: str, output_directory: str, skip_bands: set[str] | None = None):
         self.enc_directory = enc_directory
         self.output_directory = output_directory
+        self.skip_bands = skip_bands if skip_bands is not None else {'1', '2'}
         
         # Configure GDAL to properly build S-57 polygons from geometries
         os.environ["OGR_S57_OPTIONS"] = "RETURN_PRIMITIVES=OFF,RETURN_LINKAGES=OFF,LNAM_REFS=ON"
@@ -51,7 +69,20 @@ class ENCToGeoJSONPreprocessor:
 
         # Recursively find all S-57 base cell files
         enc_files = glob.glob(os.path.join(self.enc_directory, '**', '*.000'), recursive=True)
-        logger.info(f"Found {len(enc_files)} ENC (.000) files. Starting extraction...")
+        logger.info(f"Found {len(enc_files)} ENC (.000) files.")
+
+        if self.skip_bands:
+            skipped = [f for f in enc_files if _usage_band(f) in self.skip_bands]
+            if skipped:
+                logger.info(
+                    f"Skipping {len(skipped)} overview/general-scale cells (usage band "
+                    f"{sorted(self.skip_bands)}) — coarse offshore-planning charts that "
+                    f"blow up navmesh memory if merged with coastal/harbor detail: "
+                    f"{[os.path.basename(f) for f in skipped]}"
+                )
+            enc_files = [f for f in enc_files if f not in skipped]
+
+        logger.info(f"Starting extraction of {len(enc_files)} cells...")
 
         for i, file_path in enumerate(enc_files, 1):
             logger.info(f"Processing [{i}/{len(enc_files)}]: {os.path.basename(file_path)}")
@@ -121,11 +152,16 @@ if __name__ == "__main__":
                         help="Root directory containing ENC .000 files in subdirectories (default: ./data)")
     parser.add_argument("--output", default="./output_geojson",
                         help="Output directory for extracted GeoJSON files (default: ./output_geojson)")
+    parser.add_argument("--include-overview-charts", action="store_true",
+                        help="Include usage-band 1 (overview) and 2 (general) charts. Off by "
+                             "default — these are coarse offshore-planning scale charts that "
+                             "can blow up navmesh memory when merged with coastal/harbor detail.")
     args = parser.parse_args()
 
     preprocessor = ENCToGeoJSONPreprocessor(
         enc_directory=args.input,
-        output_directory=args.output
+        output_directory=args.output,
+        skip_bands=set() if args.include_overview_charts else {'1', '2'}
     )
 
     preprocessor.process_all()

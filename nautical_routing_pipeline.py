@@ -482,7 +482,7 @@ def _s57_get_val(attrs, *candidates):
 
 def _is_entry_prohibited(row):
     restrn = _s57_col(row, 'restrn')
-    if restrn is not None and pd.notnull(restrn):
+    if _is_valid(restrn):
         vals = restrn if isinstance(restrn, (list, tuple, np.ndarray)) else [restrn]
         for v in vals:
             try:
@@ -3524,19 +3524,19 @@ class NauticalRoutingPipeline:
                 if default_type == "bridge":
                     is_opening = False
                     catbrg = _s57_col(row, "catbrg", "CATAQA", "CatBrg")
-                    if catbrg is not None and pd.notnull(catbrg):
+                    if _is_valid(catbrg):
                         vals = _parse_catbrg(catbrg)
                         if any(v in ("3", "4", "5", "6", "7") for v in vals):
                             is_opening = True
                     if not is_opening:
                         vercop = _s57_col(row, "vercop", "VERCOP", "VerCop")
-                        if vercop is not None and pd.notnull(vercop):
+                        if _is_valid(vercop):
                             is_opening = True
                     if is_opening:
                         props["subtype"] = "opening"
                     else:
                         props["subtype"] = "fixed"
-                        verclr = _s57_col(row, "verclr", "VERCLR", "VerClr")
+                        verclr = _s57_get_val(row, "verclr", "VERCLR", "VerClr")
                         if verclr is not None and pd.notnull(verclr):
                             props["height"] = float(verclr)
                 return json.dumps(props)

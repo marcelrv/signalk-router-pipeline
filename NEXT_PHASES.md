@@ -3118,3 +3118,249 @@ in-memory funnel edges with stripped geometry). Dense viewports pay
 
 Round 22 status: PR-A and PR-B closed by this round; PR-C (cross-map
 stitching) remains the open Phase 3e design item.
+
+## Next milestone — US East Coast multi-region routing (Round 25 brief; cross-repo)
+
+**Decided 2026-07-20** (priority review of `PHASE_3_DESIGN.md` /
+`PHASE_4_DESIGN.md`). This closes out **Round 22's PR-C** (cross-map
+stitching) — the last open Phase 3e item — now that it is a live blocker:
+US East Coast coverage is being generated as individual per-area `.sqlite`
+files, and independently-built adjacent files cannot route across the seam
+(node IDs are coordinate-hash-derived; adjacent builds never collide, so
+the merged in-memory graph holds two disconnected node sets side by side).
+
+**Priority reassessment**: the Phase 3 doc's stated order (3a/3c first, 3e
+"last, only after 3a–3d are proven") no longer matches reality — scale-out
+*is* the active track. The near-term critical path is **scale-out →
+cross-database stitching → dynamic loading**. 3a (OSM fusion), 3b
+(bathymetry), 3d (AIS), 4b (AI-vision), 4c (bridge/lock waits), 3f
+(hierarchy) all stay valid but none blocks the US East Coast rollout; 3c
+(community overrides) is the intended fast-follow after this milestone,
+since at US scale data errors are inevitable and 3c is what makes each fix
+cheap and durable.
+
+This repo owns the **build-phase pipeline half** (below). The routeiq
+runtime half — **WS2 (4a dynamic loading, default on)**, which merges
+coincident seam nodes on load — lives in
+`signalk-routeiq/ROUTEIQ_NEXT_PHASES.md`, "Committed next milestone — US
+East Coast multi-region routing (Round 25)". Keep the two in sync.
+
+### Locked design decisions (do not re-litigate)
+
+- **Primary stitching = build-time, automatic — a global snapping grid,
+  not a runtime matcher and not neighbour awareness.** Two independent
+  axes: (1) an *overlap band* so adjacent files share seam water, and
+  (2) *coincident coordinates* so shared points get identical
+  coordinate-hash node IDs. Axis 2 is what actually connects the graph —
+  and it is solved by snapping boundary/overlap-band nodes to a **single
+  global lat/lon grid** (a shared *constant* every build references), not
+  by any build learning its neighbours. Adjacent builds then collide to
+  identical node IDs at the seam; routeiq's loader merges them into one
+  node → the cross-region graph is connected with zero runtime synthetic
+  edges. This reuses the same determinism `_tile_navmesh_piece` already
+  gives *within* a file (R23), promoted to a global grid *across* files.
+- **Fixed-band over-clip, NOT neighbour-aware.** Every build extends its
+  clip by a fixed band with no knowledge of other files. Chosen over
+  neighbour-aware overlap because it preserves per-file independence (build
+  / re-tile / add any file in isolation, re-download independently — the
+  invariant the whole architecture rests on). Neighbour-aware coupling buys
+  nothing the global grid doesn't and breaks that invariant. This is the
+  small "learn neighbours vs. fixed band" decision, resolved: **fixed band
+  + global grid.**
+- **`is_data_boundary` stamp + runtime proximity matcher = deferred
+  fallbacks**, only for legacy/un-gridded/abutting files where IDs don't
+  coincide. Not on the critical path; do not gold-plate them before the
+  grid path is proven.
+- **Do it now, while US East Coast files are being generated** — adding
+  overlap + grid-snap during generation is far cheaper than regenerating
+  every file later to acquire them.
+
+### Build-phase tasks (this repo)
+
+1. **Fixed overlap band.** Extend each region's clip extent by a
+   configurable fixed band (`overlap_band_m`) in all directions around the
+   requested extent — **no neighbour awareness**. Verify overlap does not
+   fragment classification or double-trigger the R23 tiling caps at the
+   extended extent, and is a no-op where the band falls outside any data
+   coverage.
+2. **Global grid snap for boundary/overlap-band nodes (primary — this is
+   the stitching mechanism).** Define one global lat/lon grid constant;
+   snap nodes in the overlap band (and on the coverage envelope) to it
+   before ID hashing, so adjacent independent builds emit **identical
+   coordinates → identical hash IDs** at the seam. Pick a grid pitch fine
+   enough not to distort geometry yet coarse enough that neighbouring
+   builds reliably land on the same vertex. Verify two adjacent builds
+   produce a shared node-ID set across the overlap.
+3. **`is_data_boundary` node flag (fallback stamp).** Flag nodes on the
+   *true* (un-overlapped) ENC coverage envelope so the fallback matcher can
+   find candidates in un-gridded files. Additive column, **no
+   `schema_version` bump**. Stamp during `export_to_sqlite`; carry into the
+   US East Coast files as they generate.
+
+**Build-phase tests / verification**:
+- Build two adjacent overlapping clips (a Zeeland pair is cheapest, no US
+  data needed); assert a sample of overlap-band boundary nodes have
+  **bit-identical coordinates and IDs** across the two files (task 2 is
+  the crux — this test is the go/no-go for the whole grid approach).
+- Confirm `is_data_boundary` is set only on genuine coverage-envelope
+  nodes, spot-checked via direct SQL.
+- Re-run the full-scale regeneration + `zeelandbrug.test.ts` to confirm no
+  regression on a single-file build (overlap/grid-snap must be a no-op with
+  no neighbour).
+
+### Sequencing
+
+Tasks 1–2 land early and together — they must ship before/with the US East
+Coast file generation so those files carry overlap + grid-snapped seam
+nodes (retrofitting means regenerating everything). Task 3 (fallback stamp)
+can trail. The routeiq WS2 node-merge-on-load (its task 2) is the
+consuming counterpart; the deferred runtime matcher is a later round. See
+the routeiq doc for the cross-repo sequencing.
+
+## 2026-07-20 — US East Coast build: two real pipeline bugs found, per-state is the right granularity, 9/13 states shipped
+
+**Goal**: build routing databases for the NOAA-charted US East Coast, sized
+sensibly for constrained hardware (Raspberry Pi-class SignalK servers), and
+a reusable script so this doesn't need re-deriving next time. New tooling:
+`scripts/download_noaa.py` (state-ZIP downloader, region presets) and
+`build_region.sh` (download → `enc_preprocessor.py` →
+`nautical_routing_pipeline.py` in one command; supports composing a custom
+group from already-downloaded states via `--states` and post-preprocess
+bbox clipping via `--clip-bbox`, e.g. to drop non-Atlantic cells bundled
+into a state's NOAA ZIP).
+
+### What was tried, in order, and what actually happened
+
+1. **Whole East Coast as one database (13 states, 2,180 ENC cells)**:
+   OOM-killed after 66m31s, during `Building base network topology`, heavy
+   swap. Root cause found below — not simply "too much data."
+2. **5 multi-state groups** (~280–580 cells each, sized against Puerto
+   Rico's 154-cell/32MB/successful build as the only known-safe reference
+   point): SC+GA OOM-killed in 5m21s (same root cause as #1, confirmed
+   below); after the fix, SC+GA succeeded but NJ+DE+MD still OOM-killed in
+   5m25s — this one genuine (see below), not the chart-data artifact.
+3. **Per-state** (after both fixes below): **10/13 states succeeded**
+   (9 real states + Puerto Rico already existed). **MA, VA, and NC
+   OOM-killed even alone** — confirmed genuine via real diagnostics (plausible
+   bbox sizes at the tiling stage, not thousands-of-km artifacts; VA got to
+   152,158 nodes/317,087 edges and started the final stitching pass before
+   dying). These three need a further geographic sub-split (not yet done —
+   proposed split points: MA at the Cape Cod Canal, VA at the Chesapeake
+   Bay Bridge-Tunnel, NC near Cape Lookout). User decision: stop at 9/13 for
+   now, revisit later with `build_region.sh`'s existing `--clip-bbox`.
+
+**Cell count is a poor size/complexity predictor.** New Hampshire (20 ENC
+cells, the shortest coastline of any US state) produced *more* nodes
+(57,837) than Delaware (57 cells, 26,172 nodes) — almost certainly dense
+island/ledge clusters near Portsmouth Harbor/Isles of Shoals. Marsh- and
+bay-heavy coastlines (SC/GA, MD's Chesapeake, and especially MA/VA/NC)
+cost far more per cell than open coastline.
+
+### Root cause #1 (the real reason #1 and the pre-fix #2 attempt OOM'd)
+
+NOAA bundles a handful of coarse **usage-band 1 ("overview") and 2
+("general")** scale S-57 charts into *every* state ZIP — meant for
+offshore passage planning, not per-vessel coastal/harbor routing. Confirmed
+directly: `US1GC09M` ("Gulf Coast" overview) has a DEPARE bounding box
+spanning `lon -97.9 to -76.1, lat 17.8 to 33.6` — **the entire Gulf of
+Mexico**, present in SC and GA's ZIPs despite neither state touching the
+Gulf; `US2EC02M` ("East Coast" general) spans `lon -81.7 to -67.2` —
+Florida to offshore New England. Merged into `coastal_water`/`depare`
+alongside real harbor detail, the pipeline treated the whole Atlantic
+seaboard as one water body to triangulate (logged: *"Navmesh tiling:
+3134x1978km piece ... 31361 tiles"*). Puerto Rico's Caribbean bundle never
+included these — the only reason it was previously the sole region that
+had ever built successfully. **Fix**: `enc_preprocessor.py` now skips
+usage bands 1–2 by default (`--include-overview-charts` to restore old
+behavior), matching on the NOAA/IHO cell-naming convention
+(`<producer><band-digit><cell-id>.000`).
+
+### Root cause #2 (unrelated crash, hit building Maryland)
+
+`nautical_routing_pipeline.py`'s `_poi_properties` crashed exporting POIs
+(`ValueError: The truth value of an empty array is ambiguous`) — `catbrg`
+(and 3 sibling attributes: `restrn`, `vercop`, `verclr`) can come back as a
+numpy array for a multi-valued S-57 attribute, and raw `pd.notnull(array)`
+is ambiguous. The codebase already had the right helper (`_is_valid`,
+correctly used at two other bridge-checking call sites) — it just wasn't
+used at these four. Fixed by switching all four to `_is_valid`/
+`_s57_get_val` for consistency. MD had already gotten through the entire
+expensive part of the pipeline (121,642 nodes, edge attributes, depths)
+before hitting this — it was never a resource problem.
+
+### Final results — 9 databases, 527MB total, all copied into
+`signalk-routeiq/data/` and confirmed loading in the live plugin
+
+| Region | Cells (post-filter) | Size | Nodes | Edges |
+|---|---|---|---|---|
+| Delaware | 56 | 14.4MB | 26,172 | 60,578 |
+| New York (Atlantic only — bbox-clipped to `-74.3,40.4,-71.7,42.9` to drop Buffalo/Great Lakes + Finger Lakes cells NOAA bundles into NY's ZIP) | ~440 | 32.7MB | 57,105 | 141,497 |
+| New Hampshire | 19 | 36.7MB | 57,837 | 132,956 |
+| Connecticut | 77 | 40.0MB | 46,600 | 108,445 |
+| New Jersey | 138 | 47.5MB | 52,346 | 128,012 |
+| Rhode Island | 46 | 48.2MB | 51,236 | 116,658 |
+| Maryland | 124 | 57.7MB | 121,642 | 266,748 |
+| Maine | 174 | 111.0MB | 101,607 | 264,676 |
+| South Carolina + Georgia (combined — the only multi-state group that survived) | 275 | 138.7MB | 77,739 | 186,615 |
+
+For scale, Zeeland (one Dutch province) is 14–80MB/33–56k nodes depending
+on tuning — most of these land in or near that range; SC+GA and Maine run
+notably heavier due to marsh/island density, not raw size.
+
+### Runtime finding — `dynamicLoading: false` loads *everything*, every time
+
+Restarted the live dev SignalK server after copying all 9 files into
+`routeiq-dev/data/` (alongside the existing `puertorico.sqlite` and
+`zeeland.sqlite`) — the plugin loaded **all 11 databases** in ~4.5s
+wall-clock (fast; this is not the historical `loadGraph()` bottleneck
+documented elsewhere in this file for a single large region), but the
+**signalk-server container's RSS went to 2.86GiB** with all of them
+resident simultaneously. `dynamicLoading` defaults to `false`
+(`RoutingDatabase(routingDataDir, dynamicLoading)`, `src/index.ts:312`) —
+*every* `.sqlite` file in `routingDataDir` gets opened at startup
+regardless of the vessel's actual position. **This means splitting into
+many small per-region files does not, by itself, save memory on a
+Pi-class deployment** — a real user needs to either (a) only keep the
+region(s) relevant to them in the data folder, or (b) use the
+position-aware `dynamicLoading: true` mode (referenced in
+`PHASE_4_DESIGN.md`) once it's confirmed production-ready. Worth a clear
+callout in user-facing docs when these regions are published — the
+per-region split solves "how big is one file to download/build," not
+"how much RAM does the plugin use" unless paired with selective loading.
+
+**Update, same day**: this wasn't just a Pi-scale concern — it crash-looped
+*this dev container* too (`docker inspect` showed `RestartCount=10` and
+repeated `FATAL ERROR: Ineffective mark-compacts near heap limit
+Allocation failed - JavaScript heap out of memory` in the logs; that's a
+V8 old-space heap ceiling, hit well before the container's own 15.6GiB
+cgroup limit). **`dynamicLoading`'s default has been flipped from `false`
+to `true`** in `signalk-routeiq` (`src/types.ts`'s `DEFAULT_CONFIG`) — the
+original "default false" reasoning in `PHASE_4_DESIGN.md` §4a task 6 was
+explicitly "every deployment today has exactly one region file, nothing to
+gain"; that assumption is exactly what this session's work invalidated.
+The feature was already genuinely implemented (peek-only startup via
+`peekMetadata`, per-file on-demand load via `ensureRegionsLoaded` called
+from every `RoutingEngine.calculateRoute`) — not a stub — task 3 (proactive
+position-based preloading) is the one piece still unbuilt, so a region
+loads reactively on its first route request rather than proactively before
+the vessel crosses in.
+
+Verified end-to-end after the flip: full rebuild + `npm test` (56/56 still
+pass — the flip only changes `DEFAULT_CONFIG`, not `RoutingDatabase`'s own
+constructor default, which existing tests construct directly and don't
+touch), redeployed live. Startup log: *"Dynamic loading enabled: peeked 11
+database(s) ..., none loaded yet"* — idle RSS **1.05GiB**, 0 restarts.
+A real `POST /router/route` request inside New Hampshire's coverage
+triggered exactly the databases the search actually touched (NH itself,
+plus Maine since the search bbox crossed into its coverage too) — logged
+as *"Route request falls inside not-yet-loaded database ... loading inline
+before search"*, NH in 4.7s / ME in 11.8s, real route geometry returned.
+Confirms the on-demand path works as designed, not just the idle-memory
+win. **Loading even just those 2 of the 11 databases pushed RSS to
+3.18GiB** — per-database in-memory overhead is substantial (well above raw
+`.sqlite` file size, consistent with node/edge adjacency-structure
+overhead noted elsewhere in this file for Zeeland) — so `dynamicLoading`
+avoids paying for regions you're not near, but a Pi-class deployment
+sitting near a genuinely large/complex region (Maine, Chesapeake) still
+needs real headroom for that one region's load, not just "small files are
+automatically cheap."
