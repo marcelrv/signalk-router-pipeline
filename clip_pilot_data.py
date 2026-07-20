@@ -62,6 +62,11 @@ def main():
                     help="Directory of the full-coverage GeoJSON layers.")
     ap.add_argument("--bbox", default="3.2,51.2,4.3,51.7",
                     help='"min_lon,min_lat,max_lon,max_lat" (default: Zeeland pilot).')
+    ap.add_argument("--overlap-deg", type=float, default=0.0,
+                    help="Expand --bbox outward by this many degrees on all four sides "
+                         "before clipping (default: 0.0, a no-op). Use to make adjacent "
+                         "region clips share a seam overlap band (Round 25 cross-database "
+                         "stitching, Chunk 1).")
     ap.add_argument("--output-dir", default="./data/zeeland_clip",
                     help="Where to write the clipped layers.")
     args = ap.parse_args()
@@ -69,10 +74,15 @@ def main():
     bbox_tuple = tuple(float(x) for x in args.bbox.split(","))
     if len(bbox_tuple) != 4:
         raise SystemExit("--bbox must be 'min_lon,min_lat,max_lon,max_lat'")
+    if args.overlap_deg:
+        min_lon, min_lat, max_lon, max_lat = bbox_tuple
+        bbox_tuple = (min_lon - args.overlap_deg, min_lat - args.overlap_deg,
+                      max_lon + args.overlap_deg, max_lat + args.overlap_deg)
     clip_box = box(*bbox_tuple)
     os.makedirs(args.output_dir, exist_ok=True)
 
-    print(f"Clipping to bbox {bbox_tuple} -> {args.output_dir}")
+    print(f"Clipping to bbox {bbox_tuple} -> {args.output_dir}"
+          + (f" (overlap band {args.overlap_deg}deg)" if args.overlap_deg else ""))
     for fname in LAYER_FILES:
         src = os.path.join(args.input_dir, fname)
         dst = os.path.join(args.output_dir, fname)

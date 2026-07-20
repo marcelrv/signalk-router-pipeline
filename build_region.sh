@@ -12,7 +12,7 @@
 # to a bounding box afterward (e.g. to drop non-Atlantic cells bundled into
 # a state's NOAA ZIP, like Great Lakes/Finger Lakes cells in NY's):
 #   ./build_region.sh <name> --states ME,NH,MA,RI,CT [--source-region us-east-coast]
-#                      [--clip-bbox "min_lon,min_lat,max_lon,max_lat"]
+#                      [--clip-bbox "min_lon,min_lat,max_lon,max_lat"] [--overlap-deg 0.02]
 #
 # Examples:
 #   ./build_region.sh us-east-coast
@@ -28,7 +28,7 @@ cd "$BACKEND_DIR"
 
 if [ $# -lt 1 ]; then
     echo "Usage: $0 <region> [--force] [--name \"Human Name\"] [--depth-ceiling 6.0]" >&2
-    echo "       $0 <name> --states ST1,ST2 [--source-region us-east-coast] [--clip-bbox \"min_lon,min_lat,max_lon,max_lat\"]" >&2
+    echo "       $0 <name> --states ST1,ST2 [--source-region us-east-coast] [--clip-bbox \"min_lon,min_lat,max_lon,max_lat\"] [--overlap-deg 0.02]" >&2
     echo "Run scripts/download_noaa.py --list-regions to see available region keys." >&2
     exit 1
 fi
@@ -41,6 +41,7 @@ DEPTH_CEILING="6.0"
 STATES=""
 SOURCE_REGION="us-east-coast"
 CLIP_BBOX=""
+OVERLAP_DEG=""
 while [ $# -gt 0 ]; do
     case "$1" in
         --force) FORCE="--force"; shift ;;
@@ -49,6 +50,7 @@ while [ $# -gt 0 ]; do
         --states) STATES="$2"; shift 2 ;;
         --source-region) SOURCE_REGION="$2"; shift 2 ;;
         --clip-bbox) CLIP_BBOX="$2"; shift 2 ;;
+        --overlap-deg) OVERLAP_DEG="$2"; shift 2 ;;
         *) echo "Unknown option: $1" >&2; exit 1 ;;
     esac
 done
@@ -111,8 +113,12 @@ fi
 
 if [ -n "$CLIP_BBOX" ]; then
     CLIPPED_DIR="data/geojson/${REGION}_clipped"
-    step "2b/3 clip to bbox $CLIP_BBOX -> $CLIPPED_DIR"
-    time "$PYTHON" clip_pilot_data.py --input-dir "$GEOJSON_DIR" --bbox="$CLIP_BBOX" --output-dir "$CLIPPED_DIR" \
+    OVERLAP_ARGS=()
+    if [ -n "$OVERLAP_DEG" ]; then
+        OVERLAP_ARGS=(--overlap-deg "$OVERLAP_DEG")
+    fi
+    step "2b/3 clip to bbox $CLIP_BBOX -> $CLIPPED_DIR${OVERLAP_DEG:+ (overlap ${OVERLAP_DEG}deg)}"
+    time "$PYTHON" clip_pilot_data.py --input-dir "$GEOJSON_DIR" --bbox="$CLIP_BBOX" --output-dir "$CLIPPED_DIR" "${OVERLAP_ARGS[@]}" \
         2>&1 | tee "${LOG_PREFIX}_clip.log"
     GEOJSON_DIR="$CLIPPED_DIR"
 fi
