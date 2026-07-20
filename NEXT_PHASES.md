@@ -3175,38 +3175,88 @@ East Coast multi-region routing (Round 25)". Keep the two in sync.
   overlap + grid-snap during generation is far cheaper than regenerating
   every file later to acquire them.
 
+### Key finding — a global grid already exists (verified in code)
+
+`_coord_to_id` (`nautical_routing_pipeline.py:1300`) derives node IDs by
+pure arithmetic on `round(lat,5)`/`round(lon,5)` — **no per-build
+randomness.** So identical coordinate ⇒ identical node ID across
+independent builds *already*; the 5-decimal rounding (~1.1m cells) is
+itself a global grid. The stitching problem is therefore **not** hashing,
+it's coordinate *generation*:
+- **Source-vertex nodes** (raw ENC water-polygon / coastline vertices) are
+  byte-identical in two builds of the same source, so they already hash to
+  identical IDs — an overlapping seam shares them **for free**.
+- **Derived nodes** (skeleton medial-axis samples, navmesh triangulation
+  vertices, resampled points) land at build-specific sub-meter positions
+  that depend on each build's extent/tiling — so they do *not* coincide,
+  even though the hash is deterministic.
+
+This reshapes the tasks: overlap is trivial (expand the clip bbox), and the
+real question is whether seam connectivity can ride on shared source-vertex
+nodes, or whether derived seam nodes must be snapped to a coarser shared
+grid. Chunk 1 answers that before Chunk 2 builds anything.
+
 ### Build-phase tasks (this repo)
 
-1. **Fixed overlap band.** Extend each region's clip extent by a
-   configurable fixed band (`overlap_band_m`) in all directions around the
-   requested extent — **no neighbour awareness**. Verify overlap does not
-   fragment classification or double-trigger the R23 tiling caps at the
-   extended extent, and is a no-op where the band falls outside any data
-   coverage.
-2. **Global grid snap for boundary/overlap-band nodes (primary — this is
-   the stitching mechanism).** Define one global lat/lon grid constant;
-   snap nodes in the overlap band (and on the coverage envelope) to it
-   before ID hashing, so adjacent independent builds emit **identical
-   coordinates → identical hash IDs** at the seam. Pick a grid pitch fine
-   enough not to distort geometry yet coarse enough that neighbouring
-   builds reliably land on the same vertex. Verify two adjacent builds
-   produce a shared node-ID set across the overlap.
-3. **`is_data_boundary` node flag (fallback stamp).** Flag nodes on the
-   *true* (un-overlapped) ENC coverage envelope so the fallback matcher can
-   find candidates in un-gridded files. Additive column, **no
-   `schema_version` bump**. Stamp during `export_to_sqlite`; carry into the
-   US East Coast files as they generate.
+**Chunk 1 — Overlap band + coincidence proof (do first; low-regret).**
+Add a fixed overlap band by expanding the clip bbox in
+`build_region.sh` / `clip_pilot_data.py` (`--overlap-deg` or an m→deg
+band), **no neighbour awareness**. Build two adjacent *overlapping* clips
+of the same source (a Zeeland bbox pair is cheapest — no US data needed)
+and **measure how many seam node IDs already coincide** between the two
+`.sqlite` files, broken down by node type (source-vertex vs.
+skeleton/navmesh). This is the go/no-go that decides whether Chunk 2 is
+even needed. Verify overlap doesn't fragment classification or double-fire
+the R23 tiling caps, and is a no-op outside data coverage.
+
+**Chunk 2 — Derived-node seam snap (ONLY if Chunk 1 shows a gap).** For
+derived (skeleton/navmesh) nodes generated within the overlap band, snap
+their coordinates to a coarser shared grid before `_get_or_create_node`
+hashes them, so adjacent builds' jittered positions collapse to the same
+cell → identical ID. Grid pitch: fine enough not to distort geometry,
+coarse enough that neighbouring builds reliably co-locate. Applies to band
+nodes only — interior nodes are unaffected.
+
+**Chunk 3 (fallback, later) — `is_data_boundary` node flag.** Flag nodes
+on the *true* (un-overlapped) ENC coverage envelope so the deferred runtime
+matcher can find candidates in un-gridded/legacy files. Additive column,
+**no `schema_version` bump**. Not on the critical path.
 
 **Build-phase tests / verification**:
-- Build two adjacent overlapping clips (a Zeeland pair is cheapest, no US
-  data needed); assert a sample of overlap-band boundary nodes have
-  **bit-identical coordinates and IDs** across the two files (task 2 is
-  the crux — this test is the go/no-go for the whole grid approach).
-- Confirm `is_data_boundary` is set only on genuine coverage-envelope
-  nodes, spot-checked via direct SQL.
-- Re-run the full-scale regeneration + `zeelandbrug.test.ts` to confirm no
-  regression on a single-file build (overlap/grid-snap must be a no-op with
-  no neighbour).
+- Chunk 1's coincidence measurement is the primary gate: report the shared
+  node-ID count/fraction in the overlap band per node type across two
+  adjacent builds.
+- If Chunk 2 lands: assert a sample of derived seam nodes have
+  bit-identical coordinates/IDs across the two files.
+- Re-run the full-scale regeneration + the pipeline's own scenario test to
+  confirm no regression on a single-file build (overlap/snap must be a
+  no-op with no neighbour).
+
+### Chunk 1 RESULT (2026-07-20, `--overlap-deg` committed `ac91c8a`) — grid-snap path REJECTED
+
+Ran the coincidence experiment: two adjacent overlapping Zeeland clips
+(`--overlap-deg 0.01`), measured node-ID coincidence in the shared band.
+**Only 4.0% of seam-band graph nodes coincide** (60/1506). Breakdown:
+- Raw ENC source *coordinates* agree at **99.4%** in the band — the shared
+  data premise holds.
+- But only **4.3% of graph nodes are raw-vertex passthroughs** (65/1506);
+  even those coincide at just 78.5%.
+- The other **~96% are pipeline-*derived*** (`_split_wide_narrow`'s
+  `buffer(0).simplify()`, medial-axis skeleton sampling, navmesh
+  triangulation) — and coincide at **0.6%**. That processing runs on the
+  whole connected water-body component, whose extent differs between the
+  two clips, so derived geometry diverges almost everywhere in the band,
+  not just at edge cases.
+
+**Conclusion: build-time ID coincidence is impractical** — you'd have to
+snap ~all seam nodes to a coarse grid, distorting skeleton/navmesh geometry
+and collapsing distinct nodes. **Chunk 2 (grid-snap) is dropped.** The
+`--overlap-deg` flag stays (it's what feeds the runtime matcher). Primary
+stitching pivots to the **runtime proximity matcher** (overlap band +
+closest cross-DB node connectors — the originally-"deferred" §4a.1 matcher,
+promoted to primary). A global *tiling* grid (R23 cut-lines across files)
+remains a possible long-term alternative but is un-de-risked and doesn't
+cleanly handle extent-dependent skeleton nodes.
 
 ### Sequencing
 
