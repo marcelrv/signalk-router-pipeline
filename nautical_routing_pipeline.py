@@ -27,6 +27,10 @@ from rasterio.transform import from_origin as _rio_from_origin
 # Phase 1 navmesh-region triangulation (Step B2). Hard dep per requirements.txt.
 import triangle as _triangle
 
+# Round 25 cross-database seam stitching (STITCHING_DESIGN.md Section 3):
+# pipeline-side-only shared global-node registry.
+from seam_registry import SeamRegistry
+
 def _is_valid(val):
     if val is None:
         return False
@@ -591,7 +595,10 @@ class NauticalRoutingPipeline:
                  tags: Optional[str] = None, contributor: str = "", url: str = "",
                  license: str = "", copyright: str = "",
                  architecture: str = "navmesh-hybrid-phase1",
-                 dataset_version: str = "", depth_ceiling: float = 6.0):
+                 dataset_version: str = "", depth_ceiling: float = 6.0,
+                 stitch_registry_path: str = "",
+                 coverage_bbox: Optional[Tuple[float, float, float, float]] = None,
+                 stitch_band_m: float = 300.0, stitch_radius_m: float = 500.0):
         self.data_paths = data_paths
         self.db_path = db_path
         self.country = country
@@ -620,6 +627,16 @@ class NauticalRoutingPipeline:
         # Round 14 summary counters, logged once at the end of build_network.
         self.waterway_crossing_stats = {"nodes": 0, "regions": 0, "edges": 0}
 
+        # Round 25 cross-database seam stitching (STITCHING_DESIGN.md Section 3).
+        # Empty stitch_registry_path (the default) means stitching is OFF and
+        # every method below is a strict no-op -- single-region behavior is
+        # unchanged.
+        self.stitch_registry_path = stitch_registry_path
+        self.coverage_bbox = coverage_bbox
+        self.stitch_band_m = stitch_band_m
+        self.stitch_radius_m = stitch_radius_m
+        self._coverage_bbox_cache = None
+
     def run_pipeline(self):
         self.parse_shapefiles()
         self.build_network()
@@ -627,11 +644,20 @@ class NauticalRoutingPipeline:
         self._add_lock_crossing_edges()
         self._sanity_check_no_land_crossings()
         self._ensure_coastal_connectivity()
+        # Adopt pass runs BEFORE calculate_edge_attributes so the new
+        # adopted-node connector edges go through normal edge-attribute
+        # computation like every other edge (STITCHING_DESIGN.md Section 3.3).
+        adopted_ids = self._adopt_seam_nodes() if self.stitch_registry_path else set()
         self.calculate_edge_attributes()
         for u, v, data in self.graph.edges(data=True):
             if data.get("is_opening_bridge_edge"):
                 data["max_air_draft"] = 999.0
         self._compute_node_depths()
+        # Publish pass runs after node depths are final, right before export,
+        # so the registry gets each boundary node's real computed depth
+        # (STITCHING_DESIGN.md Section 3.2).
+        if self.stitch_registry_path:
+            self._publish_seam_nodes(adopted_ids)
         self.export_to_sqlite()
         logger.info("Pipeline execution completed successfully.")
 
@@ -3200,6 +3226,281 @@ class NauticalRoutingPipeline:
                     f"across {len(components)} components ({total_inland_candidates} in-polygon "
                     f"inland-node candidates included).")
 
+    # ------------------------------------------------------------------
+    # Round 25 cross-database seam stitching (STITCHING_DESIGN.md Section 3).
+    # All three methods below are only ever called when self.stitch_registry_path
+    # is truthy (see run_pipeline) -- with stitching off, none of this runs and
+    # single-region behavior is byte-for-byte unchanged.
+    # ------------------------------------------------------------------
+
+    def _get_coverage_bbox(self) -> Optional[Tuple[float, float, float, float]]:
+        """This region's coverage bbox: the straight rectangle used for both
+        the adopt pass's registry query and the publish pass's boundary-node
+        (near-clip-edge) detection. `self.coverage_bbox` (from `--coverage-bbox`,
+        typically build_region.sh's already-overlap-expanded clip bbox) wins
+        when given; otherwise falls back to the union bounds of every loaded
+        GeoJSON layer, which is the actual clipped data extent for a build
+        that didn't pass one explicitly. Cached -- the loaded layers don't
+        change mid-build.
+        """
+        if self._coverage_bbox_cache is not None:
+            return self._coverage_bbox_cache
+        if self.coverage_bbox is not None:
+            bbox = tuple(self.coverage_bbox)
+        else:
+            lons: List[float] = []
+            lats: List[float] = []
+            for gdf in self.gdfs.values():
+                if gdf is None or gdf.empty:
+                    continue
+                b = gdf.total_bounds  # minx, miny, maxx, maxy
+                if np.all(np.isfinite(b)):
+                    lons.extend([b[0], b[2]])
+                    lats.extend([b[1], b[3]])
+            bbox = (min(lons), min(lats), max(lons), max(lats)) if lons else None
+        self._coverage_bbox_cache = bbox
+        return bbox
+
+    def _adopt_seam_nodes(self) -> set:
+        """Adopt pass (STITCHING_DESIGN.md Section 3.3): query the shared seam
+        registry for nodes inside this region's coverage bbox and splice in any
+        not already present in this build's graph, VERBATIM -- same id/lon/lat/
+        node_kind_id/node_depth, never recomputed -- then connect each to up to
+        2 nearby NATIVE (pre-existing, not itself adopted) graph nodes so the
+        seam is genuinely reachable from this region's own interior. Runs after
+        `_ensure_coastal_connectivity` (native connectivity is already settled)
+        and before `calculate_edge_attributes` (so the new connector edges get
+        normal edge-attribute computation like any other edge, per run_pipeline).
+
+        Returns the set of node ids actually adopted this build (used by the
+        publish pass's dedupe check).
+        """
+        bbox = self._get_coverage_bbox()
+        if bbox is None:
+            logger.warning("Seam registry adopt pass: no coverage bbox available, skipping.")
+            return set()
+
+        with SeamRegistry(self.stitch_registry_path) as registry:
+            rows = registry.query_bbox(*bbox)
+
+        if not rows:
+            logger.info(f"Seam registry adopt pass: 0 candidate nodes in bbox {bbox}.")
+            return set()
+
+        # Native = whatever this build's own construction + connectivity passes
+        # produced, BEFORE any adoption -- adopted nodes only ever connect to
+        # this set, never to each other (STITCHING_DESIGN.md Section 3.3).
+        native_coastal_ids = [n for n, d in self.graph.nodes(data=True)
+                               if d.get("node_type") != "inland"]
+        native_points = None
+        native_sindex = None
+        if native_coastal_ids:
+            native_points = gpd.GeoSeries(
+                [Point(self.graph.nodes[n]["lon"], self.graph.nodes[n]["lat"])
+                 for n in native_coastal_ids],
+                index=native_coastal_ids, crs=self.CRS_WGS84)
+            native_sindex = native_points.sindex
+
+        coastal_gdf = self.gdfs.get("coastal_water")
+        components = (self._connected_water_polygons(coastal_gdf)
+                      if coastal_gdf is not None and not coastal_gdf.empty else [])
+        components_sindex = None
+        if components:
+            components_gs = gpd.GeoSeries(components, crs=self.CRS_WGS84)
+            components_sindex = components_gs.sindex
+
+        adopted_ids = set()
+        already_present = 0
+        unconnected = 0
+        for row in rows:
+            node_id = row["node_id"]
+            if node_id in self.graph:
+                already_present += 1
+                continue
+            lon, lat = row["lon"], row["lat"]
+            node_depth = row["node_depth"] if row["node_depth"] is not None else -1
+            # Added verbatim: same id, same coordinate, same kind -- this build
+            # does NOT recompute or re-hash it (the whole point of the registry).
+            self.graph.add_node(
+                node_id, lon=lon, lat=lat, node_type="coastal",
+                node_kind_id=row["node_kind_id"], node_depth=node_depth,
+                source_tier=DEFAULT_SOURCE_TIER, source_id=None,
+            )
+            self.coords_to_node[(round(lon, 5), round(lat, 5))] = node_id
+            adopted_ids.add(node_id)
+
+            n_conn = self._connect_adopted_node(
+                node_id, lon, lat, components, components_sindex,
+                native_points, native_sindex)
+            if n_conn == 0:
+                unconnected += 1
+
+        logger.info(
+            f"Seam registry adopt pass: {len(adopted_ids)} nodes adopted from "
+            f"'{self.stitch_registry_path}' ({already_present} already present in "
+            f"this build's graph, {unconnected} left unconnected -- no valid "
+            f"native neighbour within {self.stitch_radius_m:.0f}m)."
+        )
+        return adopted_ids
+
+    def _connect_adopted_node(self, node_id, lon: float, lat: float, components: List[Polygon],
+                               components_sindex, native_points, native_sindex,
+                               max_connectors: int = 2) -> int:
+        """Connect one just-adopted seam node to up to `max_connectors` nearest
+        NATIVE graph nodes, gated the same way Pass 0c/0d's local-adjacency
+        connectors are (`_stitch_component_pieces`): candidates restricted to
+        the same water component, the straight connector must stay `within`
+        that component's polygon, and must not `_crosses_land`. Returns the
+        number of edges added (0 is fine -- the node stays in the graph,
+        unconnected on this side; harmless per STITCHING_DESIGN.md Section 3.3,
+        and is what `--overlap-deg >= stitch_band_m` sizing (Section 3.5) is
+        meant to make rare at a real seam).
+        """
+        if native_points is None or native_sindex is None or not components:
+            return 0
+        pt = Point(lon, lat)
+
+        target_component = None
+        if components_sindex is not None:
+            hits = list(components_sindex.query(pt.buffer(0.0005), predicate="intersects"))
+            if hits:
+                target_component = components[hits[0]]
+        if target_component is None:
+            # FP/erosion jitter can leave an adopted node just outside every
+            # polygon boundary at the seam -- fall back to nearest component.
+            target_component = min(components, key=lambda c: c.distance(pt))
+
+        probe = target_component.buffer(0.001)  # ~100m in degrees, generous prefilter
+        cand_hits = native_sindex.query(probe, predicate="intersects")
+        candidate_ids = [native_points.index[i] for i in cand_hits]
+        if not candidate_ids:
+            return 0
+
+        utm = self._local_utm_crs(target_component)
+        poly_m = gpd.GeoSeries([target_component], crs=self.CRS_WGS84).to_crs(utm).iloc[0].buffer(2.0)
+        pt_m = gpd.GeoSeries([pt], crs=self.CRS_WGS84).to_crs(utm).iloc[0]
+        cand_pts_wgs84 = [Point(self.graph.nodes[n]["lon"], self.graph.nodes[n]["lat"])
+                           for n in candidate_ids]
+        cand_pts_m = gpd.GeoSeries(cand_pts_wgs84, crs=self.CRS_WGS84).to_crs(utm)
+
+        scored = []
+        for cid, c_wgs84, cm in zip(candidate_ids, cand_pts_wgs84, cand_pts_m):
+            d = pt_m.distance(cm)
+            if d <= self.stitch_radius_m:
+                scored.append((d, cid, c_wgs84, cm))
+        scored.sort(key=lambda t: t[0])
+
+        added = 0
+        for _dist_m, cid, c_wgs84, cm in scored:
+            if added >= max_connectors:
+                break
+            if self.graph.has_edge(node_id, cid):
+                continue
+            if not LineString([pt_m, cm]).within(poly_m):
+                continue
+            if self._crosses_land(LineString([(lon, lat), (c_wgs84.x, c_wgs84.y)])):
+                continue
+            attrs = dict(edge_type="coastal", edge_kind_id=EDGE_KIND_NAVMESH_BOUNDARY,
+                         source_tier=DEFAULT_SOURCE_TIER, source_id=None)
+            self.graph.add_edge(node_id, cid, **attrs)
+            self.graph.add_edge(cid, node_id, **attrs)
+            added += 1
+        return added
+
+    def _publish_seam_nodes(self, adopted_ids: set):
+        """Publish pass (STITCHING_DESIGN.md Section 3.2): upsert this region's
+        own BOUNDARY nodes -- graph nodes within `stitch_band_m` of the region's
+        coverage-bbox rectangle edges (the artificial clip cut, not natural
+        coastline) and sitting in water -- into the shared seam registry,
+        tagged `source_region=self.region_name` for provenance. Idempotent
+        (upsert keyed by node_id). Skips a boundary node that sits within a
+        small dedupe radius of a node THIS build just adopted, so the registry
+        doesn't accumulate near-duplicate seam nodes as more regions get built
+        against it (Section 3.2's dedupe). Runs once the graph and its node
+        depths are final for this build, right before export_to_sqlite.
+        """
+        bbox = self._get_coverage_bbox()
+        if bbox is None:
+            logger.warning("Seam registry publish pass: no coverage bbox available, skipping.")
+            return
+        min_lon, min_lat, max_lon, max_lat = bbox
+
+        coastal_gdf = self.gdfs.get("coastal_water")
+        water_union = None
+        if coastal_gdf is not None and not coastal_gdf.empty:
+            geoms = [g for g in coastal_gdf.geometry if g is not None and not g.is_empty]
+            if geoms:
+                # Small buffer (~2m in degrees) so a node sitting exactly on
+                # the water polygon's own boundary (the common case for
+                # navmesh perimeter / skeleton endpoint nodes) still counts
+                # as "in water" despite shapely `contains` excluding boundary
+                # points.
+                water_union = unary_union(geoms).buffer(0.00002)
+
+        # Degrees-per-metre at this bbox's latitude, for a cheap band-membership
+        # test against the coverage-bbox rectangle edges -- a region-scale
+        # approximation, not used for any routing geometry/distance elsewhere.
+        mid_lat = (min_lat + max_lat) / 2.0
+        lat_deg_per_m = 1.0 / 111320.0
+        lon_deg_per_m = 1.0 / (111320.0 * max(0.1, math.cos(math.radians(mid_lat))))
+        band_lat_deg = self.stitch_band_m * lat_deg_per_m
+        band_lon_deg = self.stitch_band_m * lon_deg_per_m
+
+        DEDUPE_RADIUS_M = 25.0  # "small radius" (Section 3.2) -- well under stitch_radius_m/band
+        adopted_coords = [(self.graph.nodes[n]["lon"], self.graph.nodes[n]["lat"])
+                          for n in adopted_ids if n in self.graph]
+        adopted_points_m = None
+        dedupe_utm = None
+        if adopted_coords:
+            dedupe_utm = self._local_utm_crs(Point(adopted_coords[0]))
+            adopted_points_m = gpd.GeoSeries(
+                [Point(c) for c in adopted_coords], crs=self.CRS_WGS84).to_crs(dedupe_utm)
+
+        rows = []
+        skipped_land = 0
+        skipped_dedupe = 0
+        for n, data in self.graph.nodes(data=True):
+            if data.get("node_type") == "inland":
+                continue
+            lon, lat = data["lon"], data["lat"]
+            near_edge = (
+                (lon - min_lon) <= band_lon_deg or (max_lon - lon) <= band_lon_deg or
+                (lat - min_lat) <= band_lat_deg or (max_lat - lat) <= band_lat_deg
+            )
+            if not near_edge:
+                continue
+            if (lon < min_lon - band_lon_deg or lon > max_lon + band_lon_deg or
+                    lat < min_lat - band_lat_deg or lat > max_lat + band_lat_deg):
+                continue  # genuinely outside the coverage bbox -- shouldn't happen
+            if water_union is not None and not water_union.contains(Point(lon, lat)):
+                skipped_land += 1
+                continue
+            if adopted_points_m is not None:
+                p_m = gpd.GeoSeries([Point(lon, lat)], crs=self.CRS_WGS84).to_crs(dedupe_utm).iloc[0]
+                if adopted_points_m.distance(p_m).min() <= DEDUPE_RADIUS_M:
+                    skipped_dedupe += 1
+                    continue
+            rows.append({
+                "node_id": n, "lon": lon, "lat": lat,
+                "node_kind_id": data.get("node_kind_id", NODE_KIND_POINT),
+                "node_depth": data.get("node_depth", -1),
+                "source_region": self.region_name,
+            })
+
+        if not rows:
+            logger.info("Seam registry publish pass: 0 boundary nodes to publish.")
+            return
+
+        with SeamRegistry(self.stitch_registry_path) as registry:
+            registry.upsert_nodes(rows)
+
+        logger.info(
+            f"Seam registry publish pass: {len(rows)} boundary nodes upserted into "
+            f"'{self.stitch_registry_path}' (source_region={self.region_name!r}; "
+            f"{skipped_land} skipped as on land, {skipped_dedupe} skipped as within "
+            f"{DEDUPE_RADIUS_M:.0f}m of a node this build adopted)."
+        )
+
     def _compute_node_depths(self):
         depare_gdf = self.gdfs.get("depth_areas", gpd.GeoDataFrame())
         if depare_gdf.empty:
@@ -3643,7 +3944,35 @@ if __name__ == "__main__":
                         help="Dataset version string (metadata.dataset_version)")
     parser.add_argument("--depth-ceiling", type=float, default=6.0,
                         help="Depth ceiling (m) for water-body classification (Step B; used from Session 2 onward)")
+    parser.add_argument("--stitch-registry", nargs="?", const="data/seam_registry.sqlite", default="",
+                        help="Enable Round 25 cross-database seam stitching (STITCHING_DESIGN.md "
+                             "Section 3) against the shared global-node registry at this SQLite "
+                             "path. Give a bare flag with no path to use the default "
+                             "'data/seam_registry.sqlite'. Falls back to the SK_ROUTING_STITCH_REGISTRY "
+                             "env var if omitted. Omit entirely (default): stitching is off and "
+                             "behavior is unchanged from before Round 25.")
+    parser.add_argument("--coverage-bbox", default="",
+                        help='"min_lon,min_lat,max_lon,max_lat" -- this region\'s data coverage '
+                             "extent (its clip rectangle, INCLUDING any --overlap-deg expansion "
+                             "already baked into the input GeoJSON). Used only when --stitch-registry "
+                             "is set, for the adopt/publish bbox query and boundary-node detection. "
+                             "Defaults to the union bounds of the loaded GeoJSON layers when omitted.")
+    parser.add_argument("--stitch-band-m", type=float, default=300.0,
+                        help="Publish pass: a graph node within this many metres of the coverage-bbox "
+                             "rectangle edge is a 'boundary node' eligible for publishing to the seam "
+                             "registry (default 300).")
+    parser.add_argument("--stitch-radius-m", type=float, default=500.0,
+                        help="Adopt pass: max distance (m) from an adopted seam node to a native "
+                             "graph node it may connect to (default 500).")
     args = parser.parse_args()
+
+    stitch_registry_path = args.stitch_registry or os.environ.get("SK_ROUTING_STITCH_REGISTRY", "")
+    coverage_bbox = None
+    if args.coverage_bbox:
+        parts = [float(x) for x in args.coverage_bbox.split(",")]
+        if len(parts) != 4:
+            raise SystemExit("--coverage-bbox must be 'min_lon,min_lat,max_lon,max_lat'")
+        coverage_bbox = tuple(parts)
 
     data_sources = {
         "land": os.path.join(args.input_dir, "land_polygons.geojson"),
@@ -3668,5 +3997,9 @@ if __name__ == "__main__":
                                        url=args.url, license=args.license,
                                        copyright=args.copyright,
                                        architecture=args.architecture,
-                                       dataset_version=args.dataset_version)
+                                       dataset_version=args.dataset_version,
+                                       stitch_registry_path=stitch_registry_path,
+                                       coverage_bbox=coverage_bbox,
+                                       stitch_band_m=args.stitch_band_m,
+                                       stitch_radius_m=args.stitch_radius_m)
     pipeline.run_pipeline()

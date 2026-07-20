@@ -13,6 +13,15 @@
 # a state's NOAA ZIP, like Great Lakes/Finger Lakes cells in NY's):
 #   ./build_region.sh <name> --states ME,NH,MA,RI,CT [--source-region us-east-coast]
 #                      [--clip-bbox "min_lon,min_lat,max_lon,max_lat"] [--overlap-deg 0.02]
+#                      [--stitch-registry data/seam_registry.sqlite]
+#
+# Round 25 cross-database seam stitching: pass --stitch-registry to adopt/publish
+# shared seam nodes against a global-node registry SQLite (see STITCHING_DESIGN.md
+# Section 3). When --clip-bbox is also given, the region's --coverage-bbox (passed
+# to nautical_routing_pipeline.py) is derived automatically as --clip-bbox expanded
+# by --overlap-deg -- the same expansion clip_pilot_data.py itself applies, so it
+# matches the actual clipped data extent. Omit --stitch-registry entirely for
+# unchanged single-region behavior.
 #
 # Examples:
 #   ./build_region.sh us-east-coast
@@ -42,6 +51,9 @@ STATES=""
 SOURCE_REGION="us-east-coast"
 CLIP_BBOX=""
 OVERLAP_DEG=""
+STITCH_REGISTRY=""
+STITCH_BAND_M=""
+STITCH_RADIUS_M=""
 while [ $# -gt 0 ]; do
     case "$1" in
         --force) FORCE="--force"; shift ;;
@@ -51,6 +63,9 @@ while [ $# -gt 0 ]; do
         --source-region) SOURCE_REGION="$2"; shift 2 ;;
         --clip-bbox) CLIP_BBOX="$2"; shift 2 ;;
         --overlap-deg) OVERLAP_DEG="$2"; shift 2 ;;
+        --stitch-registry) STITCH_REGISTRY="$2"; shift 2 ;;
+        --stitch-band-m) STITCH_BAND_M="$2"; shift 2 ;;
+        --stitch-radius-m) STITCH_RADIUS_M="$2"; shift 2 ;;
         *) echo "Unknown option: $1" >&2; exit 1 ;;
     esac
 done
@@ -123,6 +138,31 @@ if [ -n "$CLIP_BBOX" ]; then
     GEOJSON_DIR="$CLIPPED_DIR"
 fi
 
+STITCH_ARGS=()
+if [ -n "$STITCH_REGISTRY" ]; then
+    STITCH_ARGS+=(--stitch-registry "$STITCH_REGISTRY")
+    if [ -n "$CLIP_BBOX" ]; then
+        # Coverage bbox = --clip-bbox expanded by --overlap-deg -- the SAME
+        # expansion clip_pilot_data.py itself applies before writing the
+        # GeoJSON this build reads, so it matches the actual clipped data
+        # extent (Round 25, STITCHING_DESIGN.md Section 3.5).
+        COVERAGE_BBOX=$("$PYTHON" - "$CLIP_BBOX" "${OVERLAP_DEG:-0}" <<'PYEOF'
+import sys
+b = [float(x) for x in sys.argv[1].split(",")]
+o = float(sys.argv[2] or 0)
+print(f"{b[0]-o},{b[1]-o},{b[2]+o},{b[3]+o}")
+PYEOF
+)
+        STITCH_ARGS+=(--coverage-bbox "$COVERAGE_BBOX")
+    fi
+    if [ -n "$STITCH_BAND_M" ]; then
+        STITCH_ARGS+=(--stitch-band-m "$STITCH_BAND_M")
+    fi
+    if [ -n "$STITCH_RADIUS_M" ]; then
+        STITCH_ARGS+=(--stitch-radius-m "$STITCH_RADIUS_M")
+    fi
+fi
+
 step "3/3 build routing graph -> $OUTPUT"
 time "$PYTHON" nautical_routing_pipeline.py \
     --input-dir "$GEOJSON_DIR" \
@@ -135,6 +175,7 @@ time "$PYTHON" nautical_routing_pipeline.py \
     --license "Public Domain (NOAA)" \
     --copyright "NOAA Office of Coast Survey" \
     --depth-ceiling "$DEPTH_CEILING" \
+    "${STITCH_ARGS[@]}" \
     2>&1 | tee "${LOG_PREFIX}_build.log"
 
 echo
