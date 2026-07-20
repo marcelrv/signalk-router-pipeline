@@ -3258,6 +3258,75 @@ promoted to primary). A global *tiling* grid (R23 cut-lines across files)
 remains a possible long-term alternative but is un-de-risked and doesn't
 cleanly handle extent-dependent skeleton nodes.
 
+### Chunk 2 RESULT (2026-07-20, probe on branch `round25-stitch-chunk2-globaltile-probe`, not merged) — global cut line helps a lot, still not a clean go
+
+Tested the "un-de-risked" alternative Chunk 1 flagged: an **absolute/global**
+tiling grid (`_tile_navmesh_piece` cutting on world-coordinate lines —
+multiples of the tile size from a fixed metre-CRS origin — instead of R23's
+per-piece-relative `minx + i*width/nx`), gated behind
+`SK_ROUTING_GLOBAL_TILE_GRID_PROBE=1` / `SK_ROUTING_NAVMESH_TILE_MAX_EXTENT_M`
+(both env-only, default off, shipped behavior unchanged). Two overlapping
+Zeeland clips (`--bbox "3.75,51.50,3.975,51.68"` / `"3.975,51.50,4.20,51.68"`,
+both `--overlap-deg 0.03`, same source GeoJSON), built with a 3km probe tile
+size, both independently produced a real navmesh tile cut on the identical
+global line **x=567000 (UTM31N/EPSG:32631 easting, ≈lon 3.966°E)** — confirmed
+directly from each build's own piece-bounds logging, not inferred.
+
+**On that shared line** (nodes within 1.5m of the line — sub-1.1m tolerance,
+since 5-decimal-degree rounding is ~1.1m):
+- **Navmesh/tile-seam nodes: 2/4 shared (50.0%)** — 12.5x Chunk 1's 4.0%
+  band-wide baseline. One of the two misses is a genuine **sub-meter
+  floating-point rounding-boundary flip**: west computed lat 51.53000, east
+  computed lat 51.52999 for what's the same real-world cut-line/coastline
+  intersection — exactly the failure mode `_tile_navmesh_piece`'s own
+  docstring already warns about ("two separate GEOS calls computing the same
+  intersection independently are not guaranteed to land on identical
+  floating-point coordinates"), now demonstrated to also bite **across**
+  builds on an absolute grid, not just within one (R23 only solved the
+  within-one-build case via a single noding pass).
+- **Skeleton nodes: none landed within tight tolerance on this line in
+  either build**; at a loose 25m tolerance, west had 4 and east had 6
+  nearby, **zero shared** — consistent with Chunk 1's finding that
+  skeleton/medial-axis nodes never coincide across builds. Expected
+  architecturally: `_tile_navmesh_piece` only ever runs on navmesh-eligible
+  ("wide") pieces — skeleton (narrow-channel) generation is never gridded or
+  tiled at all, so a global grid gives it zero help by construction.
+- **A second, independently-shared global line (y=5709000) showed a
+  different, more structural failure mode**: only 1/4 nodes shared, and 3 of
+  the 4 unmatched nodes belonged to a piece that only exists in the east
+  build at all (its own overall piece decomposition — from
+  `_split_wide_narrow`/`_split_deep_shallow`/the tiling-need gate — extends
+  further east than west's equivalent piece, since each build's water-body
+  extent differs by clip footprint, same root cause as Chunk 1's "processing
+  runs on the whole connected component, whose extent differs between
+  clips"). This is not a coordinate-rounding miss — it's the global grid
+  *not even attempting a matching cut* in both builds, because whether a
+  piece needs tiling *at all*, and which global lines end up inside its
+  bbox, both depend on each build's own independently-computed piece
+  geometry.
+
+**Go/no-go: not a clean go, but a real, quantified improvement over plain
+overlap.** A shared global cut line raises navmesh seam-node coincidence
+~12.5x (4%→50%) — the core geometric premise (same world-coordinate cut ⇒
+same rounded ID) does mostly hold — but two residual gaps mean it can't be
+the *sole* stitching mechanism: (1) sub-meter FP rounding-boundary misses
+persist even on a genuinely shared cut, and (2) whether a global line gets
+cut *at all* in both builds is contingent on both builds' independent
+piece-decomposition agreeing, which a shared grid alone doesn't guarantee.
+**Skeleton seams get zero benefit from global tiling by construction** —
+skeleton generation is never gridded — so skeleton seams remain entirely
+dependent on the runtime proximity matcher (or a still-hypothetical,
+unbuilt deterministic skeleton-cutting mechanism) regardless of this
+result. **This refines rather than overturns Chunk 1's conclusion**: the
+runtime proximity matcher stays primary; global tiling is a plausible
+*supplementary* hardening for navmesh seams specifically (fewer nodes the
+runtime matcher needs to bridge), not a replacement for it, and would need
+its own fix for the FP-rounding-boundary case (e.g. snapping cut-line
+intersection coordinates to the grid's own exact value instead of trusting
+GEOS's independently-computed intersection) before it's worth shipping.
+Probe code kept on its own branch, gated fully off by default
+(`GLOBAL_TILE_GRID_PROBE`/env-only), not merged to main.
+
 ### Sequencing
 
 Tasks 1–2 land early and together — they must ship before/with the US East

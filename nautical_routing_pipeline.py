@@ -340,7 +340,11 @@ NAVMESH_BOUNDARY_SIMPLIFY_M = 5.0   # build_navmesh_region: a separate, coarser 
                                      # moves a retained
                                      # one, so exact-coordinate seam matching in build_navmesh_region
                                      # still works correctly on whatever seam vertices survive.
-NAVMESH_TILE_MAX_EXTENT_M = 10_000  # build_network: a navmesh-eligible deep piece whose bbox
+NAVMESH_TILE_MAX_EXTENT_M = int(os.environ.get(  # Round 25 Chunk 2 PROBE: env-override so the
+    "SK_ROUTING_NAVMESH_TILE_MAX_EXTENT_M", 10_000))  # global-tile-grid probe can force a small
+                                     # tile size (e.g. 2-3km) without changing the shipped 10km
+                                     # default for real builds. See GLOBAL_TILE_GRID_PROBE above.
+                                     # build_network: a navmesh-eligible deep piece whose bbox
                                      # extent (or post-NAVMESH_BOUNDARY_SIMPLIFY_M boundary vertex
                                      # count) exceeds this gets tiled into a grid of pieces at most
                                      # this wide/tall (in the piece's own local UTM CRS) before
@@ -381,6 +385,21 @@ NAVMESH_TILE_MAX_VERTICES = 1_500   # build_network: second (OR'd) tiling gate -
                                      # carry a very dense boundary (many islands/reefs), so also tile
                                      # whenever the post-NAVMESH_BOUNDARY_SIMPLIFY_M boundary vertex
                                      # count alone would exceed this, independent of raw extent.
+
+# --- Round 25 Chunk 2 PROBE: absolute/global tiling grid, NOT shipped behaviour ---
+# _tile_navmesh_piece normally cuts a piece on lines placed RELATIVE to that piece's
+# own bbox (`minx + i*width/nx`) -- deterministic within one build (R23's single
+# unary_union+polygonize noding pass), but two INDEPENDENTLY built adjacent pieces
+# cut on different lines, since their bboxes differ. This flag (env-var gated so it
+# can never accidentally leak into a real build) switches the grid to ABSOLUTE
+# world-coordinate lines -- multiples of the tile size from a fixed metre-CRS origin
+# -- so that two overlapping pieces sharing a real stretch of water and (per
+# `_local_utm_crs`'s per-component `estimate_utm_crs`) the same local UTM zone will
+# reference the literal same cut-line constant. Tests whether that's enough for
+# cross-build seam-node ID coincidence on the shared line (see NEXT_PHASES.md,
+# "Chunk 2 — global cut line probe"). Defaults off; the shipped per-piece-relative
+# grid is unaffected unless SK_ROUTING_GLOBAL_TILE_GRID_PROBE=1 is set.
+GLOBAL_TILE_GRID_PROBE = os.environ.get("SK_ROUTING_GLOBAL_TILE_GRID_PROBE") == "1"
 
 # --- Round 14: inland-waterway x navmesh-region boundary crossings ---
 # Fix for the confirmed bug: _ensure_coastal_connectivity's candidate node set is
@@ -1178,20 +1197,40 @@ class NauticalRoutingPipeline:
         if not needs_tiling:
             return [(poly_m, set())], []
 
-        nx = max(1, math.ceil(width / max_extent_m))
-        ny = max(1, math.ceil(height / max_extent_m))
-        if nx <= 1 and ny <= 1:
-            # Vertex-count-only trigger with a bbox already under max_extent_m: a grid
-            # split would just hand back the same single piece (nx=ny=1) -- nothing
-            # to gain here. build_navmesh_region's own NAVMESH_PSLG_BUDGET retry/
-            # simplify loop is the fallback for an over-dense boundary this small.
-            return [(poly_m, set())], []
+        if GLOBAL_TILE_GRID_PROBE:
+            # PROBE grid: interior cut lines are multiples of max_extent_m from a
+            # fixed world origin (0,0) in this piece's own projected metre CRS,
+            # rather than `minx + i*width/nx` relative to the piece's own bbox.
+            # Whichever global lines fall strictly inside the bbox are used --
+            # count and spacing are a function of world position, not this piece.
+            def _global_interior_lines(lo, hi, step):
+                first_k = math.floor(lo / step) + 1
+                last_k = math.ceil(hi / step) - 1
+                return [k * step for k in range(int(first_k), int(last_k) + 1)]
 
-        xs = [minx + i * width / nx for i in range(nx + 1)]
-        ys = [miny + j * height / ny for j in range(ny + 1)]
+            xs_interior = _global_interior_lines(minx, maxx, max_extent_m)
+            ys_interior = _global_interior_lines(miny, maxy, max_extent_m)
+            if not xs_interior and not ys_interior:
+                # No global grid line actually crosses this piece -- nothing to cut.
+                return [(poly_m, set())], []
+            nx, ny = len(xs_interior) + 1, len(ys_interior) + 1
+        else:
+            nx = max(1, math.ceil(width / max_extent_m))
+            ny = max(1, math.ceil(height / max_extent_m))
+            if nx <= 1 and ny <= 1:
+                # Vertex-count-only trigger with a bbox already under max_extent_m: a grid
+                # split would just hand back the same single piece (nx=ny=1) -- nothing
+                # to gain here. build_navmesh_region's own NAVMESH_PSLG_BUDGET retry/
+                # simplify loop is the fallback for an over-dense boundary this small.
+                return [(poly_m, set())], []
+            xs = [minx + i * width / nx for i in range(nx + 1)]
+            ys = [miny + j * height / ny for j in range(ny + 1)]
+            xs_interior = xs[1:-1]
+            ys_interior = ys[1:-1]
+
         pad = max(width, height) * 0.01 + 10.0  # past the bbox so a grid line fully crosses it
-        grid_lines = [LineString([(x, miny - pad), (x, maxy + pad)]) for x in xs[1:-1]]
-        grid_lines += [LineString([(minx - pad, y), (maxx + pad, y)]) for y in ys[1:-1]]
+        grid_lines = [LineString([(x, miny - pad), (x, maxy + pad)]) for x in xs_interior]
+        grid_lines += [LineString([(minx - pad, y), (maxx + pad, y)]) for y in ys_interior]
 
         boundary_lines = [poly_m.exterior] + list(poly_m.interiors)
         try:
@@ -1209,8 +1248,8 @@ class NauticalRoutingPipeline:
                             "leaving it untiled.")
             return [(poly_m, set())], []
 
-        grid_x_set = {round(x, 3) for x in xs[1:-1]}
-        grid_y_set = {round(y, 3) for y in ys[1:-1]}
+        grid_x_set = {round(x, 3) for x in xs_interior}
+        grid_y_set = {round(y, 3) for y in ys_interior}
 
         tiles, reclassified = [], []
         for face in raw_tiles:
