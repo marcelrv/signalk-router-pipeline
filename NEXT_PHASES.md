@@ -3121,6 +3121,13 @@ stitching) remains the open Phase 3e design item.
 
 ## Next milestone — US East Coast multi-region routing (Round 25 brief; cross-repo)
 
+> **The stitching-mechanism decision is consolidated in
+> [`STITCHING_DESIGN.md`](STITCHING_DESIGN.md)** (for review) — it records
+> the two de-risking experiments (Chunk 1: overlap/grid-snap → 4%; Chunk 2:
+> global tiling → 50% navmesh / 0% skeleton), why build-time coincidence was
+> rejected, and the recommended runtime proximity matcher. Read that first;
+> the Chunk 1/2 RESULT notes below are the raw experiment logs it summarizes.
+
 **Decided 2026-07-20** (priority review of `PHASE_3_DESIGN.md` /
 `PHASE_4_DESIGN.md`). This closes out **Round 22's PR-C** (cross-map
 stitching) — the last open Phase 3e item — now that it is a live blocker:
