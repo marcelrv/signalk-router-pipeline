@@ -642,6 +642,7 @@ class NauticalRoutingPipeline:
         self.build_network()
         self._add_opening_bridge_edges()
         self._add_lock_crossing_edges()
+        self._mark_edges_inside_locks()
         self._sanity_check_no_land_crossings()
         self._ensure_coastal_connectivity()
         # Adopt pass runs BEFORE calculate_edge_attributes so the new
@@ -2831,6 +2832,17 @@ class NauticalRoutingPipeline:
 
         logger.info(f"Added {added} precise bridge opening edges.")
 
+    @staticmethod
+    def _lock_polygon_name(row):
+        """The lock's name, or None. A LOKBSN feature with no name cannot be
+        told apart from the mis-tagged ones in this source, so both lock passes
+        use this as their evidence that the polygon is a real lock."""
+        for key in ("OBJNAM", "objnam", "name", "NOBJNM"):
+            val = row.get(key) if hasattr(row, "get") else None
+            if isinstance(val, str) and val.strip():
+                return val.strip()
+        return None
+
     def _add_lock_crossing_edges(self):
         """Creates real connectivity across each lock chamber, mirroring
         `_add_opening_bridge_edges`'s precise-opening-point pattern
@@ -2877,6 +2889,7 @@ class NauticalRoutingPipeline:
         transit_added = 0
         fallback_count = 0
         lock_count = 0
+        skipped_unnamed = 0
 
         # Same two layers, same reasoning, as _add_opening_bridge_edges.
         fw_gdfs = []
@@ -2889,6 +2902,16 @@ class NauticalRoutingPipeline:
         for lock_idx, row in locks_gdf.iterrows():
             lock_geom = row.geometry
             if lock_geom is None or lock_geom.is_empty:
+                continue
+            # Named polygons only, for the reason spelled out in
+            # _mark_edges_inside_locks: LOKBSN here carries features that are
+            # not locks at all -- a 66 m2 polygon at Oude Tonge where there is
+            # none, against 249 m2 for the smallest real one -- and an unnamed
+            # feature gives nothing to tell them apart by. Building transit
+            # edges for one invents a lock, and a route through it is then
+            # charged an hour that does not exist.
+            if not self._lock_polygon_name(row):
+                skipped_unnamed += 1
                 continue
             lock_count += 1
             lock_id = int(lock_idx) + 1  # opaque per-lock marker value, not a pois FK
@@ -3012,7 +3035,69 @@ class NauticalRoutingPipeline:
                     transit_added += 2
 
         logger.info(f"Added {added} lock crossing edges ({transit_added} chamber-transit) "
-                    f"across {lock_count} lock polygons ({fallback_count} single-node fallback).")
+                    f"across {lock_count} named lock polygons ({fallback_count} single-node "
+                    f"fallback, {skipped_unnamed} unnamed polygons skipped).")
+
+    def _mark_edges_inside_locks(self):
+        """Tag every edge that runs through a lock chamber, not just the transit
+        edge this pipeline builds for it.
+
+        `_add_lock_crossing_edges` derives its entry/exit pair from where a
+        fairway or waterway centreline crosses the lock polygon's boundary. Where
+        the centreline does not line up with the chamber -- the two-of-seventeen
+        fallback case that method documents, and any lock the skeletonised
+        network reaches by a different edge -- a route can pass straight through
+        the chamber on edges carrying no lock marking at all. Observed on
+        Krammersluizen: a route demonstrably inside the polygon, charged as an
+        opening bridge because nothing on its path said "lock".
+
+        Named polygons only. LOKBSN in this source is not reliable enough to
+        trust unnamed features: the smallest named lock here is 249 m2, while
+        unnamed ones include a 66 m2 feature at Oude Tonge where there is no lock
+        at all. Marking by geometry would spread that error across every edge
+        near it, so a name is required as the evidence that the polygon is real.
+        A lock the charts omit entirely -- Grevelingensluis, which appears only
+        as its bridges -- is not solvable here and belongs in the manual
+        override data instead.
+        """
+        locks_gdf = self.gdfs.get("locks", gpd.GeoDataFrame())
+        if locks_gdf.empty:
+            return
+
+        named = [
+            (idx, row) for idx, row in locks_gdf.iterrows()
+            if self._lock_polygon_name(row)
+        ]
+        if not named:
+            logger.info("No named lock polygons — skipping in-chamber edge marking")
+            return
+
+        marked = 0
+        for lock_idx, row in named:
+            geom = row.geometry
+            if geom is None or geom.is_empty:
+                continue
+            # Same opaque marker _add_lock_crossing_edges uses, so an edge it
+            # already tagged and one tagged here name the same lock.
+            lock_id = int(lock_idx) + 1
+            minx, miny, maxx, maxy = geom.bounds
+            for u, v, data in self.graph.edges(data=True):
+                if data.get("requires_lock"):
+                    continue
+                nu, nv = self.graph.nodes[u], self.graph.nodes[v]
+                # Cheap bbox reject before the real intersection test: a lock is
+                # metres across and the graph has hundreds of thousands of edges.
+                if (max(nu["lon"], nv["lon"]) < minx or min(nu["lon"], nv["lon"]) > maxx
+                        or max(nu["lat"], nv["lat"]) < miny or min(nu["lat"], nv["lat"]) > maxy):
+                    continue
+                seg = LineString([(nu["lon"], nu["lat"]), (nv["lon"], nv["lat"])])
+                if geom.intersects(seg):
+                    data["requires_lock"] = True
+                    data["lock_id"] = lock_id
+                    marked += 1
+        logger.info(
+            f"Marked {marked} existing edge(s) as passing through {len(named)} named lock(s)"
+        )
 
     def _sanity_check_no_land_crossings(self):
         """Step F — land-crossing safety, retired as load-bearing for skeleton edges.
