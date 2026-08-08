@@ -3721,3 +3721,54 @@ number in §8–§10 was taken at 2.3 m required depth because of the falsy-zero
 draft. The connectivity conclusions are unaffected (graph reachability never
 consults vessel dimensions), but route-parity ratios from those sections were
 measured under that implicit constraint.
+
+### 2026-08-08 — MA, VA and NC built: they never needed a sub-split, they needed a clip
+
+The 2026-07-20 conclusion that these three "need a further geographic sub-split
+(Cape Cod Canal, Chesapeake Bay Bridge-Tunnel, Cape Lookout)" was **wrong**.
+Calibration first: Maine builds fine at **6.5M water vertices**, more than any
+of them (MA 2.9M, VA 3.8M, NC 1.8M) — size was never the problem. Their NOAA
+ZIPs span **7–9° of longitude** of offshore cells, so the whole extent fuses
+into one enormous water component: the same failure class as the original
+whole-East-Coast attempt, and the same fix New York already had — clip to the
+real coastal band.
+
+Driver: `local_only/local_scripts/build_missing_regions.sh` (clip → build →
+sub-split only as a fallback, which never fired).
+
+| region | clip bbox | nodes | edges | size | time | lowest free mem |
+|---|---|---|---|---|---|---|
+| Massachusetts | −71.70,41.10,−69.80,43.00 | 59,698 | 148,399 | 36 MB | 450 s | 6.7 GB |
+| Virginia | −77.60,36.40,−75.20,39.10 | 130,588 | 289,875 | 62 MB | 1502 s | 2.2 GB |
+| North Carolina | −78.80,33.60,−75.20,36.70 | 91,496 | 214,825 | 61 MB | 1016 s | 6.6 GB |
+
+**Coverage is now a single Maine-to-Georgia chain** — 12 files, 13 states, no
+gaps. Each new region adopted its already-built neighbours' seam nodes (MA 1,432
+adopted, VA 301, NC 623) and published its own (MA 3,061, VA 1,518, NC 2,461).
+
+**Cross-state routes, all 11 adjacent pairs: 10 genuinely routed.**
+ME↔NH ×1.10, **NH↔MA ×1.09**, MA↔RI ×5.01, RI↔CT ×1.30, CT↔NY ×1.58,
+NY↔NJ ×1.78, NJ↔DE ×1.14, DE↔MD ×1.05, **MD↔VA ×1.15**, VA↔NC *(throws)*,
+**NC↔SC+GA ×1.50**.
+
+**Watchdog note for anyone reusing the driver:** its first version summed
+`ps -o rss=` over the build and its 4 multiprocessing workers, which
+double-counts shared copy-on-write pages — it read 14.2 GB on a 15 GB box and
+killed a perfectly healthy Massachusetts build. It now watches
+`/proc/meminfo` `MemAvailable` instead, which is what actually decides whether
+the OOM killer wakes.
+
+#### Two follow-ups this surfaced
+
+1. **VA↔NC throws a routeiq invariant error**, not a data problem:
+   *"No route found — graph is connected but A* could not find a path. This
+   should not happen with soft constraints enabled."* Verified with
+   `diagnose_pair_path.mjs`: a clean **14,940 m** path exists (×1.39 of the
+   10,720 m straight line, 229 nodes, longest leg 114 m, all inside a
+   0.10°×0.03° box in the ICW behind the Outer Banks), and **none of its 228
+   edges is hard-blocked** — `crosses_land=0`, `crosses_obstacle=0`,
+   `requires_lock=0`; 105 are merely shallow, which is soft. So A* is failing on
+   a path it should traverse. routeiq-side, needs its own investigation.
+2. **MA↔RI routes ×5.01** (127.5 km for a 25.5 km straight line), no warnings —
+   the same shape of question the NY↔NJ ×13 detour turned out to be, and worth
+   the same treatment now that the tooling exists.
