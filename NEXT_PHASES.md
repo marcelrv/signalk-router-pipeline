@@ -3700,3 +3700,24 @@ and `diagnose_engine_route.mjs`. Chain of evidence, endpoint to endpoint:
 `safetyMarginDraft` 0.3). Every "unconstrained vessel" measurement in Sections
 8–10 was actually made at 2.3 m required depth. It did not cause this detour —
 all configurations give 242 km — but it should be `??`, not `||`.
+
+### 2026-08-08 — Detour fixed at both ends; East Coast rebuilt again
+
+`STITCHING_DESIGN.md` §10.8. Pipeline `5931458` emits `min_depth = -1` for
+coarse DEPARE bands (DRVAL1=0 with DRVAL2 ≥ 10 m) instead of a literal 0;
+routeiq `285bb3a` bounds the penalized retry with `maxPenaltyDetourRatio` (3.0)
+and fixes the `(dims.draft || 2.0)` falsy-zero that made draft 0 mean a 2 m
+draft. NY↔NJ: **242,299 m → 25,589 m, ×13.16 → ×1.39**, zero violating metres.
+
+Full rebuild done (~65 min). Depth reclassification discriminates by region as
+intended — NH 73.9% of edges now `unknown`, RI 42.2%, NY 21.5%, but DE, MD and
+SC+GA reclassify **nothing**, their shallows being genuine 0–2 m marsh/ICW.
+Cross-state routes 6/6 genuinely routed: ME↔NH ×1.10, RI↔CT ×1.30 (a real
+14 km route, previously degenerate at 159 m), CT↔NY ×1.58, NY↔NJ ×1.78,
+NJ↔DE ×1.14, DE↔MD ×1.05.
+
+**Worth knowing for any future measurement:** every "unconstrained vessel"
+number in §8–§10 was taken at 2.3 m required depth because of the falsy-zero
+draft. The connectivity conclusions are unaffected (graph reachability never
+consults vessel dimensions), but route-parity ratios from those sections were
+measured under that implicit constraint.

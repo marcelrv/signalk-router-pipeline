@@ -685,3 +685,57 @@ Two results are **not** wins and should not be read as such:
   attributable to this fix (the endpoints differ from the earlier run, which
   scored ×3.55), but it is the clearest remaining routing-quality defect in the
   set and deserves its own investigation.
+
+### 10.8 Detour fixed at both ends (2026-08-08): 242 km → 25.6 km
+
+§10.7 left NY↔NJ routing ×13.16. It was never a stitching defect — the merged
+graph always held a clean 27.4 km cross-seam path. Two independent causes, one
+per repo, both now fixed:
+
+**Pipeline (`5931458`) — coarse DEPARE bands read as literal 0 m.** DRVAL1 is a
+depth *band floor*; offshore the sole containing band is routinely
+`DRVAL1=0, DRVAL2=18.2`. Taking 0 as the edge minimum marked open water
+impassable. Now a zero reading is emitted as `UNKNOWN_DEPTH` (−1, which
+consumers exclude from constraint checks) only when **every** zero-reading
+sample on that edge came from a band at least `COARSE_DEPTH_BAND_DRVAL2_M`
+(10 m) deep; one genuine 0–2 m or drying reading still pins a hard 0, and a
+charted obstruction sounding still overrides −1.
+
+**routeiq (`285bb3a`) — the penalized retry was unbounded.** `isBetterCandidate`
+ordered strictly by violating metres, so a fully-compliant route beat a shorter
+one at *any* length. `maxPenaltyDetourRatio` (default 3.0) bounds the trade;
+past it the shorter route wins and its violations surface as `via_constrained`
+warnings rather than being hidden behind a 200 km detour. Also fixed there:
+`(dims.draft || 2.0)` treated a **draft of 0 as 2.0 m** — so every
+"unconstrained vessel" measurement in §8–§10 was really taken at 2.3 m required
+depth. Nine call sites, plus the same falsy-zero on beam and on api.ts's safety
+margins, switched to `??`. 131/131 routeiq tests pass.
+
+Effect on the NY↔NJ request, straight line 18,406 m:
+
+| | route | ratio | warnings |
+|---|---|---|---|
+| before | 242,299 m | ×13.16 | none (the shallow water was hidden) |
+| routeiq cap only | 41,643 m | ×2.26 | `via_constrained(2,980 m)` |
+| both fixes | **25,589 m** | **×1.39** | none — zero violating metres |
+
+**Depth attribution after a full rebuild**, `min_depth=0` → `unknown(−1)`:
+NH 2.6%/73.9%, RI 2.3%/42.2%, CT 18.3%/32.8%, NY 19.8%/21.5%, ME 12.9%/14.4%,
+NJ 30.3%/4.1% — and **DE 42.9%, MD 57.9%, SC+GA 46.9% unchanged with 0%
+reclassified**, because their shallow water is genuine 0–2 m marsh, Chesapeake
+and ICW rather than coarse offshore bands. The fix discriminates rather than
+blanket-clearing, which is the point.
+
+**Cross-state routes after the rebuild — 6/6 genuinely routed:**
+
+| pair | §10.7 | now |
+|---|---|---|
+| ME ↔ NH | ×1.17 | ×1.10 |
+| RI ↔ CT | 159 m (degenerate) | 13,989 m ×1.30 — a representative route at last |
+| CT ↔ NY | ×1.49 | ×1.58, `via_constrained(735 m)` reported |
+| NY ↔ NJ | ×13.16 | **×1.78** |
+| NJ ↔ DE | ×1.14 | ×1.14 |
+| DE ↔ MD | ×1.08 | ×1.05 |
+
+CT↔NY's warning is the bounded retry behaving as designed: it keeps the short
+route and reports 735 m of constrained water instead of detouring around it.
