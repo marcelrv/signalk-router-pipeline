@@ -3490,3 +3490,166 @@ avoids paying for regions you're not near, but a Pi-class deployment
 sitting near a genuinely large/complex region (Maine, Chesapeake) still
 needs real headroom for that one region's load, not just "small files are
 automatically cheap."
+
+## 2026-07-30 — Round 25 §6 seam-route regression finally run: the seam crosses, but the registry is not what makes it cross
+
+Full result and numbers: **`STITCHING_DESIGN.md` §8**. Summary of what
+changed in the picture:
+
+- **`STITCHING_DESIGN.md` §6's primary regression passes** for the
+  registry-built overlapping pair: three cross-seam endpoint pairs all route
+  across the seam and match a single-file baseline within 0.6–17.1%. The
+  crossing is verified on the merged in-memory graph (node-ownership
+  `W…S…E`, 96.7% of the far file's exclusive nodes reachable), not on the
+  returned polyline — which can't show it, since `routing.ts` expands
+  `edge_kind_id=1` edges into funnel `path_points` and smooths.
+- **Every control passes too**, including **abutting (zero-overlap) clips
+  with no registry**. Cause: `clip_pilot_data.py` cuts both sides on the same
+  meridian, so both files get identical boundary vertices there; where those
+  become graph nodes they hash to identical ids and routeiq's existing merge
+  unions them. Connectivity needs *one* shared node per water body — which is
+  what Chunk 1's "4.0% coincidence" number obscured (it measured a fraction
+  routing doesn't care about). Registry contribution measured: shared ids
+  60 → 211, far-side reachability unchanged 96.7% → 96.7%.
+- **Caveat, do not over-read this**: one seam, in wide water, with dense ENC
+  vertices along the cut. A seam through a narrow skeleton channel or sparse
+  open water may share nothing — the registry's actual case, still untested.
+- **Pipeline bug found and fixed** (working tree): `_connect_adopted_node`
+  passed `numpy.int64` ids from a pandas index into networkx, and sqlite3
+  binds numpy scalars via the buffer protocol → 273 `edges.target` rows in
+  the 2026-07-20 `east_stitched.sqlite` were 8-byte **BLOBs**, i.e. every
+  adopt-pass connector edge was one-way after routeiq dropped them. `int()`
+  at the source + an `int()` guardrail on all ids at export; rebuilt pair is
+  clean.
+- **routeiq gap now measured, not suspected**: the coincident-node merge
+  unions edges correctly but never de-duplicates — 62/211 shared nodes carry
+  118 duplicate adjacency entries.
+
+Harness (reusable, gitignored with the other Round 25 scratch):
+`local_only/local_scripts/round25_seamroute/` — `pick_seam_endpoints.py`
+(picks known-routable cross-seam pairs off a single-file baseline),
+`run_seam_route_test.mjs` (five configs: baseline, overlap ±registry,
+abutting ±registry; route parity + graph crossing probe + edge-union check),
+`seam_route_results.json` (raw numbers), `fixed/` and `abut/` (the rebuilt
+fixtures).
+
+### Same day — the two untested seam classes, measured: the registry earns its keep offshore
+
+Full detail: `STITCHING_DESIGN.md` §9. Two new cases, built with the
+now-parameterized harness (`build_seam_case.py <name> <seamLon> <latMin>
+<latMax> [halfWidth]`, then `run_seam_route_test.mjs cases/<name>`):
+
+- **Narrow channel** (lon 4.70, a ~120 m waterway): crosses in all four
+  configs, ×1.000–1.001 of baseline. The abutting no-registry pair shares
+  **exactly one** node — at lon 4.70 exactly, `node_kind_id=0` — and that one
+  node carries the crossing. Same mechanism as the wide-water fixture.
+- **Sparse open water** (lon 5.33, IJsselmeer, 13.5 km wide, nearest source
+  vertex 5.6 km from the cut): **without the registry there is no crossing at
+  all** — 0 shared ids, 0/1633 far-side nodes reachable, in both the
+  overlapping and abutting variants. With the registry + overlap: 36 shared
+  ids, 86.3% reachable, a real `W…S…E` path. **This is the case the registry
+  exists for, and it works.** Registry + abutting clips still gives nothing
+  (0 adopted), so `--overlap-deg ≥ stitch_band_m` is a hard requirement.
+- **Route quality across that stitched seam is 1.14–2.10× baseline**, but the
+  fixture is depth-degenerate (`min_depth=0` on ~98% of edges, baseline itself
+  `via_constrained`), so treat the connectivity result as solid and the
+  magnitude as unmeasured until a sparse-water fixture with real DEPARE
+  coverage is built.
+- **Third defect, routeiq: an unstitched seam fails silently.** With no graph
+  crossing, `calculateRoute` still returns a route — it projects the start onto
+  the nearest reachable waterway *on the far side of the seam* and joins it
+  with a straight 3.5–4.6 km leg carrying `minDepth: -1` (constraint checks
+  bypassed), flagged only as `start_connecting`. One such route came back
+  *shorter* than the single-file baseline (×0.89) by cutting the corner. Route
+  distance alone is therefore a useless stitching metric — the graph
+  reachability probe is the instrument. routeiq should distinguish "routed
+  across a seam" from "teleported over a gap".
+
+**Consequence for the US East Coast regeneration:** run it with
+`--stitch-registry` *and* `--overlap-deg` ≥ the stitch band. State-boundary
+meridians run offshore through open sea, which is exactly the class that does
+not self-stitch.
+
+### Same day — US East Coast regenerated with the shared registry (9 regions); all adjacent seams crossable
+
+Full detail and tables: `STITCHING_DESIGN.md` §10.
+
+- All 9 shipped regions rebuilt sequentially north→south against one registry
+  (`data/seam_registry.sqlite`, 10,000 seam nodes), ~55 min, non-destructive
+  (`data/us_east_*_stitched.sqlite`). Driver:
+  `local_only/local_scripts/build_east_coast_stitched.sh` (`RESUME=1` to
+  continue an interrupted run). Preprocessed GeoJSON reused.
+- **All 6 geographically adjacent pairs are crossable** in the merged graph
+  (component labelling, not anchor probes): ME↔NH, RI↔CT, CT↔NY, NY↔NJ, NJ↔DE,
+  DE↔MD. CT↔NY crosses on a *single* shared node. Coverage is three clusters —
+  ME–NH, RI–CT–NY–NJ–DE–MD, SC+GA — because MA/VA/NC are still unbuilt.
+- **5 of 6 return a genuinely routed cross-state route** (NJ↔DE 26.9 km ×1.10,
+  DE↔MD 22.1 km ×2.01, CT↔NY 36.3 km ×1.35, ME↔NH 21.0 km ×1.72, NY↔NJ 53.9 km
+  ×3.55), none teleporting. RI↔CT is crossable but marginal — no exclusive node
+  within 30 km of a shared seam node, so no representative route.
+- **Adoption is very uneven and the publish rule is why.** CT found 1,713 of
+  2,540 candidates *already in its own graph* (free coincidence from shared NOAA
+  cells); MD adopted 478 of which 471 had no native neighbour within 500 m. For
+  unclipped state builds the coverage bbox is the data extent, so the publish
+  pass writes nodes along a *rectangle* whose edges mostly sit offshore or
+  inland rather than on the real seam. **Follow-up: publish against
+  `metadata.boundary_geometry` (already stored) instead of the bbox rectangle,
+  or give every region an explicit `--clip-bbox`.**
+- **Two more defects found and fixed:** (a) the adopt pass did not scale —
+  per-adopted-node whole-component buffering + reprojection stalled NH for >9
+  min; now 193 candidates against 57,891 native nodes in 3.8 s (radius
+  prefilter, per-component projection cache, `sindex.nearest`), with progress
+  logging. (b) `build_region.sh` passed `--coverage-bbox` as two argv entries,
+  which argparse rejects for any negative longitude — the stitching path was
+  broken for *every* US region; fixed to the `=`-form.
+- **Measuring lesson:** single-anchor reachability is not a connectivity test
+  (it reported two crossable pairs as 0%, anchored in isolated ponds); label all
+  components instead. New tools: `verify_region_seams.mjs`,
+  `route_across_regions.mjs`.
+
+### 2026-08-01 — Dangling adopted seam nodes: root cause found, fixed (7 → 263 connections on Maryland)
+
+Detail: `STITCHING_DESIGN.md` §10.6. The §10.3 guess (publish against
+`metadata.boundary_geometry` instead of the bbox rectangle) was **wrong** —
+that field is a convex hull of the graph's nodes, and the published nodes were
+already in the right places (421 of MD's 478 had a coastal MD node within 500 m
+yet only 7 connected).
+
+Real cause: `_connect_adopted_node`'s `within(poly_m)` gate needs the whole
+connector, *including the adopted node itself*, inside this build's water
+polygon buffered by a flat 2 m — but an adopted node comes from the neighbour's
+ENC geometry and lands slightly outside: **406 of 478 outside MD's own water,
+median 11.3 m**, only 14 within 2 m. The gate therefore failed before any
+candidate was scored. Fixed with `ADOPT_POLY_TOLERANCE_M = 50.0`, applied only
+to nodes that are outside (inside nodes keep the old tight buffer);
+`_crosses_land` still gates land crossings. Per-reason counters were added to
+the adopt pass so this class of failure is visible in the log in future.
+
+Result on a Maryland rebuild: connections **7 → 263** of 478; DE↔MD shared nodes
+with edges in both files **29 → 277**; cross-seam route detour **×2.01 → ×1.05**.
+New Hampshire's dangling nodes are a *different*, unfixable class (113 of 127
+have no node of any kind within 500 m — water NH simply does not cover).
+
+**Not yet done: the 9 shipped `*_stitched.sqlite` regions predate this fix.** A
+full rebuild (~1 h, `RESUME=0`) is needed for the improvement to reach them.
+
+### Same day — full East Coast rebuild with the adopt-tolerance fix
+
+Detail: `STITCHING_DESIGN.md` §10.7. All 9 regions rebuilt from scratch (~67 min,
+registry 10,004 nodes). Maryland's adopt connections **7 → 265**, its polygon-gate
+rejections **392 → 2**; DE↔MD shared nodes carrying edges into both files
+**29 → 279**. Seam connectivity unchanged at 9/12 pairs with all six real
+neighbours crossable; cross-state routes **6/6 genuinely routed with zero
+warnings** (was 6/6 with four carrying connector/constraint warnings), and
+detours improved on ME↔NH (×1.72→×1.17) and DE↔MD (×2.01→×1.08).
+
+Everywhere except Maryland the dominant remaining unconnected reason is now
+`no_node_of_any_kind_in_radius` (CT 820, NJ 2,701, NH 117) — nodes published
+into water the adopter does not cover. Structural, harmless, not worth chasing.
+
+**Two things still open:** RI↔CT's demo route is degenerate (endpoints 97 m
+apart) so that seam is still undemonstrated end-to-end; and **NY↔NJ routes
+×13.16 — 242 km for an 18.4 km straight line, Jamaica Bay to offshore Sandy
+Hook, with no warnings.** That is a real graph path implying the direct exit via
+Rockaway Inlet is unconnected; it is the clearest routing-quality defect left in
+the set and needs its own investigation.
