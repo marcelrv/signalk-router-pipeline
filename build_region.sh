@@ -153,7 +153,12 @@ o = float(sys.argv[2] or 0)
 print(f"{b[0]-o},{b[1]-o},{b[2]+o},{b[3]+o}")
 PYEOF
 )
-        STITCH_ARGS+=(--coverage-bbox "$COVERAGE_BBOX")
+        # =-form is required, not stylistic: every US coverage bbox starts with a
+        # negative longitude, and argparse only tolerates a leading "-" on a value
+        # that is a bare number ("-74.3"), not on "-74.3,40.4,-71.7,42.9". Passed
+        # as two argv entries it fails with "expected one argument" -- which broke
+        # the whole stitching path for US regions. Same reason --bbox above uses it.
+        STITCH_ARGS+=("--coverage-bbox=$COVERAGE_BBOX")
     fi
     if [ -n "$STITCH_BAND_M" ]; then
         STITCH_ARGS+=(--stitch-band-m "$STITCH_BAND_M")

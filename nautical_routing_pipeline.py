@@ -282,6 +282,15 @@ NODE_KIND_POINT = 0
 NODE_KIND_NAVMESH_VERTEX = 1
 NODE_KIND_SUPERNODE = 2
 DEFAULT_SOURCE_TIER = 1  # 1 = official hydrographic authority (ENC/IENC)
+# How far outside this region's own water an ADOPTED seam node may sit and still
+# be connected (_connect_adopted_node). A seam node is authored from the
+# NEIGHBOUR's water geometry, digitised from different ENC cells, so it routinely
+# lands a few metres off this build's water edge -- 406 of Maryland's 478 adopted
+# nodes did, median 11.3m out, which the previous flat 2m buffer rejected
+# wholesale (392 of its 471 unconnected nodes). Sized an order of magnitude below
+# stitch_radius_m and at the scale of ENC digitisation differences; _crosses_land
+# remains the actual safety gate.
+ADOPT_POLY_TOLERANCE_M = 50.0
 NAVMESH_TARGET_EDGE_M = 650.0  # target interior triangle edge length (spec's 500-800m band)
 NAVMESH_PSLG_BUDGET = 20_000    # max len(vertices)+len(segments) fed into triangle's PSLG mode
 NAVMESH_MAX_TRIANGLES = 200_000 # sanity cap on triangulate() output; retry coarser above this
@@ -3386,6 +3395,23 @@ class NauticalRoutingPipeline:
                 index=native_coastal_ids, crs=self.CRS_WGS84)
             native_sindex = native_points.sindex
 
+        # Diagnostic only, never connected to: the inland network is excluded from
+        # candidates above (per Section 3.3), so when an adopted node has no
+        # coastal neighbour we want to know whether it had an INLAND one -- that
+        # distinguishes "published into water the adopter doesn't cover" from
+        # "published next to water the adopter models as inland", which is the
+        # known inland/coastal stitching gap (NEXT_PHASES Round 6, Section 5.2.1).
+        inland_ids = [n for n, d in self.graph.nodes(data=True)
+                      if d.get("node_type") == "inland"]
+        self._adopt_inland_points = None
+        self._adopt_inland_sindex = None
+        if inland_ids:
+            self._adopt_inland_points = gpd.GeoSeries(
+                [Point(self.graph.nodes[n]["lon"], self.graph.nodes[n]["lat"])
+                 for n in inland_ids],
+                index=inland_ids, crs=self.CRS_WGS84)
+            self._adopt_inland_sindex = self._adopt_inland_points.sindex
+
         coastal_gdf = self.gdfs.get("coastal_water")
         components = (self._connected_water_polygons(coastal_gdf)
                       if coastal_gdf is not None and not coastal_gdf.empty else [])
@@ -3397,7 +3423,14 @@ class NauticalRoutingPipeline:
         adopted_ids = set()
         already_present = 0
         unconnected = 0
-        for row in rows:
+        self._adopt_proj_cache = {}
+        self._adopt_reject_stats = defaultdict(int)
+        logger.info(f"Seam registry adopt pass: {len(rows)} candidate nodes in bbox {bbox}, "
+                    f"connecting against {len(native_coastal_ids)} native nodes...")
+        for i, row in enumerate(rows):
+            if i and i % 200 == 0:
+                logger.info(f"  Adopt pass: {i}/{len(rows)} candidates processed, "
+                            f"{len(adopted_ids)} adopted so far.")
             node_id = row["node_id"]
             if node_id in self.graph:
                 already_present += 1
@@ -3420,6 +3453,9 @@ class NauticalRoutingPipeline:
             if n_conn == 0:
                 unconnected += 1
 
+        if unconnected:
+            logger.info("  Adopt pass unconnected breakdown: " + ", ".join(
+                f"{k}={v}" for k, v in sorted(self._adopt_reject_stats.items())))
         logger.info(
             f"Seam registry adopt pass: {len(adopted_ids)} nodes adopted from "
             f"'{self.stitch_registry_path}' ({already_present} already present in "
@@ -3445,25 +3481,89 @@ class NauticalRoutingPipeline:
             return 0
         pt = Point(lon, lat)
 
-        target_component = None
+        comp_idx = None
         if components_sindex is not None:
             hits = list(components_sindex.query(pt.buffer(0.0005), predicate="intersects"))
             if hits:
-                target_component = components[hits[0]]
-        if target_component is None:
+                comp_idx = int(hits[0])
+        if comp_idx is None:
             # FP/erosion jitter can leave an adopted node just outside every
             # polygon boundary at the seam -- fall back to nearest component.
-            target_component = min(components, key=lambda c: c.distance(pt))
+            # Via the spatial index: the plain linear scan over every component
+            # was one of two reasons this pass stalled for >9 minutes with no
+            # output on a real region (thousands of components x hundreds of
+            # adopted nodes).
+            if components_sindex is not None:
+                try:
+                    comp_idx = int(np.atleast_1d(components_sindex.nearest(pt))[-1])
+                except Exception:
+                    comp_idx = min(range(len(components)),
+                                   key=lambda i: components[i].distance(pt))
+            else:
+                comp_idx = min(range(len(components)),
+                               key=lambda i: components[i].distance(pt))
+        target_component = components[comp_idx]
 
-        probe = target_component.buffer(0.001)  # ~100m in degrees, generous prefilter
+        # Candidate prefilter: a stitch_radius_m box around the adopted node, not
+        # the whole buffered component. Equivalent by construction -- every
+        # candidate is distance-filtered to stitch_radius_m below, and any
+        # candidate in a *different* water body still fails the within(poly_m)
+        # gate -- but bounded by the radius instead of by the component's size.
+        # The old whole-component probe pulled in every native node of a body as
+        # large as the Gulf of Maine and reprojected all of them, per adopted
+        # node: the other reason this pass did not finish on a real region.
+        deg_lat = self.stitch_radius_m / 111_320.0
+        deg_lon = self.stitch_radius_m / max(1.0, 111_320.0 * math.cos(math.radians(lat)))
+        probe = box(lon - deg_lon, lat - deg_lat, lon + deg_lon, lat + deg_lat)
         cand_hits = native_sindex.query(probe, predicate="intersects")
-        candidate_ids = [native_points.index[i] for i in cand_hits]
+        # int() is load-bearing: native_points.index is a pandas Int64Index, so
+        # index[i] is a numpy.int64. Used as a networkx key it compares/hashes
+        # equal to the plain int (so no duplicate node appears), but the freshly
+        # adopted node's adjacency dict is empty, so IT is the object stored as
+        # the key -- and sqlite3 binds numpy scalars through the buffer protocol,
+        # writing edges.target as an 8-byte BLOB. routeiq then drops those rows
+        # (target not in the node map), silently killing the outgoing half of
+        # every adopt-pass connector edge.
+        candidate_ids = [int(native_points.index[i]) for i in cand_hits]
         if not candidate_ids:
+            # No coastal node in range at all. Distinguish the two causes: water
+            # the adopter simply does not cover, versus water it models as part of
+            # the inland network (which Section 3.3 excludes from candidates).
+            if (self._adopt_inland_sindex is not None
+                    and len(self._adopt_inland_sindex.query(probe, predicate="intersects"))):
+                self._adopt_reject_stats["only_inland_nodes_in_radius"] += 1
+            else:
+                self._adopt_reject_stats["no_node_of_any_kind_in_radius"] += 1
             return 0
 
-        utm = self._local_utm_crs(target_component)
-        poly_m = gpd.GeoSeries([target_component], crs=self.CRS_WGS84).to_crs(utm).iloc[0].buffer(2.0)
+        # Per-component projection is cached: adopted seam nodes cluster along one
+        # clip edge, so the same component recurs for hundreds of them, and
+        # reprojecting a large component polygon each time is pure waste.
+        cached = self._adopt_proj_cache.get(comp_idx)
+        if cached is None:
+            utm = self._local_utm_crs(target_component)
+            base = gpd.GeoSeries([target_component], crs=self.CRS_WGS84).to_crs(utm).iloc[0]
+            cached = {"utm": utm, "base": base, "tight": base.buffer(2.0), "tol": None}
+            self._adopt_proj_cache[comp_idx] = cached
+        utm = cached["utm"]
         pt_m = gpd.GeoSeries([pt], crs=self.CRS_WGS84).to_crs(utm).iloc[0]
+
+        # `within(poly_m)` needs the WHOLE connector inside the water body -- the
+        # adopted node included. A node authored from the neighbour's geometry
+        # usually sits just outside this build's polygon, so the old flat 2m
+        # buffer failed every candidate before they were even considered. Widen
+        # the polygon only for such nodes, and only to ADOPT_POLY_TOLERANCE_M;
+        # nodes already inside keep the original tight buffer unchanged.
+        outside_m = pt_m.distance(cached["base"])
+        if outside_m > ADOPT_POLY_TOLERANCE_M:
+            self._adopt_reject_stats["node_too_far_outside_water"] += 1
+            return 0
+        if outside_m > 0:
+            if cached["tol"] is None:
+                cached["tol"] = cached["base"].buffer(ADOPT_POLY_TOLERANCE_M)
+            poly_m = cached["tol"]
+        else:
+            poly_m = cached["tight"]
         cand_pts_wgs84 = [Point(self.graph.nodes[n]["lon"], self.graph.nodes[n]["lat"])
                            for n in candidate_ids]
         cand_pts_m = gpd.GeoSeries(cand_pts_wgs84, crs=self.CRS_WGS84).to_crs(utm)
@@ -3474,6 +3574,14 @@ class NauticalRoutingPipeline:
             if d <= self.stitch_radius_m:
                 scored.append((d, cid, c_wgs84, cm))
         scored.sort(key=lambda t: t[0])
+        # Why a node ends up unconnected matters: a node with no candidate in
+        # range is a publish/overlap problem, while one whose candidates are all
+        # rejected by the polygon or land gate is a gating problem. Round 25's
+        # East Coast build could not tell those apart (Maryland reported 471 of
+        # 478 unconnected while 421 of them had a native node within 500m).
+        if not scored:
+            self._adopt_reject_stats["no_candidate_in_radius"] += 1
+        rejected_poly = rejected_land = 0
 
         added = 0
         for _dist_m, cid, c_wgs84, cm in scored:
@@ -3482,14 +3590,23 @@ class NauticalRoutingPipeline:
             if self.graph.has_edge(node_id, cid):
                 continue
             if not LineString([pt_m, cm]).within(poly_m):
+                rejected_poly += 1
                 continue
             if self._crosses_land(LineString([(lon, lat), (c_wgs84.x, c_wgs84.y)])):
+                rejected_land += 1
                 continue
             attrs = dict(edge_type="coastal", edge_kind_id=EDGE_KIND_NAVMESH_BOUNDARY,
                          source_tier=DEFAULT_SOURCE_TIER, source_id=None)
             self.graph.add_edge(node_id, cid, **attrs)
             self.graph.add_edge(cid, node_id, **attrs)
             added += 1
+        if added == 0 and scored:
+            if rejected_poly and not rejected_land:
+                self._adopt_reject_stats["all_candidates_outside_water_polygon"] += 1
+            elif rejected_land and not rejected_poly:
+                self._adopt_reject_stats["all_candidates_cross_land"] += 1
+            else:
+                self._adopt_reject_stats["candidates_rejected_mixed"] += 1
         return added
 
     def _publish_seam_nodes(self, adopted_ids: set):
@@ -3872,7 +3989,11 @@ class NauticalRoutingPipeline:
             )
             region_id = cursor.lastrowid
             
-            nodes_data = [(n, data["lat"], data["lon"],
+            # int() on every node id below is a guardrail, not cosmetics: a
+            # numpy integer id reaching sqlite3 is bound through the buffer
+            # protocol and lands as an 8-byte BLOB instead of an INTEGER, which
+            # consumers silently drop (they look ids up in a numeric node map).
+            nodes_data = [(int(n), data["lat"], data["lon"],
                            data.get("node_depth", -1),
                            region_id,
                            data.get("node_kind_id", NODE_KIND_POINT),
@@ -3882,7 +4003,7 @@ class NauticalRoutingPipeline:
             cursor.executemany("INSERT INTO nodes (id, lat, lon, node_depth, region_id, node_kind_id, source_tier, source_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", nodes_data)
             
             edges_data = [(
-                u, v,
+                int(u), int(v),
                 data.get("distance", 0.0),
                 data.get("min_depth", 99.0),
                 data.get("drval1"),
