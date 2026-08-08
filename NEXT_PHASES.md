@@ -3772,3 +3772,52 @@ the OOM killer wakes.
 2. **MA↔RI routes ×5.01** (127.5 km for a 25.5 km straight line), no warnings —
    the same shape of question the NY↔NJ ×13 detour turned out to be, and worth
    the same treatment now that the tooling exists.
+
+### 2026-08-08 — MA↔RI's ×5 route: unclipped region extents mean the seam is in the wrong place
+
+Diagnosed with `diagnose_pair_path.mjs`. Unlike the NY↔NJ ×13, this one **is**
+seam-related, and it indicts the publish rule again (§10.3) in a new way.
+
+**The ×5 headline is partly an artefact of the metric**: the straight line
+between the chosen endpoints crosses **9 land polygons** — it runs over Cape Cod.
+A sailor's reference is rounding Monomoy Point, ≈44.6 km, not the 25.5 km
+straight line. So the real overrun is 127.4 km vs ~45 km, not vs 25 km.
+
+**The real defect is a 45 km detour to reach a stitch point.** The path gets
+within **9.8 km** of the destination (node 304, 41.6886,−69.9107), then spends
+**14.2 km** climbing north to 41.9967 and ~25 km coming back south. Why: of the
+**696 shared MA/RI nodes, 690 sit at lat 42.000** — RI's coverage-bbox northern
+edge — and only **2** lie within 10 km of the natural crossing, even though MA
+has 1,827 nodes and RI has 1,312 nodes in that same water. No hard-blocked edges
+anywhere on the path (`crosses_land=0`, `crosses_obstacle=0`, `requires_lock=0`).
+
+**Root cause: the legacy regions were never clipped**, so their extents overlap
+enormously instead of abutting, while the publish pass only publishes within
+`stitch_band_m` of the coverage-bbox *rectangle*. Two files can therefore blanket
+the same water and still share nodes only along one arbitrary rectangle edge.
+
+| region | lon span | node extent | size |
+|---|---|---|---|
+| SC+GA | **9.1°** | lon −84.00..−74.92 | 132.6 MB |
+| RI | **8.3°** | lon −74.70..−66.35 (New Jersey to east of Cape Cod) | 45.8 MB |
+| NJ | 6.4° | lon −75.67..−69.27 | 47.3 MB |
+| CT | 5.4° | lon −74.70..−69.27 | 38.3 MB |
+| ME | 3.9° | lon −70.80..−66.90 | 105.7 MB |
+| NH | 3.5° | lon −70.85..−67.35 | 35.2 MB |
+| *clipped: NY 2.6°, VA 2.3°, MA 1.9°, DE 1.6°, MD 2.7°, NC 3.6°* | | | |
+
+This also explains three earlier oddities: the "adjacent" pairs that are nothing
+of the sort (CT↔DE, DE↔RI, NY↔RI — bbox overlap only), NJ adopting 4,946 seam
+nodes of which 2,701 had nothing to connect to, and CT adopting 829 with 820
+unconnected. All are nodes published onto a rectangle edge far from the
+adopter's real water.
+
+**Proposed fix — clip every region to a coastal band and rebuild**, as NY, MA,
+VA and NC already are. Expected: real borders instead of overlaps, publish bands
+that land on actual seams, materially smaller files (RI and SC+GA especially),
+and this detour class gone. **Open decision: how much offshore margin to keep.**
+Hugging the coast would drop offshore water a passage planner may legitimately
+want; ~30–60 km beyond the coast is probably the right compromise, but it is a
+coverage decision, not a technical one. Cost: ~2 h for a full 12-region rebuild
+from a fresh registry (rebuilding a subset would leave seam relationships
+inconsistent).
