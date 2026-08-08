@@ -3653,3 +3653,50 @@ apart) so that seam is still undemonstrated end-to-end; and **NY↔NJ routes
 Hook, with no warnings.** That is a real graph path implying the direct exit via
 Rockaway Inlet is unconnected; it is the clearest routing-quality defect left in
 the set and needs its own investigation.
+
+### 2026-08-08 — The NY↔NJ ×13 detour is not a stitching defect: it is depth attribution meeting a strict penalty policy
+
+Investigated with `local_only/local_scripts/round25_seamroute/diagnose_detour.mjs`
+and `diagnose_engine_route.mjs`. Chain of evidence, endpoint to endpoint:
+
+1. **The graph is fine.** Dijkstra over the merged NY+NJ graph finds a clean
+   **27,446 m** path (straight line 18,406 m, ×1.49) that crosses the seam via
+   shared nodes (`N…S…J`, crossing at 40.3994,−73.9699 on a 195 m leg). 48 shared
+   nodes lie within 5 km of the direct crossing point. Stitching is not the issue.
+2. **The engine chooses the 242 km route deliberately.** Its own log:
+   *"found a penalized result (3619 m constraint-violating, cost 808479 vs
+   distance 35850 m) — retrying with expanded bounding box"* then *"retry won
+   (final cost 246562, 0 m constraint-violating)"*. `pathViolationMeters` returns
+   non-zero if the path touches **even one** violating edge, and the retry then
+   prefers a fully-compliant route at any length — here 242 km over 36 km. Every
+   vessel configuration tried (draft 0, 0.01, 1.5, zero safety margins, navmesh
+   off) returns the identical 242 km route.
+3. **The violation is depth: 18,759 m of the 27,462 m corridor has
+   `min_depth = 0`.**
+4. **Those zeros are mostly an attribution artefact.** The corridor — open
+   Atlantic off Rockaway — lies inside a single DEPARE polygon with
+   **DRVAL1 = 0.0, DRVAL2 = 18.2**, i.e. the band "0 to 18.2 m"; the pipeline
+   takes DRVAL1 as the edge minimum. Sampling 1,500 of NY's `min_depth=0` edges
+   by the band at their midpoint: **63.7% sit in a coarse 0→>10 m band**, 14.1%
+   in 0–10 m, only **12.4% in a genuine 0–2 m shallow/drying band**, and 9.5%
+   had `DRVAL1>0` available from another containing polygon. Only 71 NY polygons
+   are coarse 0→>10 m bands, but they blanket the offshore approaches. Region
+   totals for `min_depth=0`: NY 43.6%, MD 57.3%, ME 27.3%, NJ 33.5% of all edges,
+   and **no region emits −1 anywhere** — so a third to a half of each graph is
+   permanently constraint-violating for every vessel.
+
+**Decision needed** (safety semantics, so not taken unilaterally):
+
+- **(a) Pipeline** — when the only containing band is `DRVAL1=0` with a large
+  `DRVAL2` (≥10 m, say), emit `min_depth = -1` ("unknown", which routeiq already
+  excludes from violation checks) instead of 0. Small polygon blast radius,
+  large edge effect. Risk: genuinely unsurveyed shallow water stops being flagged.
+- **(b) routeiq** — bound the penalized retry: refuse to trade an N× longer route
+  for clearing violations (242 km vs 36 km), and surface the trade as a warning.
+- **(c) both.**
+
+**Separate latent bug found on the way:** `pathViolationMeters` computes
+`(dims.draft || 2.0)`, so **draft 0 is silently treated as a 2.0 m draft** (plus
+`safetyMarginDraft` 0.3). Every "unconstrained vessel" measurement in Sections
+8–10 was actually made at 2.3 m required depth. It did not cause this detour —
+all configurations give 242 km — but it should be `??`, not `||`.
