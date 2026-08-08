@@ -739,3 +739,10 @@ blanket-clearing, which is the point.
 
 CT↔NY's warning is the bounded retry behaving as designed: it keeps the short
 route and reports 735 m of constrained water instead of detouring around it.
+
+**Connectivity re-checked after the rebuild: unchanged at 9/12 pairs, all six
+real neighbours crossable** — ME↔NH (joint component 138,030 nodes), RI↔CT
+(50,335, up from 24,826, which is why that seam finally yields a representative
+route), CT↔NY (75,146), NY↔NJ (91,858), NJ↔DE (57,294), DE↔MD (29,099). The
+three that are not crossable are the same non-adjacent pairs whose NOAA extents
+merely overlap (CT↔DE, DE↔RI, NY↔RI). So neither fix cost any connectivity.
