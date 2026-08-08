@@ -138,15 +138,36 @@ def _edge_attr_worker(edge_chunk):
                             f = i / 4.0
                             pt = Point(u_lon + f*(v_lon-u_lon), u_lat + f*(v_lat-u_lat))
                             best = None
+                            best_upper = None
                             for _, row in candidates.iterrows():
                                 geom = row.geometry
                                 if geom is not None and geom.contains(pt):
                                     val = row['DRVAL1']
                                     if pd.notna(val) and (best is None or float(val) > best):
                                         best = float(val)
-                            sampled.append(best if best is not None else 99.0)
-                        min_val = min(sampled)
-                        attrs['min_depth'] = max(0.0, float(min_val))
+                                        upper = row['DRVAL2'] if 'DRVAL2' in row else None
+                                        best_upper = float(upper) if pd.notna(upper) else None
+                            sampled.append((best, best_upper) if best is not None else (99.0, None))
+                        min_val = min(d1 for d1, _ in sampled)
+                        # A DRVAL1 of 0 is only meaningful when the band is tight.
+                        # Offshore, the sole containing band is routinely
+                        # "DRVAL1=0, DRVAL2=18.2" -- 0 is the band FLOOR, not a
+                        # surveyed minimum -- and taking it literally marks the
+                        # water impassable: 43.6% of New York's edges, 57.3% of
+                        # Maryland's, and 63.7% of NY's zero-depth edges sit in
+                        # such coarse bands (only 12.4% in a genuine 0-2m band).
+                        # routeiq then treats every route through them as
+                        # constraint-violating and detours arbitrarily far around
+                        # them (242km for an 18km crossing). Emit -1 = UNKNOWN,
+                        # which consumers exclude from constraint checks, but only
+                        # when EVERY zero-reading sample came from a coarse band;
+                        # one genuine 0-2m or drying reading keeps the hard 0.
+                        zero_samples = [(d1, d2) for d1, d2 in sampled if d1 <= 0.0]
+                        coarse_only = bool(zero_samples) and all(
+                            d1 == 0.0 and d2 is not None and d2 >= COARSE_DEPTH_BAND_DRVAL2_M
+                            for d1, d2 in zero_samples)
+                        attrs['min_depth'] = (UNKNOWN_DEPTH if coarse_only
+                                              else max(0.0, float(min_val)))
                         attrs['drval1'] = min_val if min_val < 99.0 else None
 
         # Bridges - Determine Air Draft limit
@@ -255,7 +276,11 @@ def _edge_attr_worker(edge_chunk):
                 soft_intersecting = soft_candidates[soft_candidates.intersects(edge_geom)]
                 if not soft_intersecting.empty:
                     soft_min = float(soft_intersecting['_depth_constraint'].min())
-                    attrs['min_depth'] = min(attrs['min_depth'], soft_min)
+                    # A charted sounding always wins over UNKNOWN_DEPTH: a plain
+                    # min() would keep -1 and silently discard the constraint,
+                    # since -1 sorts below any real depth.
+                    attrs['min_depth'] = (soft_min if attrs['min_depth'] < 0
+                                          else min(attrs['min_depth'], soft_min))
 
         results[(u, v)] = attrs
     return results
@@ -282,6 +307,13 @@ NODE_KIND_POINT = 0
 NODE_KIND_NAVMESH_VERTEX = 1
 NODE_KIND_SUPERNODE = 2
 DEFAULT_SOURCE_TIER = 1  # 1 = official hydrographic authority (ENC/IENC)
+# Depth sentinel: consumers (routeiq's pathViolationMeters) treat a negative
+# min_depth as "unknown, do not constrain", and 0 as "zero water, always
+# violating". The pipeline previously emitted 0 for both meanings.
+UNKNOWN_DEPTH = -1.0
+# A DEPARE band of DRVAL1=0 with an upper bound at least this deep carries no
+# usable minimum -- it is a coarse "0 to X" band, not a survey saying 0m.
+COARSE_DEPTH_BAND_DRVAL2_M = 10.0
 # How far outside this region's own water an ADOPTED seam node may sit and still
 # be connected (_connect_adopted_node). A seam node is authored from the
 # NEIGHBOUR's water geometry, digitised from different ENC cells, so it routinely
