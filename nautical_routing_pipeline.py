@@ -639,7 +639,8 @@ class NauticalRoutingPipeline:
                  dataset_version: str = "", depth_ceiling: float = 6.0,
                  stitch_registry_path: str = "",
                  coverage_bbox: Optional[Tuple[float, float, float, float]] = None,
-                 stitch_band_m: float = 300.0, stitch_radius_m: float = 500.0):
+                 stitch_band_m: float = 300.0, stitch_radius_m: float = 500.0,
+                 navmesh_edge_m: float = NAVMESH_TARGET_EDGE_M):
         self.data_paths = data_paths
         self.db_path = db_path
         self.country = country
@@ -677,6 +678,11 @@ class NauticalRoutingPipeline:
         self.stitch_band_m = stitch_band_m
         self.stitch_radius_m = stitch_radius_m
         self._coverage_bbox_cache = None
+        # Navmesh resolution. 650m is right for pilotage waters; an offshore
+        # passage layer wants kilometres, not hundreds of metres -- meshing open
+        # ocean at 650m is what made the overview-chart extents unbuildable in
+        # the first place, and the detail is worthless out there.
+        self.navmesh_edge_m = navmesh_edge_m
 
     def run_pipeline(self):
         self.parse_shapefiles()
@@ -1885,7 +1891,7 @@ class NauticalRoutingPipeline:
             pslg, ring_ranges = self._polygon_to_pslg(poly_m)
             seam_coord_set = seam_coord_set | extra_seam_coords
 
-        max_area = (NAVMESH_TARGET_EDGE_M ** 2) * 0.433
+        max_area = (self.navmesh_edge_m ** 2) * 0.433
         try:
             result = _triangle.triangulate(pslg, f"pq28a{max_area:.1f}n")
         except Exception as exc:
@@ -4180,6 +4186,11 @@ if __name__ == "__main__":
                         help="Graph architecture label (metadata.architecture)")
     parser.add_argument("--dataset-version", default="",
                         help="Dataset version string (metadata.dataset_version)")
+    parser.add_argument("--navmesh-edge-m", type=float, default=NAVMESH_TARGET_EDGE_M,
+                        help="Target navmesh triangle edge length in metres (default "
+                             f"{NAVMESH_TARGET_EDGE_M:.0f}). Raise it for a coarse offshore "
+                             "passage layer -- e.g. 12000 for open ocean, where 650m detail "
+                             "is meaningless and merely expensive.")
     parser.add_argument("--depth-ceiling", type=float, default=6.0,
                         help="Depth ceiling (m) for water-body classification (Step B; used from Session 2 onward)")
     parser.add_argument("--stitch-registry", nargs="?", const="data/seam_registry.sqlite", default="",
@@ -4239,5 +4250,6 @@ if __name__ == "__main__":
                                        stitch_registry_path=stitch_registry_path,
                                        coverage_bbox=coverage_bbox,
                                        stitch_band_m=args.stitch_band_m,
-                                       stitch_radius_m=args.stitch_radius_m)
+                                       stitch_radius_m=args.stitch_radius_m,
+                                       navmesh_edge_m=args.navmesh_edge_m)
     pipeline.run_pipeline()
