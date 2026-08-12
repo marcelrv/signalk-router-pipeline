@@ -158,16 +158,21 @@ def _edge_attr_worker(edge_chunk):
                         # such coarse bands (only 12.4% in a genuine 0-2m band).
                         # routeiq then treats every route through them as
                         # constraint-violating and detours arbitrarily far around
-                        # them (242km for an 18km crossing). Emit -1 = UNKNOWN,
+                        # them (242km for an 18km crossing). Emit UNKNOWN_DEPTH,
                         # which consumers exclude from constraint checks, but only
                         # when EVERY zero-reading sample came from a coarse band;
-                        # one genuine 0-2m or drying reading keeps the hard 0.
+                        # one genuine 0-2m or drying reading keeps the real value.
                         zero_samples = [(d1, d2) for d1, d2 in sampled if d1 <= 0.0]
                         coarse_only = bool(zero_samples) and all(
                             d1 == 0.0 and d2 is not None and d2 >= COARSE_DEPTH_BAND_DRVAL2_M
                             for d1, d2 in zero_samples)
+                        # Preserve the sign: a genuine drying/intertidal band (e.g.
+                        # DRVAL1=-2.0, exposed 2m above chart datum at low water) is
+                        # real survey data, not "unknown" -- flooring it to 0.0 here
+                        # discarded that information upstream of every consumer (see
+                        # UNKNOWN_DEPTH above).
                         attrs['min_depth'] = (UNKNOWN_DEPTH if coarse_only
-                                              else max(0.0, float(min_val)))
+                                              else float(min_val))
                         attrs['drval1'] = min_val if min_val < 99.0 else None
 
         # Bridges - Determine Air Draft limit
@@ -277,9 +282,11 @@ def _edge_attr_worker(edge_chunk):
                 if not soft_intersecting.empty:
                     soft_min = float(soft_intersecting['_depth_constraint'].min())
                     # A charted sounding always wins over UNKNOWN_DEPTH: a plain
-                    # min() would keep -1 and silently discard the constraint,
-                    # since -1 sorts below any real depth.
-                    attrs['min_depth'] = (soft_min if attrs['min_depth'] < 0
+                    # min() would keep UNKNOWN_DEPTH and silently discard the
+                    # constraint, since it sorts below any real (or drying) depth.
+                    # Compare by identity, not `< 0` -- a genuine drying height is
+                    # also negative and must still take part in the min() below.
+                    attrs['min_depth'] = (soft_min if attrs['min_depth'] == UNKNOWN_DEPTH
                                           else min(attrs['min_depth'], soft_min))
 
         results[(u, v)] = attrs
@@ -307,10 +314,20 @@ NODE_KIND_POINT = 0
 NODE_KIND_NAVMESH_VERTEX = 1
 NODE_KIND_SUPERNODE = 2
 DEFAULT_SOURCE_TIER = 1  # 1 = official hydrographic authority (ENC/IENC)
-# Depth sentinel: consumers (routeiq's pathViolationMeters) treat a negative
-# min_depth as "unknown, do not constrain", and 0 as "zero water, always
-# violating". The pipeline previously emitted 0 for both meanings.
-UNKNOWN_DEPTH = -1.0
+# Depth sentinel for "unknown, do not constrain" (ROUTEIQ_NEXT_PHASES.md,
+# "Negative charted depths are read as unknown"). Deliberately far outside any
+# plausible charted drying height (a bank drying tens of metres does not
+# exist) so it stays distinguishable from a genuine negative DRVAL1 -- a
+# drying/intertidal bank exposed at low water, which the pipeline now emits
+# as-is (e.g. -2.0) instead of flooring to 0.0. Consumers must gate on
+# metadata.schema_version >= DEPTH_SENTINEL_SCHEMA_VERSION before trusting
+# real negatives; older builds still floor drying heights to 0.0 and use -1
+# for unknown.
+UNKNOWN_DEPTH = -999.0
+# metadata.schema_version bumped to this the first time a build emits the
+# -999 sentinel (was 1, always floored negatives to 0.0 and used -1 for
+# unknown). See UNKNOWN_DEPTH above.
+DEPTH_SENTINEL_SCHEMA_VERSION = 2
 # A DEPARE band of DRVAL1=0 with an upper bound at least this deep carries no
 # usable minimum -- it is a coarse "0 to X" band, not a survey saying 0m.
 COARSE_DEPTH_BAND_DRVAL2_M = 10.0
@@ -3474,7 +3491,7 @@ class NauticalRoutingPipeline:
                 already_present += 1
                 continue
             lon, lat = row["lon"], row["lat"]
-            node_depth = row["node_depth"] if row["node_depth"] is not None else -1
+            node_depth = row["node_depth"] if row["node_depth"] is not None else UNKNOWN_DEPTH
             # Added verbatim: same id, same coordinate, same kind -- this build
             # does NOT recompute or re-hash it (the whole point of the registry).
             self.graph.add_node(
@@ -3723,7 +3740,7 @@ class NauticalRoutingPipeline:
             rows.append({
                 "node_id": n, "lon": lon, "lat": lat,
                 "node_kind_id": data.get("node_kind_id", NODE_KIND_POINT),
-                "node_depth": data.get("node_depth", -1),
+                "node_depth": data.get("node_depth", UNKNOWN_DEPTH),
                 "source_region": self.region_name,
             })
 
@@ -3744,7 +3761,7 @@ class NauticalRoutingPipeline:
     def _compute_node_depths(self):
         depare_gdf = self.gdfs.get("depth_areas", gpd.GeoDataFrame())
         if depare_gdf.empty:
-            for _, data in self.graph.nodes(data=True): data["node_depth"] = -1
+            for _, data in self.graph.nodes(data=True): data["node_depth"] = UNKNOWN_DEPTH
             return
 
         logger.info("Computing node depths from DEPARE polygons...")
@@ -3758,12 +3775,14 @@ class NauticalRoutingPipeline:
 
             pt = Point(data["lon"], data["lat"])
             candidates = list(positive.sindex.intersection(pt.bounds))
-            depth = -1
+            depth = UNKNOWN_DEPTH
             for idx in candidates:
                 row = positive.iloc[idx]
                 if row.geometry.contains(pt):
                     if "DRVAL1" in row and pd.notnull(row["DRVAL1"]):
-                        depth = max(0.0, float(row["DRVAL1"]))
+                        # Preserve sign -- see UNKNOWN_DEPTH: a genuine drying
+                        # height is real data, not flooring material.
+                        depth = float(row["DRVAL1"])
                     else:
                         depth = 99.0
                     found += 1
@@ -3931,7 +3950,7 @@ class NauticalRoutingPipeline:
                     id INTEGER PRIMARY KEY,
                     lat REAL,
                     lon REAL,
-                    node_depth REAL DEFAULT -1,
+                    node_depth REAL DEFAULT -999,
                     region_id INTEGER REFERENCES metadata(id) ON DELETE CASCADE,
                     node_kind_id INTEGER DEFAULT 0 REFERENCES node_kind_enum(id),
                     source_tier INTEGER DEFAULT 1,
@@ -4021,7 +4040,7 @@ class NauticalRoutingPipeline:
                    (country, name, description, last_update_date, tags, bounding_box, boundary_geometry, schema_version, contributor, url, license, copyright, architecture, dataset_version)
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                  (self.country, self.region_name, self.description, now_utc,
-                 self.tags, bbox_json, boundary_json, 1,
+                 self.tags, bbox_json, boundary_json, DEPTH_SENTINEL_SCHEMA_VERSION,
                  self.contributor, self.url,
                  self.license, self.copyright, self.architecture, self.dataset_version)
             )
@@ -4032,7 +4051,7 @@ class NauticalRoutingPipeline:
             # protocol and lands as an 8-byte BLOB instead of an INTEGER, which
             # consumers silently drop (they look ids up in a numeric node map).
             nodes_data = [(int(n), data["lat"], data["lon"],
-                           data.get("node_depth", -1),
+                           data.get("node_depth", UNKNOWN_DEPTH),
                            region_id,
                            data.get("node_kind_id", NODE_KIND_POINT),
                            data.get("source_tier", DEFAULT_SOURCE_TIER),
