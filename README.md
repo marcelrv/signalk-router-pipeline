@@ -8,7 +8,7 @@ legally redistributable.
 
 Compiled output databases are published to
 [signalk-router-data](https://github.com/marcelrv/signalk-router-data) and
-consumed by [SignalK Autoroute](https://github.com/marcelrv/signalk-autoroute)
+consumed by [SignalK RouteIQ](https://github.com/marcelrv/signalk-routeiq)
 (and any other tool — the database format is an open, documented contract,
 not tied to one consumer).
 
@@ -190,7 +190,14 @@ This repository is a from-scratch rebuild of the graph-generation pipeline
 around the architecture above. Rollout is phased by region, starting with
 a pilot area with good existing test coverage, then scaling out to full
 national/regional coverage before adding the hierarchical long-distance
-layer. See open issues for current phase and in-progress work.
+layer. Phase 0-2 (navmesh/skeleton generation, funnel-algorithm routing)
+are implemented; see `PHASE_3_DESIGN.md` for the detailed design of what
+comes next (community data fusion, override workflow, vessel-traffic
+validation, scale-out, hierarchical routing), `PHASE_4_DESIGN.md` for three
+further sub-phases (dynamic, position-aware database loading; AI-vision-
+assisted resolution of ambiguous path choices; bridge/lock wait-time and
+schedule data), and `NEXT_PHASES.md` for
+the tactical, in-progress bug-tracking log.
 
 ## Contributing
 

@@ -8,6 +8,8 @@ __pycache__/
 *.egg-info/
 
 # Raw chart downloads / working data (large, re-downloadable, not committed)
+# Blanket-ignore data/ so pilot clip output (clip_pilot_data.py) is never committed.
+data/
 data/raw/
 data/cache/
 *.sqlite
@@ -17,3 +19,6 @@ data/cache/
 # OS / editor
 .DS_Store
 .vscode/
+
+# Local Claude Code settings (machine-specific, not for public distribution)
+.claude/settings.local.json
