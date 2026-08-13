@@ -3782,7 +3782,8 @@ class NauticalRoutingPipeline:
     def _compute_node_depths(self):
         depare_gdf = self.gdfs.get("depth_areas", gpd.GeoDataFrame())
         if depare_gdf.empty:
-            for _, data in self.graph.nodes(data=True): data["node_depth"] = UNKNOWN_DEPTH
+            for _, data in self.graph.nodes(data=True):
+                data["node_depth"] = UNKNOWN_DEPTH
             return
 
         logger.info("Computing node depths from DEPARE polygons...")
@@ -3796,25 +3797,43 @@ class NauticalRoutingPipeline:
 
             pt = Point(data["lon"], data["lat"])
             candidates = list(positive.sindex.intersection(pt.bounds))
-            depth = UNKNOWN_DEPTH
+            # Evaluate every containing candidate, not just the first (CodeRabbit
+            # PR #3) -- the same multi-scale-cell overlap Round 18 fixed for
+            # edges: a coarse overview cell and a fine harbor cell routinely
+            # both contain the same point, and taking whichever the spatial
+            # index happened to return first made node_depth silently
+            # order-dependent and able to disagree with the edges meeting it,
+            # which always did evaluate every candidate. The deepest/finest
+            # containing DRVAL1 wins here too, for the same reason.
+            best = None
+            best_upper = None
+            any_containing = False
             for idx in candidates:
                 row = positive.iloc[idx]
                 if row.geometry.contains(pt):
+                    any_containing = True
                     if "DRVAL1" in row and pd.notnull(row["DRVAL1"]):
-                        # Preserve sign -- see UNKNOWN_DEPTH: a genuine drying
-                        # height is real data, not flooring material.
-                        depth = float(row["DRVAL1"])
-                        # See DRYING_BAND_IMPLAUSIBLE_DRVAL1_M: an implausibly
-                        # extreme DRVAL1 with a plausible DRVAL2 is a coarse-band
-                        # placeholder on the drying side, not a real reading.
-                        if depth < DRYING_BAND_IMPLAUSIBLE_DRVAL1_M and "DRVAL2" in row and pd.notnull(row["DRVAL2"]):
-                            upper = float(row["DRVAL2"])
-                            if upper >= DRYING_BAND_IMPLAUSIBLE_DRVAL1_M:
-                                depth = upper
-                    else:
-                        depth = 99.0
-                    found += 1
-                    break
+                        val = float(row["DRVAL1"])
+                        if best is None or val > best:
+                            best = val
+                            upper = row["DRVAL2"] if "DRVAL2" in row else None
+                            best_upper = float(upper) if pd.notnull(upper) else None
+            if best is not None:
+                # Preserve sign -- see UNKNOWN_DEPTH: a genuine drying height
+                # is real data, not flooring material.
+                depth = best
+                # See DRYING_BAND_IMPLAUSIBLE_DRVAL1_M: an implausibly extreme
+                # DRVAL1 with a plausible DRVAL2 is a coarse-band placeholder
+                # on the drying side, not a real reading.
+                if (depth < DRYING_BAND_IMPLAUSIBLE_DRVAL1_M and best_upper is not None
+                        and best_upper >= DRYING_BAND_IMPLAUSIBLE_DRVAL1_M):
+                    depth = best_upper
+                found += 1
+            elif any_containing:
+                depth = 99.0
+                found += 1
+            else:
+                depth = UNKNOWN_DEPTH
             data["node_depth"] = depth
 
     def calculate_edge_attributes(self):
@@ -3927,7 +3946,7 @@ class NauticalRoutingPipeline:
                     tags TEXT DEFAULT '[]',
                     bounding_box TEXT,
                     boundary_geometry TEXT,
-                    schema_version INTEGER DEFAULT 1,
+                    schema_version INTEGER DEFAULT 2,
                     contributor TEXT DEFAULT '',
                     url TEXT DEFAULT '',
                     license TEXT DEFAULT '',
