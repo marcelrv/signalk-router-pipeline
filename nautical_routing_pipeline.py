@@ -147,6 +147,14 @@ def _edge_attr_worker(edge_chunk):
                                         best = float(val)
                                         upper = row['DRVAL2'] if 'DRVAL2' in row else None
                                         best_upper = float(upper) if pd.notna(upper) else None
+                            # See DRYING_BAND_IMPLAUSIBLE_DRVAL1_M: an implausibly
+                            # extreme DRVAL1 (e.g. -50) with a plausible DRVAL2 is a
+                            # coarse-band placeholder on the drying side, not a real
+                            # reading -- the upper bound is the trustworthy one.
+                            if (best is not None and best_upper is not None
+                                    and best < DRYING_BAND_IMPLAUSIBLE_DRVAL1_M
+                                    and best_upper >= DRYING_BAND_IMPLAUSIBLE_DRVAL1_M):
+                                best = best_upper
                             sampled.append((best, best_upper) if best is not None else (99.0, None))
                         min_val = min(d1 for d1, _ in sampled)
                         # A DRVAL1 of 0 is only meaningful when the band is tight.
@@ -331,6 +339,19 @@ DEPTH_SENTINEL_SCHEMA_VERSION = 2
 # A DEPARE band of DRVAL1=0 with an upper bound at least this deep carries no
 # usable minimum -- it is a coarse "0 to X" band, not a survey saying 0m.
 COARSE_DEPTH_BAND_DRVAL2_M = 10.0
+# The mirror-image artifact on the drying side: RWS Zeeland's DEPARE data
+# carries 1,901 polygons banded DRVAL1=-50.0/DRVAL2=-4.0, all at exactly this
+# pair -- verified against the full band table (a clean 0/0.5/1/.../8/10/20/
+# /30/40/50/100 S-57 scheme) and geography (the three largest, 6.36/2.39/
+# 2.17 km^2, centre on Verdronken Land van Saeftinghe, a real tidal marsh).
+# -50 is almost certainly the SAME catch-all placeholder the positive scale
+# uses for its widest band (40-50, 50-100), reused with a minus sign where it
+# does not belong -- every genuine drying reading elsewhere in this dataset
+# stays inside -7.0m, and no charted intertidal height on Earth approaches
+# -20m, let alone -50m. DRVAL2 (-4.0, itself an ordinary band boundary) is
+# the trustworthy bound. Same fix shape as COARSE_DEPTH_BAND_DRVAL2_M above,
+# mirrored onto the drying side instead of the positive-floor side.
+DRYING_BAND_IMPLAUSIBLE_DRVAL1_M = -20.0
 # How far outside this region's own water an ADOPTED seam node may sit and still
 # be connected (_connect_adopted_node). A seam node is authored from the
 # NEIGHBOUR's water geometry, digitised from different ENC cells, so it routinely
@@ -3783,6 +3804,13 @@ class NauticalRoutingPipeline:
                         # Preserve sign -- see UNKNOWN_DEPTH: a genuine drying
                         # height is real data, not flooring material.
                         depth = float(row["DRVAL1"])
+                        # See DRYING_BAND_IMPLAUSIBLE_DRVAL1_M: an implausibly
+                        # extreme DRVAL1 with a plausible DRVAL2 is a coarse-band
+                        # placeholder on the drying side, not a real reading.
+                        if depth < DRYING_BAND_IMPLAUSIBLE_DRVAL1_M and "DRVAL2" in row and pd.notnull(row["DRVAL2"]):
+                            upper = float(row["DRVAL2"])
+                            if upper >= DRYING_BAND_IMPLAUSIBLE_DRVAL1_M:
+                                depth = upper
                     else:
                         depth = 99.0
                     found += 1
