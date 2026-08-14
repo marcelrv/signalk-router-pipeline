@@ -323,18 +323,29 @@ NODE_KIND_NAVMESH_VERTEX = 1
 NODE_KIND_SUPERNODE = 2
 DEFAULT_SOURCE_TIER = 1  # 1 = official hydrographic authority (ENC/IENC)
 # Depth sentinel for "unknown, do not constrain" (ROUTEIQ_NEXT_PHASES.md,
-# "Negative charted depths are read as unknown"). Deliberately far outside any
-# plausible charted drying height (a bank drying tens of metres does not
-# exist) so it stays distinguishable from a genuine negative DRVAL1 -- a
-# drying/intertidal bank exposed at low water, which the pipeline now emits
-# as-is (e.g. -2.0) instead of flooring to 0.0. Consumers must gate on
-# metadata.schema_version >= DEPTH_SENTINEL_SCHEMA_VERSION before trusting
-# real negatives; older builds still floor drying heights to 0.0 and use -1
-# for unknown.
+# "Negative charted depths are read as unknown" / "Depth-unknown is declared
+# by the file, not inferred"). Deliberately far outside any plausible charted
+# drying height (a bank drying tens of metres does not exist) so it stays
+# distinguishable from a genuine negative DRVAL1 -- a drying/intertidal bank
+# exposed at low water, which the pipeline now emits as-is (e.g. -2.0)
+# instead of flooring to 0.0.
+#
+# Consumers must read this build's own declared value from
+# metadata.depth_unknown_sentinel (this constant, when present), NOT gate on
+# schema_version: schema_version numbers the database FORMAT and had already
+# reached 3 on legacy-convention builds for unrelated reasons before this
+# column existed, so no schema_version threshold can ever separate the two
+# depth conventions -- routeiq shipped exactly that gate once (PR #31) and it
+# silently misread 92% of a live European build's edges as "dries 1.0 m".
+# Builds that omit depth_unknown_sentinel (older than this change) still
+# floor drying heights to 0.0 and use -1 for unknown; that is what an absent
+# column means to a tolerant reader, and it must keep meaning that.
 UNKNOWN_DEPTH = -999.0
 # metadata.schema_version bumped to this the first time a build emits the
 # -999 sentinel (was 1, always floored negatives to 0.0 and used -1 for
-# unknown). See UNKNOWN_DEPTH above.
+# unknown) -- a general format-version bump for the new
+# depth_unknown_sentinel column, not itself load-bearing for depth semantics
+# (see UNKNOWN_DEPTH above; do not let a consumer start gating on it again).
 DEPTH_SENTINEL_SCHEMA_VERSION = 2
 # A DEPARE band of DRVAL1=0 with an upper bound at least this deep carries no
 # usable minimum -- it is a coarse "0 to X" band, not a survey saying 0m.
@@ -3947,6 +3958,19 @@ class NauticalRoutingPipeline:
                     bounding_box TEXT,
                     boundary_geometry TEXT,
                     schema_version INTEGER DEFAULT 2,
+                    -- The value this build reserves for "depth unknown" (see
+                    -- UNKNOWN_DEPTH). A consumer must read this column, not
+                    -- schema_version, to decide whether a negative min_depth/
+                    -- node_depth is a real drying height or unknown --
+                    -- schema_version numbers the database FORMAT and had
+                    -- already reached 3 on legacy-convention builds for
+                    -- unrelated reasons before this column existed, so no
+                    -- schema_version threshold can separate the two
+                    -- conventions (routeiq ROUTEIQ_NEXT_PHASES.md, "Depth-
+                    -- unknown is declared by the file, not inferred").
+                    -- NULL (the default) means the legacy convention: any
+                    -- negative value is unknown.
+                    depth_unknown_sentinel REAL DEFAULT NULL,
                     contributor TEXT DEFAULT '',
                     url TEXT DEFAULT '',
                     license TEXT DEFAULT '',
@@ -4084,10 +4108,10 @@ class NauticalRoutingPipeline:
             bbox_json, boundary_json = self._compute_boundary_geometry()
             cursor.execute(
                 """INSERT INTO metadata
-                   (country, name, description, last_update_date, tags, bounding_box, boundary_geometry, schema_version, contributor, url, license, copyright, architecture, dataset_version)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   (country, name, description, last_update_date, tags, bounding_box, boundary_geometry, schema_version, depth_unknown_sentinel, contributor, url, license, copyright, architecture, dataset_version)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                  (self.country, self.region_name, self.description, now_utc,
-                 self.tags, bbox_json, boundary_json, DEPTH_SENTINEL_SCHEMA_VERSION,
+                 self.tags, bbox_json, boundary_json, DEPTH_SENTINEL_SCHEMA_VERSION, UNKNOWN_DEPTH,
                  self.contributor, self.url,
                  self.license, self.copyright, self.architecture, self.dataset_version)
             )
