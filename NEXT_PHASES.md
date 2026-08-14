@@ -3821,3 +3821,33 @@ want; ~30–60 km beyond the coast is probably the right compromise, but it is a
 coverage decision, not a technical one. Cost: ~2 h for a full 12-region rebuild
 from a fresh registry (rebuilding a subset would leave seam relationships
 inconsistent).
+
+### 2026-08-14 — CodeRabbit on the depth-sentinel PR: one fixed, one open question
+
+`depth-sentinel-999` (PR #3) got a real CodeRabbit review (after a false start —
+merging the sync PR seconds after opening it, and later a same-content throwaway
+PR, both denied it a chance to run; see PR #2/#4 discussion). Two "Major" findings:
+
+**Fixed**: `_compute_node_depths()` stopped at the first containing DEPARE
+polygon instead of evaluating every candidate and picking the finest DRVAL1 —
+the same multi-scale-cell overlap Round 18 fixed for edges, just never applied
+to node depths. Made node depth spatial-index-order-dependent and able to
+disagree with the edges meeting it. Rewritten to mirror the edge sampler's
+candidate loop exactly.
+
+**Open, not fixed**: `run_pipeline()` runs `_adopt_seam_nodes()` then
+`_compute_node_depths()` (line 736/741), and the latter unconditionally
+recomputes `node_depth` for every node — including ones just adopted verbatim
+from the seam registry, discarding whatever depth the registry carried for
+them. This might be intentional: §3.2/3.3 above and the code comment right
+before the publish-pass call both suggest each build is meant to validate/
+refresh a boundary node's depth against its own local DEPARE data before
+republishing, not blindly trust the neighbour's number. But if an adopted node
+sits just outside this build's own DEPARE coverage (plausible right at a seam,
+despite the `--overlap-deg` connectivity guarantee — overlap guarantees a
+nearby *edge* neighbour, not necessarily DEPARE *polygon* coverage at that
+exact point), it silently downgrades to `UNKNOWN_DEPTH` or a wrong value
+instead of keeping the registry's real one. Needs a deliberate design decision
+(preserve adopted depths outright? only fall back to registry value when local
+recomputation finds nothing? something else?), not a reflexive patch — left
+unchanged pending that.
