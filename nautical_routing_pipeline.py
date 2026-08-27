@@ -2671,7 +2671,7 @@ class NauticalRoutingPipeline:
         node_id = self._get_or_create_node(lon, lat, node_type)
         return node_id, (pt_m.x, pt_m.y)
 
-    def _remesh_local_gap(self, i: int, j: int, ids, coords_m, coords_wgs84, poly_m, utm,
+    def _remesh_local_gap(self, i: int, j: int, ids, coords_m, coords_wgs84, poly_m, poly_prep, utm,
                           source_tier, source_id) -> int:
         """Re-rasterize a small window around candidate nodes ids[i]/ids[j] at a
         fixed fine pixel size and, if their medial axis is genuinely connected
@@ -2739,9 +2739,18 @@ class NauticalRoutingPipeline:
         # LOCAL_GAP_RESOLVE_SNAP_M, same discipline build_skeleton_network uses
         # via _get_or_create_node's coordinate-rounding dedupe, just with an
         # explicit wider tolerance since this bridges two independently-built
-        # meshes rather than deduping within one.
-        pool_ids = list(ids)
-        pool_coords_m = coords_m.copy()
+        # meshes rather than deduping within one. Pool is pre-filtered to the
+        # remesh window (+ snap margin) rather than the whole component's
+        # `ids` -- a component can hold tens of thousands of nodes, and only
+        # ones inside this ~600m window can ever be within snap_m of a local
+        # skeleton node.
+        in_window = ((coords_m[:, 0] >= minx - LOCAL_GAP_RESOLVE_SNAP_M) &
+                     (coords_m[:, 0] <= maxx + LOCAL_GAP_RESOLVE_SNAP_M) &
+                     (coords_m[:, 1] >= miny - LOCAL_GAP_RESOLVE_SNAP_M) &
+                     (coords_m[:, 1] <= maxy + LOCAL_GAP_RESOLVE_SNAP_M))
+        window_idxs = np.flatnonzero(in_window)
+        pool_ids = [ids[k] for k in window_idxs]
+        pool_coords_m = coords_m[window_idxs].copy()
         node_map = {}
         for n in local_ids:
             lon, lat = G_local.nodes[n]["lonlat"]
@@ -2755,10 +2764,22 @@ class NauticalRoutingPipeline:
         added = 0
         for u, v, d in G_local.edges(data=True):
             full_pts, full_widths = d["pts"], d["width_profile"]
+            # G_local is undirected -- edge iteration does not guarantee u
+            # corresponds to full_pts[0]: a node already present in G_local
+            # from an EARLIER edge (in that edge's "end" role) is reported
+            # first regardless of the argument order THIS edge's own
+            # add_edge call used (confirmed via networkx directly). Resolve
+            # each end by matching against the two nodes' own recorded
+            # lonlat instead of assuming u/v order matches pts order --
+            # otherwise a multi-segment chain's outer hops can bind to the
+            # wrong endpoint node, producing a straight chord to the wrong
+            # place instead of following the validated centerline.
+            node_start = u if G_local.nodes[u]["lonlat"] == full_pts[0] else v
+            node_end = v if node_start == u else u
             for sub_pts, sub_widths in self._resample_long_skeleton_edges(full_pts, full_widths, cfg.max_segment_m):
-                su = node_map[u] if sub_pts[0] == full_pts[0] else \
+                su = node_map[node_start] if sub_pts[0] == full_pts[0] else \
                     self._get_or_create_node(sub_pts[0][0], sub_pts[0][1], "coastal")
-                sv = node_map[v] if sub_pts[-1] == full_pts[-1] else \
+                sv = node_map[node_end] if sub_pts[-1] == full_pts[-1] else \
                     self._get_or_create_node(sub_pts[-1][0], sub_pts[-1][1], "coastal")
                 if su == sv:
                     continue
@@ -2778,9 +2799,10 @@ class NauticalRoutingPipeline:
         # centerline (collapsed away, never a G_local node in its own right),
         # so node_map's per-chain-endpoint snap above isn't guaranteed to have
         # touched them directly. Same safety gates as the ordinary stitch
-        # passes (poly_prep containment + _crosses_land) apply here too.
-        from shapely.prepared import prep as _prep
-        poly_prep_local = _prep(poly_m)
+        # passes (poly_prep containment + _crosses_land) apply here too --
+        # reuses the caller's already-built poly_prep (same poly_m this
+        # method received) rather than re-preparing the full-component
+        # polygon's edge index on every successful pair.
         for idx in (i, j):
             orig_id = ids[idx]
             touched = set(node_map.values())
@@ -2798,7 +2820,7 @@ class NauticalRoutingPipeline:
             best_lon, best_lat = self.graph.nodes[best_id]["lon"], self.graph.nodes[best_id]["lat"]
             best_pt_m = gpd.GeoSeries([Point(best_lon, best_lat)], crs=self.CRS_WGS84).to_crs(utm).iloc[0]
             candidate_m = LineString([coords_m[idx], (best_pt_m.x, best_pt_m.y)])
-            if not poly_prep_local.contains(candidate_m):
+            if not poly_prep.contains(candidate_m):
                 continue
             if self._crosses_land(LineString([(olon, olat), (best_lon, best_lat)])):
                 continue
@@ -2827,30 +2849,33 @@ class NauticalRoutingPipeline:
         if len(groups) <= 1:
             return 0
 
+        # Nearest-first candidate pairs across DIFFERENT groups. A separate
+        # cKDTree per group, cross-queried against every other group, is
+        # O(groups x nodes) -- Pass 0's own comment above records 8440
+        # union-find groups for one real component, which would make that
+        # approach run hundreds of millions of queries right when this
+        # last-resort pass is most likely to be reached (a highly fragmented
+        # component). One tree over ALL nodes, queried once for each node's
+        # k nearest neighbours within LOCAL_GAP_RESOLVE_MAX_M, gives the same
+        # nearest-first cross-group candidates in O(nodes log nodes) --
+        # filtering to cross-group pairs afterward is cheap since only a
+        # bounded k per node is ever considered.
         from scipy.spatial import cKDTree
-        group_keys = list(groups.keys())
-        group_trees = {g: cKDTree(coords_m[idxs]) for g, idxs in groups.items()}
-
-        # Nearest-first candidate pairs across DIFFERENT groups: for every node,
-        # find its nearest neighbour in every OTHER group within
-        # LOCAL_GAP_RESOLVE_MAX_M, then walk all resulting candidates in
-        # distance order so the tightest, most-likely-genuine gaps are
-        # attempted first (and the per-component cap below is spent on those).
+        all_tree = cKDTree(coords_m)
+        k = min(8, len(ids))
+        dists, nns = all_tree.query(coords_m, k=k, distance_upper_bound=LOCAL_GAP_RESOLVE_MAX_M)
+        dists = np.atleast_2d(dists)
+        nns = np.atleast_2d(nns)
         candidates = []
-        for gi, idxs in groups.items():
-            pts = coords_m[idxs]
-            for gj in group_keys:
-                if gj == gi:
+        for a in range(len(ids)):
+            for dist, b in zip(dists[a], nns[a]):
+                b = int(b)
+                # cKDTree pads unfilled slots (fewer than k neighbours within
+                # the distance bound) with index==n and distance==inf.
+                if b >= len(ids) or not np.isfinite(dist) or a == b:
                     continue
-                dists, nn = group_trees[gj].query(pts, k=1)
-                dists = np.atleast_1d(dists)
-                nn = np.atleast_1d(nn)
-                for local_i, (dist, nn_j) in enumerate(zip(dists, nn)):
-                    if dist > LOCAL_GAP_RESOLVE_MAX_M:
-                        continue
-                    gi_idx = idxs[local_i]
-                    gj_idx = groups[gj][int(nn_j)]
-                    candidates.append((dist, gi_idx, gj_idx))
+                if find(ids[a]) != find(ids[b]):
+                    candidates.append((float(dist), a, b))
         candidates.sort(key=lambda t: t[0])
 
         added = 0
@@ -2870,7 +2895,7 @@ class NauticalRoutingPipeline:
             if not poly_prep.contains(candidate_m):
                 continue
 
-            n_added = self._remesh_local_gap(i, j, ids, coords_m, coords_wgs84, poly_m, utm,
+            n_added = self._remesh_local_gap(i, j, ids, coords_m, coords_wgs84, poly_m, poly_prep, utm,
                                              source_tier, source_id)
             if n_added:
                 added += n_added
