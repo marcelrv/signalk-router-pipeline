@@ -544,8 +544,20 @@ LOCAL_GAP_RESOLVE_MIN_SPUR_M = 10.0        # spur-prune threshold for the tiny l
                                             # (scaled down from ClassificationConfig's 60m default,
                                             # which is sized for whole-piece rasters, not a
                                             # <=~600m window)
-MAX_LOCAL_GAP_RESOLVE_PER_COMPONENT = 25   # cap so a pathologically fragmented component can't
-                                            # blow up build time in this fallback pass
+MAX_LOCAL_GAP_RESOLVE_PER_COMPONENT = 200  # cap so a pathologically fragmented component can't
+                                            # blow up build time in this fallback pass -- raised
+                                            # from an initial 25 after switching candidate
+                                            # generation to query_ball_point (see above): a real
+                                            # coastline can legitimately have more than 25 narrow
+                                            # throats needing this pass in one original water-body
+                                            # component (confirmed on a full fl_atl_s rebuild: 25
+                                            # capped out on OTHER, closer gaps before ever reaching
+                                            # Lake Worth Inlet's own 39.7m one, leaving the
+                                            # motivating case for this whole pass unresolved; 200
+                                            # resolved 203 real gaps region-wide with no measurable
+                                            # build-time increase, since each resolution is a tiny
+                                            # bounded local raster, not the whole-piece rasters
+                                            # this cap was originally modeled after)
 
 
 @dataclass
@@ -2855,27 +2867,28 @@ class NauticalRoutingPipeline:
         # union-find groups for one real component, which would make that
         # approach run hundreds of millions of queries right when this
         # last-resort pass is most likely to be reached (a highly fragmented
-        # component). One tree over ALL nodes, queried once for each node's
-        # k nearest neighbours within LOCAL_GAP_RESOLVE_MAX_M, gives the same
-        # nearest-first cross-group candidates in O(nodes log nodes) --
-        # filtering to cross-group pairs afterward is cheap since only a
-        # bounded k per node is ever considered.
+        # component). A single tree over ALL nodes queried with a fixed k
+        # (tried first) has its own failure mode -- Pass 0's own docstring
+        # already documents it for a differently-scoped query: if a node has
+        # more same-group neighbours than k closer than the true cross-group
+        # candidate, that candidate never appears in its top-k and the gap
+        # silently goes unresolved, no different from the crowding Pass 0b
+        # exists to fix. `query_ball_point` returns every node within
+        # LOCAL_GAP_RESOLVE_MAX_M instead of just the k nearest, so no amount
+        # of same-group crowding can hide a genuine cross-group candidate --
+        # still O(nodes x local-density), not O(groups x nodes), since the
+        # radius this pass searches is deliberately tight.
         from scipy.spatial import cKDTree
         all_tree = cKDTree(coords_m)
-        k = min(8, len(ids))
-        dists, nns = all_tree.query(coords_m, k=k, distance_upper_bound=LOCAL_GAP_RESOLVE_MAX_M)
-        dists = np.atleast_2d(dists)
-        nns = np.atleast_2d(nns)
+        own_group = [find(n) for n in ids]
+        neighbor_lists = all_tree.query_ball_point(coords_m, r=LOCAL_GAP_RESOLVE_MAX_M)
         candidates = []
-        for a in range(len(ids)):
-            for dist, b in zip(dists[a], nns[a]):
-                b = int(b)
-                # cKDTree pads unfilled slots (fewer than k neighbours within
-                # the distance bound) with index==n and distance==inf.
-                if b >= len(ids) or not np.isfinite(dist) or a == b:
+        for a, neighbors in enumerate(neighbor_lists):
+            for b in neighbors:
+                if b <= a or own_group[a] == own_group[b]:
                     continue
-                if find(ids[a]) != find(ids[b]):
-                    candidates.append((float(dist), a, b))
+                dist = float(np.hypot(*(coords_m[a] - coords_m[b])))
+                candidates.append((dist, a, b))
         candidates.sort(key=lambda t: t[0])
 
         added = 0
