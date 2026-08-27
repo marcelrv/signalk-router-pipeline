@@ -2,17 +2,28 @@
 """
 Deploy a routing database to the signalk-router-data repository.
 
-Zips the .sqlite file and places it in the correct folder structure
-under the data-repo directory, then regenerates index.json.
+The database itself is published as an asset on a rolling GitHub Release
+(`routing-databases-latest`) rather than committed to the repository — the
+same pattern the tide/current GRIB files already use. Assets are overwritten
+in place, so rebuilding a region as often as you like costs nothing in git
+history; committing a 10 MB .sqlite.gz per rebuild would bloat it forever,
+because git never discards the old blobs.
+
+What lands in the data repo is a small `<region>.index.json` descriptor: the
+region's catalog entry (metadata, stats, bounding box, checksum) read out of
+the database at deploy time. `scripts/generate_index.py` merges the
+descriptors into routing-index.json without needing the databases present.
 
 Usage:
-    python3 backend/deploy_to_data_repo.py \
-        --input ./netherlands.sqlite \
-        --continent europe \
-        --country nl \
-        --region netherlands \
-        --no-generate-index \
-        --data-repo /home/node/signalkdev/router-data
+    # Build the descriptor + upload the asset to the release
+    python3 deploy_to_data_repo.py \
+        --input ./data/zeeland.sqlite \
+        --continent europe --country nl --region zeeland \
+        --data-repo /home/node/signalkdev/router-data \
+        --upload
+
+    # Dry run: descriptor only, nothing published
+    python3 deploy_to_data_repo.py ... --no-upload
 """
 
 import os
@@ -24,7 +35,12 @@ import hashlib
 import sqlite3
 import argparse
 import subprocess
-from pathlib import Path
+import tempfile
+from datetime import datetime, timezone
+
+DEFAULT_RELEASE_TAG = "routing-databases-latest"
+DEFAULT_GH_REPO = "marcelrv/signalk-router-data"
+RELEASE_TITLE = "Routing Databases — Nautical Routing Graphs"
 
 
 def sha256_file(path: str) -> str:
@@ -38,144 +54,203 @@ def sha256_file(path: str) -> str:
     return h.hexdigest()
 
 
-def read_metadata_for_verify(db_path: str) -> dict | None:
-    """Quick metadata read for verification before deployment."""
+def load_metadata_reader(data_repo: str):
+    """Import the data repo's own metadata reader.
+
+    Reusing it rather than reimplementing keeps the descriptor byte-identical
+    to what generate_index.py would have produced from the same database, so
+    switching a region between release-hosted and repo-hosted never changes
+    the catalog entry.
+    """
+    scripts_dir = os.path.join(data_repo, 'scripts')
+    index_script = os.path.join(scripts_dir, 'generate_index.py')
+    if not os.path.isfile(index_script):
+        print(f"ERROR: {index_script} not found — is --data-repo correct?", file=sys.stderr)
+        sys.exit(1)
+    sys.path.insert(0, scripts_dir)
+    import generate_index  # noqa: E402
+    return generate_index
+
+
+def verify_gz(gz_path: str, inner_filename: str):
+    """Decompress to a temp dir and confirm the result is a usable database."""
+    tmpdir = tempfile.mkdtemp(prefix="deploy_verify_")
     try:
-        conn = sqlite3.connect(db_path)
-        conn.row_factory = sqlite3.Row
-        cur = conn.cursor()
-        cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='metadata'")
-        if not cur.fetchone():
-            conn.close()
-            return None
-        cur.execute("SELECT country, name, description, schema_version FROM metadata LIMIT 1")
-        row = cur.fetchone()
+        out = os.path.join(tmpdir, inner_filename)
+        with gzip.open(gz_path, 'rb') as f_in, open(out, 'wb') as f_out:
+            shutil.copyfileobj(f_in, f_out)
+        conn = sqlite3.connect(out)
+        conn.execute("SELECT COUNT(*) FROM nodes").fetchone()
         conn.close()
-        if not row:
-            return None
-        return dict(row)
-    except Exception as e:
-        return None
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def run_gh(args: list, **kwargs) -> subprocess.CompletedProcess:
+    return subprocess.run(["gh"] + args, capture_output=True, text=True, **kwargs)
+
+
+def upload_asset(gz_path: str, tag: str, gh_repo: str):
+    """Upload (clobbering) the asset, creating the release if it doesn't exist."""
+    name = os.path.basename(gz_path)
+    print(f"Uploading {name} to release {tag} ...", file=sys.stderr)
+    res = run_gh(["release", "upload", tag, gz_path, "--clobber", "--repo", gh_repo])
+    if res.returncode == 0:
+        print(f"  Uploaded to {tag}", file=sys.stderr)
+        return
+
+    if "release not found" not in res.stderr.lower():
+        print(f"ERROR: upload failed:\n{res.stderr}", file=sys.stderr)
+        sys.exit(1)
+
+    print(f"  Release {tag} does not exist — creating it...", file=sys.stderr)
+    created = run_gh([
+        "release", "create", tag, gz_path,
+        "--repo", gh_repo,
+        "--title", RELEASE_TITLE,
+        "--notes", "(placeholder — regenerated by the Generate Routing Index workflow)",
+        "--latest=false",
+    ])
+    if created.returncode != 0:
+        print(f"ERROR: release creation failed:\n{created.stderr}", file=sys.stderr)
+        sys.exit(1)
+    print(f"  Created {tag} and uploaded {name}", file=sys.stderr)
+
+
+def build_descriptor(gi, sqlite_path: str, gz_path: str, region_id: str,
+                     inner_filename: str, release_tag: str) -> dict:
+    md = gi.read_metadata_from_sqlite(sqlite_path)
+    if md is None:
+        print(f"ERROR: {sqlite_path} has no metadata table or invalid schema.\n"
+              f"       Run the pipeline with --tags etc. so it writes one.", file=sys.stderr)
+        sys.exit(1)
+
+    return {
+        "id": region_id,
+        "filename": os.path.basename(gz_path),
+        "release_tag": release_tag,
+        "inner_filename": inner_filename,
+        "sha256": sha256_file(gz_path),
+        "size_bytes": os.path.getsize(gz_path),
+        "compression": "gzip",
+        "country": md.get("country", ""),
+        "name": md.get("name", ""),
+        "description": md.get("description", ""),
+        "last_update": md.get("last_update", ""),
+        "schema_version": md.get("schema_version", 1),
+        "tags": md.get("tags", []),
+        "contributor": md.get("contributor", ""),
+        "url": md.get("url", ""),
+        "bounding_box": md.get("bounding_box"),
+        "boundary_geometry": md.get("boundary_geometry"),
+        "stats": md.get("stats", {}),
+        "deployed": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    }
 
 
 def deploy(args):
     input_path = os.path.abspath(args.input)
     data_repo = os.path.abspath(args.data_repo)
-    continent = args.continent
-    country = args.country
-    region = args.region
 
-    # Validate input file
     if not os.path.isfile(input_path):
         print(f"ERROR: input file not found: {input_path}", file=sys.stderr)
         sys.exit(1)
-
     if not input_path.endswith('.sqlite'):
         print(f"WARNING: input file does not end with .sqlite: {input_path}", file=sys.stderr)
 
-    # Verify metadata exists in the database
-    meta = read_metadata_for_verify(input_path)
-    if meta is None:
-        print(f"ERROR: {input_path} has no metadata table or invalid schema. Run the pipeline with --tags etc.", file=sys.stderr)
-        sys.exit(1)
+    gi = load_metadata_reader(data_repo)
 
-    print(f"Database: {meta.get('country', '?')} — {meta.get('name', '?')} (schema v{meta.get('schema_version', '?')})", file=sys.stderr)
+    base_name = args.region
+    inner_filename = f"{base_name}.sqlite"
+    gz_filename = f"{base_name}.sqlite.gz"
 
-    # Determine output paths
-    regions_dir = os.path.join(data_repo, 'regions', continent, country)
-    os.makedirs(regions_dir, exist_ok=True)
+    # Region id must match generate_index.py's path-derived id exactly, or the
+    # descriptor and a local file copy would show up as two separate regions.
+    region_id = f"{args.continent}_{args.country}_{base_name}".lower()
 
-    base_name = region  # e.g. "netherlands"
-    sqlite_filename = f"{base_name}.sqlite"
-    zip_filename = f"{base_name}.sqlite.gz"
-    zip_path = os.path.join(regions_dir, zip_filename)
+    # The compressed asset is a build artifact, not repo content: it is staged
+    # outside regions/ so it can never be picked up by `git add regions/`.
+    staging_dir = os.path.abspath(args.staging_dir) if args.staging_dir \
+        else os.path.join(data_repo, '.release-staging')
+    os.makedirs(staging_dir, exist_ok=True)
+    gz_path = os.path.join(staging_dir, gz_filename)
 
-    # Gzip the .sqlite file (gzip is smaller than zip, native Python support, and
-    # decompress-on-the-fly via Content-Encoding if served from a proper web server,
-    # though our GitHub raw use-case will just download and decompress locally)
-    print(f"Compressing {input_path} -> {zip_path} ...", file=sys.stderr)
+    print(f"Compressing {input_path} -> {gz_path} ...", file=sys.stderr)
     input_size = os.path.getsize(input_path)
     with open(input_path, 'rb') as f_in:
-        with gzip.open(zip_path, 'wb', compresslevel=9) as f_out:
+        with gzip.open(gz_path, 'wb', compresslevel=9) as f_out:
             shutil.copyfileobj(f_in, f_out)
-    zip_size = os.path.getsize(zip_path)
-    ratio = (1 - zip_size / input_size) * 100
-    print(f"  {input_size / 1048576:.1f} MB -> {zip_size / 1048576:.1f} MB ({ratio:.0f}% compression)", file=sys.stderr)
+    gz_size = os.path.getsize(gz_path)
+    ratio = (1 - gz_size / input_size) * 100
+    print(f"  {input_size / 1048576:.1f} MB -> {gz_size / 1048576:.1f} MB "
+          f"({ratio:.0f}% compression)", file=sys.stderr)
 
-    # Compute sha256 of the .gz file
-    checksum = sha256_file(zip_path)
-
-    # Verify the .gz is valid by decompressing to temp
-    temp_dir = os.path.join(data_repo, '.tmp_verify')
-    os.makedirs(temp_dir, exist_ok=True)
-    verify_path = os.path.join(temp_dir, sqlite_filename)
     try:
-        with gzip.open(zip_path, 'rb') as f_in:
-            with open(verify_path, 'wb') as f_out:
-                shutil.copyfileobj(f_in, f_out)
-        # Quick sanity check
-        conn = sqlite3.connect(verify_path)
-        conn.execute("SELECT COUNT(*) FROM nodes").fetchone()
-        conn.close()
-        os.remove(verify_path)
-        os.rmdir(temp_dir)
+        verify_gz(gz_path, inner_filename)
     except Exception as e:
-        os.remove(zip_path)
-        shutil.rmtree(temp_dir, ignore_errors=True)
+        os.remove(gz_path)
         print(f"ERROR: compressed file verification failed: {e}", file=sys.stderr)
         sys.exit(1)
 
-    print(f"  SHA256: {checksum}", file=sys.stderr)
+    descriptor = build_descriptor(gi, input_path, gz_path, region_id,
+                                  inner_filename, args.release_tag)
+    print(f"Database: {descriptor['country'] or '?'} — {descriptor['name'] or '?'} "
+          f"(schema v{descriptor['schema_version']})", file=sys.stderr)
+    print(f"  SHA256: {descriptor['sha256']}", file=sys.stderr)
+    stats = descriptor.get("stats") or {}
+    print(f"  Nodes: {stats.get('nodes', '?')}  Edges: {stats.get('edges', '?')}  "
+          f"POIs: {stats.get('pois', '?')}", file=sys.stderr)
 
-    # Write a companion .metadata.json with the info the index script needs
-    # (So generate_index.py doesn't need to decompress every DB just to read metadata)
-    metadata_json_path = os.path.join(regions_dir, f"{base_name}.metadata.json")
-    # Copy the sqlite metadata file alongside for faster index generation
-    # The index script can use this instead of decompressing
-    meta_out = {
-        "country": meta["country"],
-        "name": meta["name"],
-        "description": meta.get("description", ""),
-        "schema_version": meta.get("schema_version", 1),
-    }
-    with open(metadata_json_path, 'w') as f:
-        json.dump(meta_out, f, indent=2)
+    # Upload BEFORE writing the descriptor: a descriptor committed for an asset
+    # that never made it to the release would publish a catalog entry whose
+    # download 404s for every user until the next successful deploy.
+    if args.upload:
+        upload_asset(gz_path, args.release_tag, args.gh_repo)
+    else:
+        print(f"Skipping upload (--no-upload). Asset staged at {gz_path}", file=sys.stderr)
 
-    # Also copy a clean copy of the .sqlite for direct local use (not committed to git)
-    # but create a symlink instead to save space
-    sqlite_local_path = os.path.join(data_repo, 'regions', continent, country, sqlite_filename)
-    if os.path.exists(sqlite_local_path):
-        os.remove(sqlite_local_path)
+    regions_dir = os.path.join(data_repo, 'regions', args.continent, args.country)
+    os.makedirs(regions_dir, exist_ok=True)
+    descriptor_path = os.path.join(regions_dir, f"{base_name}.index.json")
+    with open(descriptor_path, 'w') as f:
+        json.dump(descriptor, f, indent=2)
+        f.write("\n")
+    print(f"\nDescriptor: {descriptor_path}", file=sys.stderr)
 
-    print(f"\nDeployed: {zip_path}", file=sys.stderr)
-    print(f"  Size: {zip_size} bytes ({zip_size / 1048576:.1f} MB)", file=sys.stderr)
-    print(f"  Inner file: {sqlite_filename}", file=sys.stderr)
-    print(f"  Metadata: {metadata_json_path}", file=sys.stderr)
+    # A previously committed copy of this database would keep being served as
+    # the catalog's `file` for older clients and keep bloating history — flag
+    # it, but leave the removal to the operator.
+    legacy_gz = os.path.join(regions_dir, gz_filename)
+    legacy_meta = os.path.join(regions_dir, f"{base_name}.metadata.json")
+    for legacy in (legacy_gz, legacy_meta):
+        if os.path.exists(legacy):
+            rel = os.path.relpath(legacy, data_repo)
+            print(f"\nNOTE: {rel} is still in the data repo and is now redundant.\n"
+                  f"      Once the release asset is live, untrack it:\n"
+                  f"        git -C {data_repo} rm --cached '{rel}' && rm '{legacy}'",
+                  file=sys.stderr)
 
-    # Optionally regenerate index.json
     if args.generate_index:
-        print("\nRegenerating index.json and coverage map...", file=sys.stderr)
-        index_script = os.path.join(data_repo, 'scripts', 'generate_index.py')
-        if os.path.isfile(index_script):
-            result = subprocess.run(
-                [sys.executable, index_script,
-                 '--regions-dir', os.path.join(data_repo, 'regions'),
-                 '--output-dir', data_repo],
-                capture_output=True, text=True
-            )
-            print(result.stdout, file=sys.stderr)
-            if result.returncode != 0:
-                print(f"WARNING: index generation failed:\n{result.stderr}", file=sys.stderr)
-        else:
-            print(f"WARNING: {index_script} not found", file=sys.stderr)
+        print("\nRegenerating routing-index.json and coverage map...", file=sys.stderr)
+        result = subprocess.run(
+            [sys.executable, os.path.join(data_repo, 'scripts', 'generate_index.py'),
+             '--regions-dir', os.path.join(data_repo, 'regions'),
+             '--output-dir', data_repo],
+            capture_output=True, text=True
+        )
+        print(result.stderr, file=sys.stderr)
+        if result.returncode != 0:
+            print(f"WARNING: index generation failed:\n{result.stdout}", file=sys.stderr)
 
-    print("\nDone. Commit and push the data-repo to publish.", file=sys.stderr)
+    print(f"\nDone. Commit {os.path.relpath(descriptor_path, data_repo)} "
+          f"(and routing-index.json) to publish.", file=sys.stderr)
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Deploy a routing database to the signalk-router-data repository.\n"
-                    "Compresses the .sqlite with gzip and places it in the correct folder.",
+        description="Deploy a routing database to signalk-router-data: gzip it, "
+                    "upload it to the rolling GitHub Release, and write the "
+                    "catalog descriptor into the repo.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("--input", required=True, help="Path to the .sqlite file to deploy")
@@ -184,13 +259,23 @@ def main():
     parser.add_argument("--country", required=True,
                         help="Country slug (lowercase): nl, be, de, usa, etc.")
     parser.add_argument("--region", required=True,
-                        help="Region slug: netherlands, belgium, chesapeake-bay, etc.")
+                        help="Region slug: netherlands, zeeland, chesapeake-bay, etc.")
     parser.add_argument("--data-repo", required=True,
                         help="Path to the local clone of signalk-router-data")
+    parser.add_argument("--release-tag", default=DEFAULT_RELEASE_TAG,
+                        help=f"Rolling release tag to upload to (default: {DEFAULT_RELEASE_TAG})")
+    parser.add_argument("--gh-repo", default=DEFAULT_GH_REPO,
+                        help=f"GitHub repo hosting the release (default: {DEFAULT_GH_REPO})")
+    parser.add_argument("--staging-dir", default=None,
+                        help="Where to write the .sqlite.gz (default: <data-repo>/.release-staging)")
+    parser.add_argument("--upload", action="store_true", default=True,
+                        help="Upload the asset to the release (default: true)")
+    parser.add_argument("--no-upload", action="store_false", dest="upload",
+                        help="Build the descriptor and staged .gz without publishing")
     parser.add_argument("--generate-index", action="store_true", default=True,
-                        help="Regenerate index.json after deploy (default: true)")
+                        help="Regenerate routing-index.json after deploy (default: true)")
     parser.add_argument("--no-generate-index", action="store_false", dest="generate_index",
-                        help="Skip index.json regeneration")
+                        help="Skip routing-index.json regeneration")
 
     args = parser.parse_args()
     deploy(args)

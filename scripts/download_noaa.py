@@ -53,8 +53,13 @@ ALL_STATES = [
 
 REGIONS = {
     "us-east-coast": {
-        "states": ["ME", "NH", "MA", "RI", "CT", "NY", "NJ", "DE", "MD", "VA", "NC", "SC", "GA"],
-        "description": "US East Coast — Maine to Georgia (Atlantic seaboard)",
+        # FL's raw ZIP includes both its Atlantic and Gulf ENC cells (NOAA
+        # bundles per state, not per coast) -- it's downloaded here once and
+        # clipped twice downstream via build_region.sh's --states/--clip-bbox
+        # sub-region mode: us_east_fl (Atlantic clip) continues this chain
+        # south of GA, us_gulf_fl (Gulf clip) starts a future Gulf chain.
+        "states": ["ME", "NH", "MA", "RI", "CT", "NY", "NJ", "DE", "MD", "VA", "NC", "SC", "GA", "FL"],
+        "description": "US East Coast — Maine to Georgia to Florida (Atlantic seaboard, plus Florida's Gulf-side cells for a future Gulf build)",
     },
     "us-gulf-coast": {
         "states": ["FL", "AL", "MS", "LA", "TX"],
