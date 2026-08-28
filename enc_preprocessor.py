@@ -97,13 +97,37 @@ class ENCToGeoJSONPreprocessor:
 
         self._merge_and_export()
 
+    def _read_cell_cscl(self, file_path: str) -> int | None:
+        """Read this cell's DSID.DSPM_CSCL (compilation scale, e.g. 12000 for a
+        harbour cell, 180000 for a coastal one) -- the per-CELL scale NOAA
+        reliably populates, unlike per-feature SCAMIN/SORIND on DEPARE
+        (confirmed absent at source: every current-edition US ENC DEPARE
+        feature sampled has both null). Stamped onto every feature this cell
+        contributes (below) so per-cell scale survives _merge_and_export's
+        pd.concat, which otherwise discards cell identity irreversibly --
+        needed downstream (nautical_routing_pipeline.py's TRUSTED_SURVEY_CSCL_MAX)
+        to tell a coarse overview/general/coastal-scale DEPARE placeholder
+        from a real harbour/approach-scale survey reading, since NOAA reuses
+        the same standard depth-band cutoffs (0-1.8m, 0-5.4m, ...) at every
+        chart scale -- band width alone can't tell them apart."""
+        try:
+            dsid = gpd.read_file(file_path, layer='DSID')
+            if not dsid.empty and 'DSPM_CSCL' in dsid.columns:
+                val = dsid['DSPM_CSCL'].iloc[0]
+                if pd.notna(val):
+                    return int(val)
+        except Exception:
+            pass
+        return None
+
     def _extract_layers_from_file(self, file_path: str):
         """Extracts configured S-57 layers from a single ENC file."""
+        cscl = self._read_cell_cscl(file_path)
         for s57_layer, output_filename in self.layer_mapping.items():
             try:
                 # Read the specific layer from the S-57 file
                 gdf = gpd.read_file(file_path, layer=s57_layer)
-                
+
                 if not gdf.empty:
                     # Standardize to WGS84
                     if gdf.crs and gdf.crs != "EPSG:4326":
@@ -116,6 +140,9 @@ class ENCToGeoJSONPreprocessor:
                         # what lets a unified feature's origin still be told apart.
                         gdf = gdf.copy()
                         gdf['src_objl'] = s57_layer
+
+                    gdf = gdf.copy()
+                    gdf['src_cscl'] = cscl
 
                     self.extracted_data[output_filename].append(gdf)
             except Exception as e:
