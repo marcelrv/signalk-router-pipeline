@@ -2907,7 +2907,8 @@ class NauticalRoutingPipeline:
 
         # Combine Inland Waterways and Fairways to find the true navigable opening
         fw_gdfs = []
-        if not self.gdfs.get("fairways_unified", gpd.GeoDataFrame()).empty: fw_gdfs.append(self.gdfs["fairways_unified"])
+        if not self.gdfs.get("fairways_unified", gpd.GeoDataFrame()).empty:
+            fw_gdfs.append(self.gdfs["fairways_unified"])
         if not self.gdfs.get("inland_waterways", gpd.GeoDataFrame()).empty: fw_gdfs.append(self.gdfs["inland_waterways"])
         hw_gdf = pd.concat(fw_gdfs, ignore_index=True) if fw_gdfs else gpd.GeoDataFrame()
 
@@ -3059,7 +3060,8 @@ class NauticalRoutingPipeline:
 
         # Same two layers, same reasoning, as _add_opening_bridge_edges.
         fw_gdfs = []
-        if not self.gdfs.get("fairways_unified", gpd.GeoDataFrame()).empty: fw_gdfs.append(self.gdfs["fairways_unified"])
+        if not self.gdfs.get("fairways_unified", gpd.GeoDataFrame()).empty:
+            fw_gdfs.append(self.gdfs["fairways_unified"])
         if not self.gdfs.get("inland_waterways", gpd.GeoDataFrame()).empty: fw_gdfs.append(self.gdfs["inland_waterways"])
         hw_gdf = pd.concat(fw_gdfs, ignore_index=True) if fw_gdfs else gpd.GeoDataFrame()
 
@@ -3945,7 +3947,8 @@ class NauticalRoutingPipeline:
                 yield chunk
 
         fw_gdfs = []
-        if not self.gdfs.get("fairways_unified", gpd.GeoDataFrame()).empty: fw_gdfs.append(self.gdfs["fairways_unified"])
+        if not self.gdfs.get("fairways_unified", gpd.GeoDataFrame()).empty:
+            fw_gdfs.append(self.gdfs["fairways_unified"])
         if not self.gdfs.get("inland_waterways", gpd.GeoDataFrame()).empty: fw_gdfs.append(self.gdfs["inland_waterways"])
         highways_gdf = pd.concat(fw_gdfs, ignore_index=True) if fw_gdfs else gpd.GeoDataFrame(geometry=[])
 
