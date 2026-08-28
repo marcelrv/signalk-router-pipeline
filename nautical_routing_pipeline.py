@@ -749,7 +749,7 @@ class NauticalRoutingPipeline:
         for u, v, data in self.graph.edges(data=True):
             if data.get("is_opening_bridge_edge"):
                 data["max_air_draft"] = 999.0
-        self._compute_node_depths()
+        self._compute_node_depths(adopted_ids)
         # Publish pass runs after node depths are final, right before export,
         # so the registry gets each boundary node's real computed depth
         # (STITCHING_DESIGN.md Section 3.2).
@@ -1138,7 +1138,16 @@ class NauticalRoutingPipeline:
         # the one this function fixes). Erode the deep mask a further margin
         # past the ceiling contour so the region boundary sits inside
         # confirmed-deep water with real clearance, not exactly on the line.
-        pre_closing_m = (unary_union(list(deep_mask_m.geometry)).buffer(0)
+        # buffer(0) each geometry individually right before the union, not
+        # just relying on the make_valid()+is_valid filter above -- GEOS can
+        # still throw "TopologyException: side location conflict" out of
+        # unary_union on a large batch of inputs that each independently
+        # report is_valid=True (confirmed: FL Gulf's DEPARE-derived deep mask
+        # crashed here with exactly that exception despite every input having
+        # passed the is_valid filter). buffer(0) is a stronger/differently-
+        # implemented repair than make_valid() and is the standard GEOS
+        # workaround for this specific failure mode.
+        pre_closing_m = (unary_union([g.buffer(0) for g in deep_mask_m.geometry]).buffer(0)
                           .simplify(1.0).buffer(0))
         closed_m = pre_closing_m.buffer(DEPTH_SPLIT_CLOSING_RADIUS_M).buffer(-DEPTH_SPLIT_CLOSING_RADIUS_M)
 
@@ -3790,10 +3799,25 @@ class NauticalRoutingPipeline:
             f"{DEDUPE_RADIUS_M:.0f}m of a node this build adopted)."
         )
 
-    def _compute_node_depths(self):
+    def _compute_node_depths(self, adopted_ids: set = frozenset()):
+        """Recompute node_depth from this build's own DEPARE coverage.
+
+        Nodes in `adopted_ids` were just spliced in verbatim from the seam
+        registry by `_adopt_seam_nodes()` (STITCHING_DESIGN.md Section 3.3),
+        carrying another build's already-computed depth. Per NEXT_PHASES.md
+        "2026-08-14": only overwrite an adopted node's depth when this
+        build's own local DEPARE data actually contains that point -- an
+        adopted node sitting just outside this build's DEPARE coverage
+        (plausible right at a seam; `--overlap-deg` guarantees a nearby edge
+        neighbour, not DEPARE polygon coverage at that exact point) keeps the
+        registry's real depth instead of being silently downgraded to
+        UNKNOWN_DEPTH.
+        """
         depare_gdf = self.gdfs.get("depth_areas", gpd.GeoDataFrame())
         if depare_gdf.empty:
-            for _, data in self.graph.nodes(data=True):
+            for nid, data in self.graph.nodes(data=True):
+                if nid in adopted_ids:
+                    continue
                 data["node_depth"] = UNKNOWN_DEPTH
             return
 
@@ -3829,6 +3853,11 @@ class NauticalRoutingPipeline:
                             best = val
                             upper = row["DRVAL2"] if "DRVAL2" in row else None
                             best_upper = float(upper) if pd.notnull(upper) else None
+            if not any_containing and nid in adopted_ids:
+                # No local DEPARE reaches this adopted node -- keep the depth
+                # spliced in verbatim from the seam registry rather than
+                # downgrading a real, already-computed value to unknown.
+                continue
             if best is not None:
                 # Preserve sign -- see UNKNOWN_DEPTH: a genuine drying height
                 # is real data, not flooring material.
