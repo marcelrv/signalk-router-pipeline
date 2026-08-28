@@ -188,6 +188,26 @@ boundary, lock transit) still default to 999.0, so their behaviour is unchanged.
 
 Covered by `tests/test_edge_min_width.py`.
 
+#### 4.1.3 Follow-on (FIXED): the lock width constraint never applied
+
+Verifying §4.1.2 on a real pilot-clip build showed **zero** edges narrowed by a lock,
+which is implausible in Zeeland. Cause: the branch only ever looked for an `HORCLR`
+column, and no lock in this data carries one. Across the full RWS set, of **304 lock
+polygons `HORCLR` is absent as a column entirely, while `HORWID` holds a real value on
+247** — so this constraint has never applied to a single edge on any build.
+
+S-57 uses `HORCLR` for a clearance *between* structures (the bridge sense) and `HORWID`
+for a structure's own horizontal width, which is what a lock chamber publishes. Both
+express the navigable width here.
+
+**Implemented.** Prefer `HORCLR` where present, fall back to `HORWID`, with the same
+case-variant tolerance `_s57_col` already gives `catbrg`/`vercop`/`verclr`, and treating
+`0` as "not surveyed" exactly as the `VERCLR` branch does for bridges. This is
+load-bearing rather than cosmetic: it makes a narrow lock chamber actually constrain
+routing, where a 12 m gate was previously invisible.
+
+Also covered by `tests/test_edge_min_width.py`.
+
 ### 4.2 Simplify the raster chain before it becomes graph edges
 
 Apply a small Douglas-Peucker (≈ ½ pixel, so 1–5 m) to each `_skeleton_raster_to_graph`

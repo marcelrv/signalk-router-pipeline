@@ -31,11 +31,11 @@ def _run(edge, locks=None):
     return _edge_attr_worker([edge])[(1, 2)]
 
 
-def _lock(horclr):
-    """A lock polygon covering the whole test edge, with the given horizontal clearance."""
+def _lock(width, attr="HORCLR"):
+    """A lock polygon covering the whole test edge, publishing its width under `attr`."""
     box = Polygon([(4.1590, 51.6595), (4.1630, 51.6595),
                    (4.1630, 51.6605), (4.1590, 51.6605)])
-    return gpd.GeoDataFrame({"HORCLR": [horclr]}, geometry=[box], crs="EPSG:4326")
+    return gpd.GeoDataFrame({attr: [width]}, geometry=[box], crs="EPSG:4326")
 
 
 class TestMeasuredWidthSurvives:
@@ -71,3 +71,35 @@ class TestLockClearanceNarrowsRatherThanReplaces:
             geometry=[Polygon([(4.30, 51.80), (4.31, 51.80), (4.31, 51.81), (4.30, 51.81)])],
             crs="EPSG:4326")
         assert _run(_edge(142.8), far)["min_width"] == pytest.approx(142.8)
+
+
+class TestLockWidthAttribute:
+    """S-57 publishes a lock chamber's navigable width as HORWID; HORCLR is the
+    clearance-between-structures sense used for bridges. This branch only looked for
+    HORCLR, which no lock in the RWS data carries -- of 304 lock polygons HORCLR is
+    absent as a column entirely, while HORWID holds a real value on 247 -- so the lock
+    width constraint never applied to a single edge.
+    """
+
+    def test_horwid_constrains_the_edge(self):
+        assert _run(_edge(300.0), _lock(12.0, "HORWID"))["min_width"] == pytest.approx(12.0)
+
+    def test_horclr_still_works_where_it_exists(self):
+        assert _run(_edge(300.0), _lock(12.0, "HORCLR"))["min_width"] == pytest.approx(12.0)
+
+    def test_lowercase_variant_is_accepted(self):
+        assert _run(_edge(300.0), _lock(12.0, "horwid"))["min_width"] == pytest.approx(12.0)
+
+    @pytest.mark.parametrize("attr", ["HORCLR", "HORWID"])
+    def test_zero_means_not_surveyed_not_a_zero_width_lock(self, attr):
+        # Same S-57 convention the bridge branch applies to VERCLR=0.
+        assert _run(_edge(300.0), _lock(0.0, attr))["min_width"] == pytest.approx(300.0)
+
+    def test_null_width_leaves_the_measurement_alone(self):
+        assert _run(_edge(142.8), _lock(None, "HORWID"))["min_width"] == pytest.approx(142.8)
+
+    def test_lock_with_no_width_attribute_at_all(self):
+        box = Polygon([(4.1590, 51.6595), (4.1630, 51.6595),
+                       (4.1630, 51.6605), (4.1590, 51.6605)])
+        bare = gpd.GeoDataFrame({"OBJNAM": ["Krammersluizen"]}, geometry=[box], crs="EPSG:4326")
+        assert _run(_edge(142.8), bare)["min_width"] == pytest.approx(142.8)
