@@ -236,7 +236,7 @@ Simplifying after the fact would hit the 33% but silently invalidate every alrea
 sampled against the pre-merge geometry. Any decimation must happen *before*
 `calculate_edge_attributes`, which is why 4.1 and 4.2 are placed where they are.
 
-## 5. Measurement noise floor: builds are not reproducible
+## 5. Measurement noise floor: builds were not reproducible (FIXED)
 
 Before any before/after sweep can be trusted, the pipeline's own run-to-run variance has
 to be known. Two builds of the **same clip, same commit, same input**, run sequentially:
@@ -272,13 +272,49 @@ Two consequences:
    built adjacent regions cannot be assumed to agree on a seam node's position, and
    rebuilding one region of a stitched set may silently break its seams with neighbours
    that were not rebuilt. This is pre-existing and unrelated to anything in this spec,
-   but it deserves its own investigation — the likely candidates are ordering-dependent
-   passes with caps (`MAX_LOCAL_GAP_RESOLVE_PER_COMPONENT`, `_stitch_component_pieces`),
-   where which candidates get processed before the cap is hit decides the outcome.
+   but it deserves its own investigation.
+
+### 5.1 Root cause and resolution
+
+Not the capped passes guessed at above. `skimage.morphology.medial_axis` breaks ties by
+processing pixels in an order drawn from a PRNG, and its `rng` parameter defaults to a
+**fresh unseeded generator on every call** — "the PRNG determines the order in which
+pixels are processed for tiebreaking", per its own documentation.
+`_extract_medial_axis_skeleton` called it with no `rng`, so every build drew a different
+centerline from the same raster.
+
+That accounts for the whole signature above: the skeleton keeps its topology and length
+(counts stable to under 1%) while ties broken differently nudge the axis by a pixel here
+and there, and node ids are coordinate-derived. Demonstrated minimally — two unseeded
+`medial_axis` calls on one fixed mask return different arrays; through a seeded wrapper
+they are identical.
+
+**Fixed** by seeding (`MEDIAL_AXIS_SEED`), with the keyword bound at import by inspecting
+the signature, since it has been spelled `rng` / `random_state` / `seed` across the
+versions `requirements.txt` allows (`scikit-image>=0.22`).
+
+Verified on two full builds of the same clip:
+
+| | Before (`995b9bc`) | After (`de98535`) |
+|---|---|---|
+| Run 1 / Run 2 nodes | 33,470 / 33,726 | **33,057 / 33,057** |
+| Run 1 / Run 2 edges | 87,703 / 88,331 | **86,617 / 86,617** |
+| Shared node ids | 62.3% | **100.0%** |
+| Edge lists identical | no | **yes** |
+| `crosses_land` | 0 / 0 | 0 / 0 |
+
+Builds are now bit-for-bit reproducible, so the §6 sweep can compare configurations
+directly rather than against a noise floor, and seam stitching has a stable basis. Note
+the seeded build lands at a slightly different node count than either unseeded run —
+expected, since it fixes one particular tie-breaking order rather than reproducing a
+previous accidental one.
+
+Covered by `tests/test_medial_axis_determinism.py`.
 
 ## 6. Verification plan
 
-- §4.1.2 is done, so per-edge width is now available to drive the coupling.
+- §4.1.2 is done, so per-edge width is now available to drive the coupling, and §5.1
+  makes builds reproducible, so a single run per configuration is now sufficient.
 - Rebuild Zeeland with 4.1 width-coupled at caps 25/75/150 m, plus one flat-75 m control to
   confirm the predicted land-crossing damage is real and not an artefact of this estimate.
   Record node/edge counts, DB size, and `_sanity_check_no_land_crossings` violations — the
