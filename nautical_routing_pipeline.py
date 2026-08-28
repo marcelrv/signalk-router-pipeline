@@ -544,20 +544,25 @@ LOCAL_GAP_RESOLVE_MIN_SPUR_M = 10.0        # spur-prune threshold for the tiny l
                                             # (scaled down from ClassificationConfig's 60m default,
                                             # which is sized for whole-piece rasters, not a
                                             # <=~600m window)
-MAX_LOCAL_GAP_RESOLVE_PER_COMPONENT = 200  # cap so a pathologically fragmented component can't
+MAX_LOCAL_GAP_RESOLVE_PER_COMPONENT = 2000  # cap so a pathologically fragmented component can't
                                             # blow up build time in this fallback pass -- raised
-                                            # from an initial 25 after switching candidate
-                                            # generation to query_ball_point (see above): a real
-                                            # coastline can legitimately have more than 25 narrow
-                                            # throats needing this pass in one original water-body
-                                            # component (confirmed on a full fl_atl_s rebuild: 25
-                                            # capped out on OTHER, closer gaps before ever reaching
-                                            # Lake Worth Inlet's own 39.7m one, leaving the
-                                            # motivating case for this whole pass unresolved; 200
-                                            # resolved 203 real gaps region-wide with no measurable
+                                            # from an initial 25: a full fl_atl_s rebuild showed
+                                            # "resolved" landing right at the cap both at 25
+                                            # (26-28) and at 200 (202-203), meaning the cap -- not
+                                            # a lack of real candidates -- was the binding
+                                            # constraint. Florida's coastline apparently has
+                                            # hundreds of legitimate narrow-throat gaps in one
+                                            # original water-body component -- not pathological,
+                                            # just a real count this cap needs comfortable
+                                            # headroom above (confirmed: raising to 2000 resolved
+                                            # 214, well under the new cap, with no measurable
                                             # build-time increase, since each resolution is a tiny
                                             # bounded local raster, not the whole-piece rasters
-                                            # this cap was originally modeled after)
+                                            # this cap was originally modeled after). Leaves an
+                                            # order of magnitude of headroom above observed real
+                                            # demand while still bounding the pathological case
+                                            # (e.g. the 8440-union-find-group one documented
+                                            # above) this cap exists for in the first place.
 
 
 @dataclass
@@ -2861,34 +2866,69 @@ class NauticalRoutingPipeline:
         if len(groups) <= 1:
             return 0
 
-        # Nearest-first candidate pairs across DIFFERENT groups. A separate
-        # cKDTree per group, cross-queried against every other group, is
-        # O(groups x nodes) -- Pass 0's own comment above records 8440
-        # union-find groups for one real component, which would make that
-        # approach run hundreds of millions of queries right when this
-        # last-resort pass is most likely to be reached (a highly fragmented
-        # component). A single tree over ALL nodes queried with a fixed k
-        # (tried first) has its own failure mode -- Pass 0's own docstring
-        # already documents it for a differently-scoped query: if a node has
-        # more same-group neighbours than k closer than the true cross-group
-        # candidate, that candidate never appears in its top-k and the gap
-        # silently goes unresolved, no different from the crowding Pass 0b
-        # exists to fix. `query_ball_point` returns every node within
-        # LOCAL_GAP_RESOLVE_MAX_M instead of just the k nearest, so no amount
-        # of same-group crowding can hide a genuine cross-group candidate --
-        # still O(nodes x local-density), not O(groups x nodes), since the
-        # radius this pass searches is deliberately tight.
+        # Nearest-first candidate pairs across DIFFERENT groups. This has
+        # tried two simpler approaches first, each with a real failure mode:
+        #   1. A separate cKDTree per group, cross-queried against every
+        #      other group, is O(groups x nodes) -- Pass 0's own comment
+        #      above records 8440 union-find groups for one real component,
+        #      which would make that approach run hundreds of millions of
+        #      queries right when this last-resort pass is most likely to be
+        #      reached (a highly fragmented component).
+        #   2. A single tree over ALL nodes queried with a small fixed k has
+        #      Pass 0's own documented crowding failure: if a node has more
+        #      same-group neighbours than k closer than the true cross-group
+        #      candidate, that candidate never appears in its top-k and the
+        #      gap silently goes unresolved.
+        #   3. query_ball_point(r=LOCAL_GAP_RESOLVE_MAX_M) fixes the crowding
+        #      miss (returns every node in range, not just the k nearest),
+        #      but can materialize an unbounded same-group-inclusive
+        #      neighbour list before any group filtering happens -- a single
+        #      node sitting inside a large, densely-packed already-connected
+        #      mesh can return thousands of same-group hits that get thrown
+        #      away immediately after, real memory/time wasted for nothing.
+        # Escalating k bounds the DISCOVERY budget instead: start small,
+        # and only widen it for a node whose entire current top-k turned out
+        # to be same-group AND still has room before LOCAL_GAP_RESOLVE_MAX_M
+        # (i.e. genuinely crowded, not just sparse), up to a hard ceiling.
+        # Worst case is O(nodes x MAX_K), not O(nodes x local-density) or
+        # O(groups x nodes) -- a genuine miss is now only possible for a
+        # node with more than MAX_K same-group neighbours all closer than
+        # its true cross-group candidate, far rarer than the k=8 case this
+        # replaced and explicitly bounded rather than open-ended.
         from scipy.spatial import cKDTree
         all_tree = cKDTree(coords_m)
-        own_group = [find(n) for n in ids]
-        neighbor_lists = all_tree.query_ball_point(coords_m, r=LOCAL_GAP_RESOLVE_MAX_M)
+        own_group = np.array([find(n) for n in ids])
+        n = len(ids)
+        MAX_K = min(256, n)
+        k = min(8, n)
+        seen_pairs = set()
         candidates = []
-        for a, neighbors in enumerate(neighbor_lists):
-            for b in neighbors:
-                if b <= a or own_group[a] == own_group[b]:
-                    continue
-                dist = float(np.hypot(*(coords_m[a] - coords_m[b])))
-                candidates.append((dist, a, b))
+        remaining = np.arange(n)
+        while len(remaining):
+            dists, nns = all_tree.query(coords_m[remaining], k=k, distance_upper_bound=LOCAL_GAP_RESOLVE_MAX_M)
+            dists = np.atleast_2d(dists)
+            nns = np.atleast_2d(nns)
+            still_stuck = []
+            for local_a, a in enumerate(remaining):
+                found_cross = False
+                last_dist = -1.0
+                for dist, b in zip(dists[local_a], nns[local_a], strict=True):
+                    b = int(b)
+                    if b >= n or not np.isfinite(dist) or b == a:
+                        continue
+                    last_dist = dist
+                    if own_group[a] != own_group[b]:
+                        found_cross = True
+                        pair = (a, b) if a < b else (b, a)
+                        if pair not in seen_pairs:
+                            seen_pairs.add(pair)
+                            candidates.append((float(dist), pair[0], pair[1]))
+                if not found_cross and k < MAX_K and 0 <= last_dist < LOCAL_GAP_RESOLVE_MAX_M:
+                    still_stuck.append(a)
+            if k >= MAX_K:
+                break
+            remaining = np.array(still_stuck, dtype=int)
+            k = min(k * 2, MAX_K)
         candidates.sort(key=lambda t: t[0])
 
         added = 0
