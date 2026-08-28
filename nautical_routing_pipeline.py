@@ -93,6 +93,7 @@ def _edge_attr_worker(edge_chunk):
     CRS_METRIC = "EPSG:3857"
     land_metric = gdfs.get('land_metric', gpd.GeoDataFrame())
     depare_gdf = gdfs.get('depth_areas', gpd.GeoDataFrame())
+    dredged_gdf = gdfs.get('dredged_areas', gpd.GeoDataFrame())
     bridges_gdf = gdfs.get('bridges', gpd.GeoDataFrame())
     fairways_gdf = gdfs.get('fairways', gpd.GeoDataFrame())
     locks_gdf = gdfs.get('locks', gpd.GeoDataFrame())
@@ -182,6 +183,44 @@ def _edge_attr_worker(edge_chunk):
                         attrs['min_depth'] = (UNKNOWN_DEPTH if coarse_only
                                               else float(min_val))
                         attrs['drval1'] = min_val if min_val < 99.0 else None
+
+        # DRGARE (dredged/maintained-depth channel) override -- see
+        # docs/SPEC-FAIRWAY-HARMONIZATION.md section 3. Inside a DRGARE
+        # footprint the maintained DRVAL1 is the authoritative depth, which
+        # can be either deeper or shallower than the surrounding DEPARE band
+        # -- so this always needs checking, even where DEPARE alone looked
+        # comfortably deep above. Sampled the same 5-point way as DEPARE
+        # (same max-DRVAL1-among-containing-candidates rule) so it can tell
+        # per point whether the edge is actually inside a dredged footprint;
+        # DEPARE's already-computed value stands wherever it isn't. Where
+        # DRGARE has no candidates at all near this edge (the common case),
+        # this is a no-op and DEPARE's verdict -- including UNKNOWN_DEPTH --
+        # passes through untouched.
+        if not dredged_gdf.empty and 'DRVAL1' in dredged_gdf.columns:
+            dr_candidates = _candidates_by_bounds_static(dredged_gdf, edge_geom)
+            if not dr_candidates.empty:
+                dr_samples = []
+                for i in range(5):
+                    f = i / 4.0
+                    pt = Point(u_lon + f*(v_lon-u_lon), u_lat + f*(v_lat-u_lat))
+                    best = None
+                    for _, row in dr_candidates.iterrows():
+                        geom = row.geometry
+                        if geom is not None and geom.contains(pt):
+                            val = row['DRVAL1']
+                            if pd.notna(val) and (best is None or float(val) > best):
+                                best = float(val)
+                    dr_samples.append(best)
+                # Only override once a sample point is confirmed to fall
+                # INSIDE a DRGARE polygon -- a candidate that merely shares a
+                # bounding box with the edge (the common near-miss) must not
+                # silently replace a genuine UNKNOWN_DEPTH verdict with a
+                # generic 99.0 "no data here" fallback.
+                if any(v is not None for v in dr_samples):
+                    base_depth = attrs['min_depth'] if attrs['min_depth'] != UNKNOWN_DEPTH else 99.0
+                    combined = [dv if dv is not None else base_depth for dv in dr_samples]
+                    attrs['min_depth'] = min(combined)
+                    attrs['drval1'] = attrs['min_depth'] if attrs['min_depth'] < 99.0 else None
 
         # Bridges - Determine Air Draft limit
         attrs['max_air_draft'] = 999.0
@@ -558,6 +597,12 @@ def _default_data_sources() -> List[dict]:
     """
     enc_layers = [
         "land", "coastal_water", "depth_areas", "bridges", "locks", "fairways",
+        # DRGARE (dredged/maintained-depth channel areas) -- see
+        # docs/SPEC-FAIRWAY-HARMONIZATION.md. Same tier/source_type as
+        # "fairways"; kept as its own provenance row (not folded into
+        # "fairways") since it's a distinct S-57 object class read from its
+        # own dredged_areas_polygons.geojson.
+        "dredged_areas",
         "restricted_areas", "obstacles", "hulks", "mariculture", "caution_areas",
         "pois",
     ]
@@ -773,10 +818,35 @@ class NauticalRoutingPipeline:
             else:
                 logger.warning(f"File not found for '{layer_name}': {path}. Using empty fallback.")
                 self.gdfs[layer_name] = gpd.GeoDataFrame(geometry=[], crs=self.CRS_WGS84)
+        self._build_fairways_unified()
         self.gdfs_metric = {
             name: gdf.to_crs(self.CRS_METRIC) for name, gdf in self.gdfs.items()
         }
         self._build_obstacle_layer()
+
+    def _build_fairways_unified(self):
+        """FAIRWY + DRGARE as one fairway signal (docs/SPEC-FAIRWAY-HARMONIZATION.md).
+
+        NOAA sparsely charts FAIRWY (regulated traffic lanes) but densely charts
+        DRGARE (maintained-depth dredged channel footprints) -- DRGARE is the
+        primary US analogue of what NL RWS IENC charts as FAIRWY. Cost
+        harmonization, laned/skeleton classification, and bridge/lock crossing
+        detection all read this unified layer so they see the real channel
+        footprint regardless of which object class charted it. Kept distinct
+        from the raw "fairways" (FAIRWY-only) layer used for POI generation and
+        TRAFIC one-way direction, which stays FAIRWY-only per the spec (DRGARE
+        carries no traffic-direction attribute). A build without a
+        dredged_areas_polygons.geojson (older data, or a country where NOAA's
+        DRGARE convention doesn't apply) falls back to fairways_unified ==
+        fairways -- identical to pre-harmonization behavior.
+        """
+        fairways = self.gdfs.get("fairways", gpd.GeoDataFrame())
+        dredged = self.gdfs.get("dredged_areas", gpd.GeoDataFrame())
+        parts = [gdf for gdf in (fairways, dredged) if not gdf.empty]
+        self.gdfs["fairways_unified"] = (
+            gpd.GeoDataFrame(pd.concat(parts, ignore_index=True), crs=self.CRS_WGS84)
+            if parts else gpd.GeoDataFrame(geometry=[], crs=self.CRS_WGS84)
+        )
 
     def _build_obstacle_layer(self):
         logger.info("Building obstacle layer from restricted areas, hulks, obstructions...")
@@ -886,7 +956,7 @@ class NauticalRoutingPipeline:
         if coastal_gdf is not None and not coastal_gdf.empty:
             polygons = self._connected_water_polygons(coastal_gdf)
             depth_gdf = self.gdfs.get("depth_areas", gpd.GeoDataFrame())
-            fairway_gdf = self.gdfs.get("fairways", gpd.GeoDataFrame())
+            fairway_gdf = self.gdfs.get("fairways_unified", gpd.GeoDataFrame())
             src_id = self.layer_source_ids.get("coastal_water") if hasattr(self, "layer_source_ids") else None
             cfg = self.classification_config
             counts = {"skeleton": 0, "laned": 0, "navmesh": 0}
@@ -2837,7 +2907,7 @@ class NauticalRoutingPipeline:
 
         # Combine Inland Waterways and Fairways to find the true navigable opening
         fw_gdfs = []
-        if not self.gdfs.get("fairways", gpd.GeoDataFrame()).empty: fw_gdfs.append(self.gdfs["fairways"])
+        if not self.gdfs.get("fairways_unified", gpd.GeoDataFrame()).empty: fw_gdfs.append(self.gdfs["fairways_unified"])
         if not self.gdfs.get("inland_waterways", gpd.GeoDataFrame()).empty: fw_gdfs.append(self.gdfs["inland_waterways"])
         hw_gdf = pd.concat(fw_gdfs, ignore_index=True) if fw_gdfs else gpd.GeoDataFrame()
 
@@ -2989,7 +3059,7 @@ class NauticalRoutingPipeline:
 
         # Same two layers, same reasoning, as _add_opening_bridge_edges.
         fw_gdfs = []
-        if not self.gdfs.get("fairways", gpd.GeoDataFrame()).empty: fw_gdfs.append(self.gdfs["fairways"])
+        if not self.gdfs.get("fairways_unified", gpd.GeoDataFrame()).empty: fw_gdfs.append(self.gdfs["fairways_unified"])
         if not self.gdfs.get("inland_waterways", gpd.GeoDataFrame()).empty: fw_gdfs.append(self.gdfs["inland_waterways"])
         hw_gdf = pd.concat(fw_gdfs, ignore_index=True) if fw_gdfs else gpd.GeoDataFrame()
 
@@ -3875,7 +3945,7 @@ class NauticalRoutingPipeline:
                 yield chunk
 
         fw_gdfs = []
-        if not self.gdfs.get("fairways", gpd.GeoDataFrame()).empty: fw_gdfs.append(self.gdfs["fairways"])
+        if not self.gdfs.get("fairways_unified", gpd.GeoDataFrame()).empty: fw_gdfs.append(self.gdfs["fairways_unified"])
         if not self.gdfs.get("inland_waterways", gpd.GeoDataFrame()).empty: fw_gdfs.append(self.gdfs["inland_waterways"])
         highways_gdf = pd.concat(fw_gdfs, ignore_index=True) if fw_gdfs else gpd.GeoDataFrame(geometry=[])
 
@@ -3884,6 +3954,7 @@ class NauticalRoutingPipeline:
             "depth_areas": self.gdfs.get("depth_areas", gpd.GeoDataFrame()),
             "bridges": self.gdfs.get("bridges", gpd.GeoDataFrame()),
             "fairways": highways_gdf,
+            "dredged_areas": self.gdfs.get("dredged_areas", gpd.GeoDataFrame()),
             "locks": self.gdfs.get("locks", gpd.GeoDataFrame()),
             "obstacles": self.gdfs.get("obstacles", gpd.GeoDataFrame()),
             "obstacles_soft": self.gdfs.get("obstacles_soft", gpd.GeoDataFrame()),
@@ -4321,6 +4392,7 @@ if __name__ == "__main__":
         "bridges": os.path.join(args.input_dir, "bridges_polygons.geojson"),
         "locks": os.path.join(args.input_dir, "locks_polygons.geojson"),
         "fairways": os.path.join(args.input_dir, "fairways_polygons.geojson"),
+        "dredged_areas": os.path.join(args.input_dir, "dredged_areas_polygons.geojson"),
         "pois": os.path.join(args.input_dir, "pois_points.geojson"),
         "restricted_areas": os.path.join(args.input_dir, "restricted_areas_polygons.geojson"),
         "obstacles": os.path.join(args.input_dir, "obstructions_points.geojson"),
