@@ -21,7 +21,7 @@ import os
 import geopandas as gpd
 from shapely.geometry import box
 
-# The 13 pipeline layers (filename per the pipeline CLI dict).
+# The 14 pipeline layers (filename per the pipeline CLI dict).
 LAYER_FILES = [
     "land_polygons.geojson",
     "coastal_water_polygons.geojson",
@@ -30,6 +30,14 @@ LAYER_FILES = [
     "bridges_polygons.geojson",
     "locks_polygons.geojson",
     "fairways_polygons.geojson",
+    # DRGARE (dredged/maintained-depth channel areas) -- see
+    # docs/SPEC-FAIRWAY-HARMONIZATION.md. Added after this list otherwise
+    # went stale: enc_preprocessor.py started emitting this file (PR #9) but
+    # this list wasn't updated, so a clip silently dropped it -- no error,
+    # just missing dredged_areas_polygons.geojson downstream, quietly
+    # disabling the DRGARE depth-override/fairway-unification feature for
+    # anyone using the clip-based fast-iteration workflow.
+    "dredged_areas_polygons.geojson",
     "pois_points.geojson",
     "restricted_areas_polygons.geojson",
     "obstructions_points.geojson",
