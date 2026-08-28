@@ -168,7 +168,8 @@ def _edge_attr_worker(edge_chunk):
     obstacles_soft_gdf = gdfs.get('obstacles_soft', gpd.GeoDataFrame())
 
     results = {}
-    for u, v, u_lon, u_lat, v_lon, v_lat, edge_type, is_opening_bridge_edge, requires_lock in edge_chunk:
+    for (u, v, u_lon, u_lat, v_lon, v_lat, edge_type, is_opening_bridge_edge,
+         requires_lock, existing_min_width) in edge_chunk:
         attrs = {}
         _, _, distance = geod.inv(u_lon, u_lat, v_lon, v_lat)
         attrs['distance'] = round(distance, 2)
@@ -345,13 +346,28 @@ def _edge_attr_worker(edge_chunk):
                     attrs['max_air_draft'] = min_clearance
 
         # Locks
-        attrs['min_width'] = 999.0
+        # Seed from whatever width the edge already carries -- build_skeleton_network
+        # measures a real medial-axis channel width and stores it (alongside the
+        # matching width_profile) when it creates the edge. This used to start at the
+        # 999.0 "unconstrained" default instead, and since calculate_edge_attributes
+        # writes every key this worker returns back onto the edge, that overwrote the
+        # measured width on EVERY edge: a real build had min_width=999.0 on all
+        # 137,718 edges, while width_profile still held the true values on 81,110 of
+        # them. See docs/SPEC-GRAPH-DENSITY.md section 4.1.2.
+        attrs['min_width'] = (float(existing_min_width) if existing_min_width is not None
+                              else 999.0)
         if not locks_gdf.empty:
             lock_candidates = _candidates_by_bounds_static(locks_gdf, edge_geom)
             if not lock_candidates.empty:
                 intersecting = lock_candidates[lock_candidates.intersects(edge_geom)]
                 if not intersecting.empty and 'HORCLR' in intersecting.columns:
-                    attrs['min_width'] = float(intersecting['HORCLR'].min())
+                    horclr = intersecting['HORCLR'].min()
+                    # A lock gate NARROWS the channel -- it is one more constraint along
+                    # the edge, not a redefinition of it. Taking the min keeps whichever
+                    # is tighter, so a 12m gate still wins inside a 300m basin while a
+                    # 6m creek keeps its own width where the gate is wider than the creek.
+                    if pd.notna(horclr):
+                        attrs['min_width'] = min(attrs['min_width'], float(horclr))
 
         # Fairway + one-way (TRAFIC)
         attrs['cost_factor'] = 1.2  # open water default
@@ -4440,6 +4456,7 @@ class NauticalRoutingPipeline:
                     data.get("edge_type", "coastal"),
                     data.get("is_opening_bridge_edge", False),
                     data.get("requires_lock", False),
+                    data.get("min_width"),
                 )
 
         def chunked_iterable(iterable, size):

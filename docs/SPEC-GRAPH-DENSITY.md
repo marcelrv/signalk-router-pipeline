@@ -1,6 +1,6 @@
 # Spec: Graph Node Density — Over-Sampling and Fairway Duplication
 
-Status: Draft — analysis only, no code changes
+Status: Draft. Analysis, plus the §4.1.2 fix implemented (the prerequisite for §4.1)
 Complements: `SPEC-RECOMMENDED-TRACK.md`, `SPEC-FAIRWAY-HARMONIZATION.md`
 Scope: `nautical_routing_pipeline.py` (`build_skeleton_network`, `_resample_long_skeleton_edges`, `_skeleton_raster_to_graph`, `ClassificationConfig`)
 Measured against: `data/zeeland_full.sqlite` (48,553 nodes / 137,718 directed edges), RWS source GeoJSON
@@ -165,7 +165,7 @@ is what binds. **Recommendation: adopt the coupling and set the cap generously (
 fine, so is 150 m); do not raise a flat tolerance.** Expected yield ≈ 38% of nodes
 (~18,400 of 48,553), edges roughly 137,718 → ~101,000.
 
-#### 4.1.2 Blocker: `min_width` is clobbered before it reaches the database
+#### 4.1.2 Prerequisite (FIXED): `min_width` was clobbered before reaching the database
 
 The coupling above needs per-edge channel width, and the column that should hold it is
 unusable: **every one of the 137,718 edges has `min_width = 999.0`.**
@@ -175,11 +175,18 @@ line 3235), but `_edge_attr_worker` then sets `attrs['min_width'] = 999.0` uncon
 worker key back onto the edge — so the skeleton's value is overwritten unless a lock's
 `HORCLR` happens to intersect.
 
-The data itself is not lost: `width_profile` survives with real values on 81,110 of 99,112
-centerline edges (`{"min_m": 142.8, "samples_m": [...]}`). So this is a narrow fix — seed
-`attrs['min_width']` from the existing edge value rather than from 999.0, and take the lock
-`HORCLR` as a minimum against it, not a replacement. Worth doing on its own: `min_width`
-is exported and any consumer reading it today gets a constant.
+The data itself was not lost: `width_profile` survives with real values on 81,110 of 99,112
+centerline edges (`{"min_m": 142.8, "samples_m": [...]}`).
+
+**Implemented.** `edge_generator` now passes the edge's existing `min_width` into the
+worker, which seeds from it instead of from 999.0, and a lock's `HORCLR` is applied as a
+`min()` against that value rather than replacing it. The `min()` is the substantive part:
+a 12 m gate still wins inside a 300 m basin, but a 20 m gate no longer *widens* a 6 m
+creek to 20 m, which the old replace-outright branch did wherever a lock polygon was
+wider than the channel it sits in. Edges that never carried a measurement (navmesh
+boundary, lock transit) still default to 999.0, so their behaviour is unchanged.
+
+Covered by `tests/test_edge_min_width.py`.
 
 ### 4.2 Simplify the raster chain before it becomes graph edges
 
@@ -211,7 +218,7 @@ sampled against the pre-merge geometry. Any decimation must happen *before*
 
 ## 5. Verification plan
 
-- Fix §4.1.2 first — the coupling cannot be evaluated while `min_width` is a constant.
+- §4.1.2 is done, so per-edge width is now available to drive the coupling.
 - Rebuild Zeeland with 4.1 width-coupled at caps 25/75/150 m, plus one flat-75 m control to
   confirm the predicted land-crossing damage is real and not an artefact of this estimate.
   Record node/edge counts, DB size, and `_sanity_check_no_land_crossings` violations — the
