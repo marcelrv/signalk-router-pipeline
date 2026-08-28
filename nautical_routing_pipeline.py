@@ -87,30 +87,71 @@ def _candidates_by_bounds_static(gdf, geom, margin=0.0):
     return gpd.GeoDataFrame()
 
 
-def _depare_candidate_beats(val, candidate_cscl, best, best_cscl) -> bool:
+def _depare_candidate_sort_key(drval1, cscl, drval2):
+    """Total order over a DEPARE candidate's (DRVAL1, src_cscl, DRVAL2);
+    the winning candidate is the maximum. See _depare_candidate_beats.
+
+    Ranked highest-priority first:
+
+    1. Deepest DRVAL1. Unchanged from before any of this: overlapping bands
+       nest, so the deepest containing claim is the most detailed one.
+    2. A KNOWN src_cscl outranks an unknown one. Not a claim that an
+       unlabeled cell is finer or coarser -- it is a claim that a candidate
+       carrying evidence about its own chart scale is worth more than one
+       carrying none, applied uniformly whatever that evidence says. It
+       cuts the same way for a fine and a coarse label, and it is the
+       conservative direction: preferring the candidate that CAN reveal a
+       coarse source is what lets TRUSTED_SURVEY_CSCL_MAX fire at all
+       (a build where _read_cell_cscl failed on some cells would otherwise
+       silently fall back to pre-PR-#11 behaviour on exactly those ties).
+    3. Among two known scales, the finer (smaller) one.
+    4. A known DRVAL2 outranks an unknown one, for the same reason as (2):
+       COARSE_DEPTH_BAND_DRVAL2_M needs an upper bound to judge.
+    5. Among two known bands, the narrower (smaller DRVAL2) one -- a
+       0-1.8m claim is far more specific than a 0-18.2m one, the same
+       reasoning COARSE_DEPTH_BAND_DRVAL2_M already encodes.
+
+    Two candidates comparing equal under this key have the same DRVAL1, the
+    same src_cscl and the same DRVAL2 -- which is the WHOLE of what the
+    selection loops carry out (best / best_cscl / best_upper). So a
+    remaining tie is observationally empty: either candidate yields a
+    byte-identical result downstream, and no further tie-break key (source
+    cell id, feature id, geometry) is needed to make the outcome
+    deterministic. That is why none is threaded through: the order is total
+    where it is observable, and the unobservable residue cannot leak.
+    """
+    return (
+        drval1,
+        cscl is not None,
+        -cscl if cscl is not None else 0.0,
+        drval2 is not None,
+        -drval2 if drval2 is not None else 0.0,
+    )
+
+
+def _depare_candidate_beats(val, candidate_cscl, candidate_upper,
+                            best, best_cscl, best_upper) -> bool:
     """Shared tie-break policy for DEPARE candidate selection, used by both
     _edge_attr_worker and NauticalRoutingPipeline._compute_node_depths.
 
-    The primary rule (max DRVAL1 wins) is unchanged -- a deeper containing
-    claim is the more detailed one. But two overlapping cells (different
-    chart scales, both containing the same sample point) routinely tie on
-    the EXACT same DRVAL1, most commonly at 0.0 -- a standard band floor
-    every scale reuses. Before this, a tie kept whichever candidate
-    iterrows()/the spatial index happened to visit first: incidental
-    row/insertion order from the multi-cell merge, not anything tied to
-    chart quality. That could silently drop a genuine fine-scale harbor
-    reading's src_cscl in favour of a coarse cell's, or vice versa,
-    non-deterministically -- exactly the ambiguity TRUSTED_SURVEY_CSCL_MAX
-    exists to resolve, undermined by unstable tie-breaking. On a tie, prefer
-    the candidate with the smaller (finer) src_cscl. Only fires when BOTH
-    values are known -- an unlabeled candidate (older data without src_cscl
-    tagging) is not assumed worse than a labeled one, so the incumbent keeps
-    its seat rather than risk preferring an actually-coarser unlabeled cell.
+    The primary rule (max DRVAL1 wins) is unchanged. But two overlapping
+    cells (different chart scales, both containing the same sample point)
+    routinely tie on the EXACT same DRVAL1, most commonly at 0.0 -- a
+    standard band floor every scale reuses. A tie used to keep whichever
+    candidate iterrows()/the spatial index happened to visit first:
+    incidental row/insertion order from the multi-cell merge, not anything
+    tied to chart quality. Since the winner also supplies DRVAL2 and
+    src_cscl, that order decided whether a zero reading came out trusted or
+    UNKNOWN_DEPTH -- exactly the ambiguity TRUSTED_SURVEY_CSCL_MAX exists to
+    resolve, undermined by unstable tie-breaking.
+
+    _depare_candidate_sort_key documents the full ordering and why it is
+    total over everything the caller observes.
     """
-    if best is None or val > best:
+    if best is None:
         return True
-    return (val == best and candidate_cscl is not None and best_cscl is not None
-            and candidate_cscl < best_cscl)
+    return (_depare_candidate_sort_key(val, candidate_cscl, candidate_upper)
+            > _depare_candidate_sort_key(best, best_cscl, best_upper))
 
 def _edge_attr_worker(edge_chunk):
     geod = _EDGE_ATTR_GEOD
@@ -175,10 +216,12 @@ def _edge_attr_worker(edge_chunk):
                                         val = float(val)
                                         cscl = row['src_cscl'] if 'src_cscl' in row else None
                                         row_cscl = int(cscl) if pd.notna(cscl) else None
-                                        if _depare_candidate_beats(val, row_cscl, best, best_cscl):
+                                        upper = row['DRVAL2'] if 'DRVAL2' in row else None
+                                        row_upper = float(upper) if pd.notna(upper) else None
+                                        if _depare_candidate_beats(val, row_cscl, row_upper,
+                                                                   best, best_cscl, best_upper):
                                             best = val
-                                            upper = row['DRVAL2'] if 'DRVAL2' in row else None
-                                            best_upper = float(upper) if pd.notna(upper) else None
+                                            best_upper = row_upper
                                             best_cscl = row_cscl
                             # See DRYING_BAND_IMPLAUSIBLE_DRVAL1_M: an implausibly
                             # extreme DRVAL1 (e.g. -50) with a plausible DRVAL2 is a
@@ -4338,10 +4381,12 @@ class NauticalRoutingPipeline:
                         val = float(row["DRVAL1"])
                         cscl = row["src_cscl"] if "src_cscl" in row else None
                         row_cscl = int(cscl) if pd.notnull(cscl) else None
-                        if _depare_candidate_beats(val, row_cscl, best, best_cscl):
+                        upper = row["DRVAL2"] if "DRVAL2" in row else None
+                        row_upper = float(upper) if pd.notnull(upper) else None
+                        if _depare_candidate_beats(val, row_cscl, row_upper,
+                                                   best, best_cscl, best_upper):
                             best = val
-                            upper = row["DRVAL2"] if "DRVAL2" in row else None
-                            best_upper = float(upper) if pd.notnull(upper) else None
+                            best_upper = row_upper
                             best_cscl = row_cscl
             if not any_containing and nid in adopted_ids:
                 # No local DEPARE reaches this adopted node -- keep the depth
