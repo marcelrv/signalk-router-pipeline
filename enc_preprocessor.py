@@ -45,6 +45,13 @@ class ENCToGeoJSONPreprocessor:
             'BRIDGE': 'bridges_polygons.geojson',
             'LOKBSN': 'locks_polygons.geojson',
             'FAIRWY': 'fairways_polygons.geojson',
+            # DRGARE (Dredged Area) is the primary US charting of "the channel" --
+            # NOAA sparsely charts FAIRWY (regulated traffic lanes) but densely
+            # charts DRGARE (maintained-depth dredged footprints), 5x FAIRWY at
+            # harbour scale. See docs/SPEC-FAIRWAY-HARMONIZATION.md. Kept as its
+            # own file (not merged into fairways_polygons.geojson here) so
+            # provenance survives; the pipeline unifies the two at read time.
+            'DRGARE': 'dredged_areas_polygons.geojson',
             'HRBFAC': 'pois_points.geojson',
             # We will merge RECTRC, NAVLNE and WTWAXS (IENC Waterway Axis) together
             # for inland waterways centerlines
@@ -101,7 +108,15 @@ class ENCToGeoJSONPreprocessor:
                     # Standardize to WGS84
                     if gdf.crs and gdf.crs != "EPSG:4326":
                         gdf = gdf.to_crs("EPSG:4326")
-                        
+
+                    if s57_layer in ('FAIRWY', 'DRGARE'):
+                        # Record the originating S-57 object class: the pipeline
+                        # unifies these two into one fairway signal at read time
+                        # (see docs/SPEC-FAIRWAY-HARMONIZATION.md), and this is
+                        # what lets a unified feature's origin still be told apart.
+                        gdf = gdf.copy()
+                        gdf['src_objl'] = s57_layer
+
                     self.extracted_data[output_filename].append(gdf)
             except Exception as e:
                 # Fiona raises an exception if the layer doesn't exist in this specific chart
