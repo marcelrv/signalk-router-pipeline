@@ -360,14 +360,29 @@ def _edge_attr_worker(edge_chunk):
             lock_candidates = _candidates_by_bounds_static(locks_gdf, edge_geom)
             if not lock_candidates.empty:
                 intersecting = lock_candidates[lock_candidates.intersects(edge_geom)]
-                if not intersecting.empty and 'HORCLR' in intersecting.columns:
-                    horclr = intersecting['HORCLR'].min()
-                    # A lock gate NARROWS the channel -- it is one more constraint along
-                    # the edge, not a redefinition of it. Taking the min keeps whichever
-                    # is tighter, so a 12m gate still wins inside a 300m basin while a
-                    # 6m creek keeps its own width where the gate is wider than the creek.
-                    if pd.notna(horclr):
-                        attrs['min_width'] = min(attrs['min_width'], float(horclr))
+                if not intersecting.empty:
+                    # HORWID, not just HORCLR. This branch only ever looked for HORCLR,
+                    # which no lock in the RWS data carries -- of 304 lock polygons,
+                    # HORCLR is absent as a column entirely while HORWID holds a real
+                    # value on 247 -- so the lock width constraint never once applied.
+                    # S-57 uses HORCLR for a clearance between structures (the bridge
+                    # sense) and HORWID for a structure's own horizontal width, which is
+                    # what a lock chamber publishes; both express the navigable width
+                    # here, so prefer HORCLR where it exists and fall back to HORWID.
+                    # Same case-variant tolerance _s57_col gives the bridge attributes.
+                    width_col = next((c for c in intersecting.columns
+                                      if str(c).lower() in ('horclr', 'horwid')), None)
+                    gate_w = (pd.to_numeric(intersecting[width_col], errors='coerce').min()
+                              if width_col is not None else None)
+                    # A 0 means "not surveyed" rather than a zero-width lock, exactly as
+                    # VERCLR=0 does for bridges above.
+                    if _is_valid(gate_w) and float(gate_w) > 0.0:
+                        # A lock gate NARROWS the channel -- it is one more constraint
+                        # along the edge, not a redefinition of it. Taking the min keeps
+                        # whichever is tighter, so a 12m gate still wins inside a 300m
+                        # basin while a 6m creek keeps its own width where the gate is
+                        # wider than the creek.
+                        attrs['min_width'] = min(attrs['min_width'], float(gate_w))
 
         # Fairway + one-way (TRAFIC)
         attrs['cost_factor'] = 1.2  # open water default
