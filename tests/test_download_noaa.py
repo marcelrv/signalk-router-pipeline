@@ -50,4 +50,7 @@ class TestRegionsConfig:
     def test_all_states_are_two_letter_codes(self):
         for state in ALL_STATES:
             assert len(state) == 2
+            # isupper() alone passes "A1" (digits have no case), so a
+            # malformed non-alphabetic code could slip through undetected.
+            assert state.isalpha()
             assert state.isupper()
