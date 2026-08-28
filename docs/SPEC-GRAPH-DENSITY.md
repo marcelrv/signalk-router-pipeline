@@ -107,13 +107,79 @@ backstop) is hit.
 - Straight reaches collapse to a handful of long edges; bends keep — or gain — density
   exactly where the sampler needs it. This is strictly *more* faithful than today at bends
   and only relaxes where relaxing is provably free.
-- Suggested starting tolerance: 10 m, or `min(10.0, 0.25 × local channel width)` using
-  the `width_profile` already carried per segment, so narrow channels stay tight.
+- Tolerance must be **coupled to local channel width**, not flat. See §4.1.1 — this is
+  the decision that matters; the cap on top of it barely does.
 - `min_width` / `width_profile` merge safely: both are minima over the span, and a
   minimum over a union is the min of the minima. Depth is sampled after the split, so it
   picks up the new geometry automatically.
 - Expected: most of the 33.4% node reduction that DP@10 m shows as available, without DP's
   blindness to the sampler contract.
+
+#### 4.1.1 Choosing the tolerance — measured, not guessed
+
+Node reduction saturates quickly, while the safety cost of a *flat* tolerance keeps climbing.
+Douglas-Peucker over degree-2 chains, and the share of centerline edges whose channel is
+narrower than twice the tolerance (i.e. where the chord would leave the water):
+
+| Flat tolerance | Nodes removed | Marginal gain | Edges where sagitta > ½ channel width |
+|---|---|---|---|
+| 10 m | 33.4% | — | **1.9%** |
+| 25 m | 40.9% | +7.4pp | 20.7% |
+| 50 m | 43.5% | +2.6pp | 28.0% |
+| 75 m | 44.4% | +0.9pp | **34.4%** |
+| 100 m | 45.0% | +0.5pp | — |
+| 200 m | 45.7% | +0.7pp | — |
+
+The ceiling is 46.1% (every degree-2 interior node). Past ~25 m the curve is flat: going
+10 m → 75 m buys 11pp, but 25 m → 75 m buys only **3.5pp** while taking the share of
+edges whose chord leaves its channel from 20.7% to **34.4%**.
+
+That safety column is driven by a strongly bimodal channel-width distribution — median
+346 m, but **15.1% of centerline edges sit in water narrower than 25 m** and 26.6% in
+water narrower than 100 m, against 52.5% wider than 300 m:
+
+| Channel width (medial axis) | Share of centerline edges |
+|---|---|
+| 0–25 m | 15.1% |
+| 25–50 m | 5.5% |
+| 50–100 m | 7.3% |
+| 100–150 m | 6.5% |
+| 150–300 m | 13.1% |
+| >300 m | 52.5% |
+
+So no single flat number is right: the same tolerance that is wasteful in the Oosterschelde
+puts the chord on the bank in a Zeeland creek.
+
+**With width coupling — `sagitta ≤ min(cap, 0.5 × local width)` — the cap stops mattering:**
+
+| Cap (coupled) | Nodes removed |
+|---|---|
+| 25 m | 36.2% |
+| 50 m | 37.4% |
+| 75 m | 37.8% |
+| 100 m | 38.0% |
+| 200 m | 38.3% |
+
+From 50 m to 75 m is +0.4pp, and to 200 m only +0.9pp, because local width — not the cap —
+is what binds. **Recommendation: adopt the coupling and set the cap generously (75 m is
+fine, so is 150 m); do not raise a flat tolerance.** Expected yield ≈ 38% of nodes
+(~18,400 of 48,553), edges roughly 137,718 → ~101,000.
+
+#### 4.1.2 Blocker: `min_width` is clobbered before it reaches the database
+
+The coupling above needs per-edge channel width, and the column that should hold it is
+unusable: **every one of the 137,718 edges has `min_width = 999.0`.**
+`build_skeleton_network` computes a real medial-axis width (`min_width=min(sub_widths)`,
+line 3235), but `_edge_attr_worker` then sets `attrs['min_width'] = 999.0` unconditionally
+(line 264) as its lock-clearance default, and `calculate_edge_attributes` writes every
+worker key back onto the edge — so the skeleton's value is overwritten unless a lock's
+`HORCLR` happens to intersect.
+
+The data itself is not lost: `width_profile` survives with real values on 81,110 of 99,112
+centerline edges (`{"min_m": 142.8, "samples_m": [...]}`). So this is a narrow fix — seed
+`attrs['min_width']` from the existing edge value rather than from 999.0, and take the lock
+`HORCLR` as a minimum against it, not a replacement. Worth doing on its own: `min_width`
+is exported and any consumer reading it today gets a constant.
 
 ### 4.2 Simplify the raster chain before it becomes graph edges
 
@@ -145,8 +211,11 @@ sampled against the pre-merge geometry. Any decimation must happen *before*
 
 ## 5. Verification plan
 
-- Rebuild Zeeland with 4.1 at 5/10/25 m sagitta. Record node/edge counts, DB size, and
-  `_sanity_check_no_land_crossings` violations — the last must not regress at any tolerance.
+- Fix §4.1.2 first — the coupling cannot be evaluated while `min_width` is a constant.
+- Rebuild Zeeland with 4.1 width-coupled at caps 25/75/150 m, plus one flat-75 m control to
+  confirm the predicted land-crossing damage is real and not an artefact of this estimate.
+  Record node/edge counts, DB size, and `_sanity_check_no_land_crossings` violations — the
+  coupled runs must not regress it at any cap; the flat control is expected to.
 - Confirm the 90–110 m spike flattens and that new long edges appear only on straight reaches
   (assert measured sagitta ≤ tolerance on every emitted edge).
 - Re-measure the Krammersluizen view (342 nodes today; DP@10 m suggests ~272 is reachable).
