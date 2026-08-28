@@ -236,7 +236,47 @@ Simplifying after the fact would hit the 33% but silently invalidate every alrea
 sampled against the pre-merge geometry. Any decimation must happen *before*
 `calculate_edge_attributes`, which is why 4.1 and 4.2 are placed where they are.
 
-## 5. Verification plan
+## 5. Measurement noise floor: builds are not reproducible
+
+Before any before/after sweep can be trusted, the pipeline's own run-to-run variance has
+to be known. Two builds of the **same clip, same commit, same input**, run sequentially:
+
+| | Run 1 | Run 2 | Spread |
+|---|---|---|---|
+| Nodes | 33,470 | 33,726 | 256 (0.76%) |
+| Edges | 87,703 | 88,331 | 628 (0.72%) |
+| `crosses_obstacle` | 2,100 | 2,196 | 96 (4.6%) |
+| `crosses_land` | 0 | 0 | — |
+
+Counts are stable to under a percent. **Node identity is not:**
+
+| | |
+|---|---|
+| Shared node ids | 25,786 — **62.3%** of the union |
+| Only in run 1 | 7,684 |
+| Only in run 2 | 7,940 |
+
+Node ids are coordinate-derived (`_coord_to_id`), so a differing id means a node at a
+different position: **15,624 nodes — 37.7% of the union — moved between two runs of
+identical code on identical input.** Both graphs are valid (`crosses_land = 0` in each);
+they are simply different meshings of the same water.
+
+Two consequences:
+
+1. **The §4.1 sweep is safe to run.** Its expected effect (~38% fewer nodes) is roughly
+   50× the count noise floor, so count-based comparisons are meaningful. Run each config
+   twice regardless, and treat any difference under ~2% in counts as noise.
+2. **Anything keyed on node identity across builds is not safe.** This bears directly on
+   Round 25 cross-database seam stitching, which matches seam nodes on coordinates
+   (`_seam_coord_set`, `_publish_seam_nodes`, `_adopt_seam_nodes`): two independently
+   built adjacent regions cannot be assumed to agree on a seam node's position, and
+   rebuilding one region of a stitched set may silently break its seams with neighbours
+   that were not rebuilt. This is pre-existing and unrelated to anything in this spec,
+   but it deserves its own investigation — the likely candidates are ordering-dependent
+   passes with caps (`MAX_LOCAL_GAP_RESOLVE_PER_COMPONENT`, `_stitch_component_pieces`),
+   where which candidates get processed before the cap is hit decides the outcome.
+
+## 6. Verification plan
 
 - §4.1.2 is done, so per-edge width is now available to drive the coupling.
 - Rebuild Zeeland with 4.1 width-coupled at caps 25/75/150 m, plus one flat-75 m control to
@@ -250,7 +290,7 @@ sampled against the pre-merge geometry. Any decimation must happen *before*
   `min_depth` along the path. Depth must not become more optimistic anywhere.
 - Largest-component connectivity must hold at 87.1% (the current Zeeland figure).
 
-## 6. Risks
+## 7. Risks
 
 - Long edges on straight reaches increase the chance a single edge spans a chart feature
   (a shoal, a dredged-channel boundary) that the 5-point sampler steps over. Mitigate by
