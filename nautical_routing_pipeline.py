@@ -1,5 +1,6 @@
 import os
 import math
+import inspect
 import json
 import sqlite3
 import hashlib
@@ -22,6 +23,17 @@ from pyproj import Geod
 
 # Phase 0 navmesh-hybrid skeleton extraction (Step C). Hard deps per requirements.txt.
 from skimage.morphology import medial_axis
+# medial_axis breaks ties by processing pixels in an order drawn from a PRNG, and
+# defaults to a FRESH UNSEEDED generator on every call -- so two runs of the same
+# build produced different centerlines. Measured on one clip: node/edge counts moved
+# under 1%, but only 62.3% of coordinate-derived node ids were shared between runs,
+# i.e. 37.7% of nodes sat somewhere else. See docs/SPEC-GRAPH-DENSITY.md section 5.
+# The keyword has been spelled rng / random_state / seed across the versions
+# requirements.txt allows (scikit-image>=0.22), so bind whichever this one has.
+MEDIAL_AXIS_SEED = 0
+_MEDIAL_AXIS_RNG_KW = next(
+    (kw for kw in ("rng", "random_state", "seed")
+     if kw in inspect.signature(medial_axis).parameters), None)
 from rasterio.features import rasterize as _rio_rasterize
 from rasterio.transform import from_origin as _rio_from_origin
 # Phase 1 navmesh-region triangulation (Step B2). Hard dep per requirements.txt.
@@ -3234,8 +3246,17 @@ class NauticalRoutingPipeline:
 
     @staticmethod
     def _extract_medial_axis_skeleton(mask):
-        """medial_axis with the distance transform (width profile) in one call."""
-        skel, dist = medial_axis(mask, return_distance=True)
+        """medial_axis with the distance transform (width profile) in one call.
+
+        Seeded: see MEDIAL_AXIS_SEED. Without it the same input yields a different
+        centerline on every run, which makes builds irreproducible and -- because
+        node ids are coordinate-derived (_coord_to_id) -- means two independently
+        built adjacent regions cannot be relied on to agree about a shared seam node.
+        """
+        kwargs = {"return_distance": True}
+        if _MEDIAL_AXIS_RNG_KW is not None:
+            kwargs[_MEDIAL_AXIS_RNG_KW] = MEDIAL_AXIS_SEED
+        skel, dist = medial_axis(mask, **kwargs)
         return skel, dist
 
     def _skeleton_raster_to_graph(self, skel, dist, transform, utm_crs, pixel_size_m) -> nx.Graph:
