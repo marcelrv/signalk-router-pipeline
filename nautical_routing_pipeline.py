@@ -514,6 +514,56 @@ WATERWAY_CROSSING_CAP_PER_LINE = 8     # sanity cap per (navmesh piece, line) --
 WATERWAY_CONNECTOR_MAX_M = 250.0       # normal connector search radius to the nearest inland vertex
 WATERWAY_CONNECTOR_FALLBACK_MAX_M = 500.0  # widened radius for sparsely-digitized lines (logged)
 
+# --- Local gap-resolve pass (_stitch_component_pieces' last resort) ---
+# Fix for a confirmed bug: build_skeleton_network rasterizes an entire narrow
+# water-body piece at ONE shared pixel size derived from that whole piece's
+# bounding box, enlarged further whenever MAX_RASTER_PIXELS would be exceeded
+# (real build log: pixel size enlarged to 35-43m for the FL Atlantic-south
+# narrow piece). A real jetty-narrowed inlet throat (~150-250m) can pinch to
+# 0-1 pixels wide at that resolution, leaving medial-axis endpoints retreated
+# from the true gap on each bank -- confirmed on a real build (Lake Worth
+# Inlet, FL): two nodes 39.7m apart ended up in separate connected
+# components, well inside every pass above's snap_radius_m. Rather than
+# widening/relaxing any of those passes (which risks manufacturing a chord
+# through solid land), this re-rasterizes just a small window around a
+# still-disconnected close pair at a fixed fine pixel size and only merges
+# the result if that fresh medial axis itself proves a real water path.
+LOCAL_GAP_RESOLVE_MAX_M = 300.0            # max separation between two still-disconnected nodes
+                                            # to attempt a local remesh for -- kept below
+                                            # snap_radius_m (500m) since this is a materially
+                                            # more expensive fallback than the passes above it,
+                                            # reserved for near-miss gaps, not distant water bodies
+LOCAL_GAP_RESOLVE_WINDOW_MARGIN_M = 150.0  # buffer around the candidate pair's bbox for the
+                                            # local re-rasterization window
+LOCAL_GAP_RESOLVE_PIXEL_M = 1.0            # fixed fine pixel size for the local remesh -- the
+                                            # window is always tiny (<= ~600m across), so
+                                            # MAX_RASTER_PIXELS is never a constraint here
+LOCAL_GAP_RESOLVE_SNAP_M = 10.0            # snap tolerance for merging local-remesh chain
+                                            # endpoints onto existing nearby graph nodes
+LOCAL_GAP_RESOLVE_MIN_SPUR_M = 10.0        # spur-prune threshold for the tiny local skeleton
+                                            # (scaled down from ClassificationConfig's 60m default,
+                                            # which is sized for whole-piece rasters, not a
+                                            # <=~600m window)
+MAX_LOCAL_GAP_RESOLVE_PER_COMPONENT = 2000  # cap so a pathologically fragmented component can't
+                                            # blow up build time in this fallback pass -- raised
+                                            # from an initial 25: a full fl_atl_s rebuild showed
+                                            # "resolved" landing right at the cap both at 25
+                                            # (26-28) and at 200 (202-203), meaning the cap -- not
+                                            # a lack of real candidates -- was the binding
+                                            # constraint. Florida's coastline apparently has
+                                            # hundreds of legitimate narrow-throat gaps in one
+                                            # original water-body component -- not pathological,
+                                            # just a real count this cap needs comfortable
+                                            # headroom above (confirmed: raising to 2000 resolved
+                                            # 214, well under the new cap, with no measurable
+                                            # build-time increase, since each resolution is a tiny
+                                            # bounded local raster, not the whole-piece rasters
+                                            # this cap was originally modeled after). Leaves an
+                                            # order of magnitude of headroom above observed real
+                                            # demand while still bounding the pathological case
+                                            # (e.g. the 8440-union-find-group one documented
+                                            # above) this cap exists for in the first place.
+
 
 @dataclass
 class ClassificationConfig:
@@ -717,6 +767,9 @@ class NauticalRoutingPipeline:
         self.navmesh_seam_node_ids: set = set()
         # Round 14 summary counters, logged once at the end of build_network.
         self.waterway_crossing_stats = {"nodes": 0, "regions": 0, "edges": 0}
+        # Local gap-resolve summary counters, logged once at the end of
+        # _ensure_coastal_connectivity (see LOCAL_GAP_RESOLVE_* above).
+        self.local_gap_resolve_stats = {"gaps_resolved": 0, "edges_added": 0}
 
         # Round 25 cross-database seam stitching (STITCHING_DESIGN.md Section 3).
         # Empty stitch_registry_path (the default) means stitching is OFF and
@@ -2623,6 +2676,297 @@ class NauticalRoutingPipeline:
                                    f"connector among sampled candidates; {remaining} components "
                                    f"left unmerged.")
                 break
+
+        if len({find(n) for n in ids}) > 1:
+            added += self._resolve_local_skeleton_gaps(
+                ids, coords_m, coords_wgs84, poly_m, poly_prep, utm,
+                DEFAULT_SOURCE_TIER, None, parent, find, union)
+        return added
+
+    def _snap_or_create_node(self, lon, lat, pool_ids, pool_coords_m, utm, snap_m, node_type="coastal"):
+        """Return (node_id, (x_m, y_m)) -- an existing node from pool_ids/pool_coords_m
+        within snap_m of (lon, lat) if one exists, else a freshly created node.
+        Used by _remesh_local_gap to merge a local skeleton onto nearby existing
+        graph nodes rather than always minting brand-new ones a few metres away."""
+        pt_m = gpd.GeoSeries([Point(lon, lat)], crs=self.CRS_WGS84).to_crs(utm).iloc[0]
+        if len(pool_ids):
+            d = np.hypot(pool_coords_m[:, 0] - pt_m.x, pool_coords_m[:, 1] - pt_m.y)
+            k = int(np.argmin(d))
+            if d[k] <= snap_m:
+                return pool_ids[k], (pt_m.x, pt_m.y)
+        node_id = self._get_or_create_node(lon, lat, node_type)
+        return node_id, (pt_m.x, pt_m.y)
+
+    def _remesh_local_gap(self, i: int, j: int, ids, coords_m, coords_wgs84, poly_m, poly_prep, utm,
+                          source_tier, source_id) -> int:
+        """Re-rasterize a small window around candidate nodes ids[i]/ids[j] at a
+        fixed fine pixel size and, if their medial axis is genuinely connected
+        there, merge the result into self.graph. Returns edges added (0 if the
+        two points turn out not to be connected at this resolution either --
+        e.g. a real charting gap, not a rasterization artifact).
+
+        See LOCAL_GAP_RESOLVE_* constants' comment for why this exists: the
+        whole-piece skeleton raster this component was originally built from
+        can retreat well short of a narrow, jetty-flanked throat, and the
+        ordinary stitch passes above can only accept or reject a straight
+        connector between whatever nodes that coarse raster already produced.
+        This re-derives the answer at a resolution fine enough that
+        MAX_RASTER_PIXELS never forces a coarser pixel size.
+        """
+        cfg = self.classification_config
+        margin = LOCAL_GAP_RESOLVE_WINDOW_MARGIN_M
+        minx = min(coords_m[i][0], coords_m[j][0]) - margin
+        maxx = max(coords_m[i][0], coords_m[j][0]) + margin
+        miny = min(coords_m[i][1], coords_m[j][1]) - margin
+        maxy = max(coords_m[i][1], coords_m[j][1]) + margin
+        window_m = box(minx, miny, maxx, maxy)
+        clipped_m = poly_m.intersection(window_m)
+        if clipped_m.is_empty:
+            return 0
+
+        window_wgs84 = gpd.GeoSeries([window_m], crs=utm).to_crs(self.CRS_WGS84).iloc[0]
+        land_m = self._land_union_for(window_wgs84, utm)
+
+        mask, transform, px = self._rasterize_water_polygon(clipped_m, land_m, LOCAL_GAP_RESOLVE_PIXEL_M)
+        if mask is None or int(mask.sum()) < 3:
+            return 0
+        skel, dist = self._extract_medial_axis_skeleton(mask)
+        if int(skel.sum()) < 2:
+            return 0
+        G_local = self._skeleton_raster_to_graph(skel, dist, transform, utm, px)
+        if G_local.number_of_nodes() < 2:
+            return 0
+        self._prune_skeleton_spurs(G_local, LOCAL_GAP_RESOLVE_MIN_SPUR_M)
+        if G_local.number_of_edges() == 0:
+            return 0
+
+        # Correctness gate: only proceed if the two ORIGINAL candidate points
+        # both land near the SAME connected component of this fresh local
+        # skeleton -- i.e. the fine remesh itself proves a real water path
+        # exists between them, not just that this window happens to contain
+        # some water. This is what makes the whole pass safe: it can never
+        # bridge two genuinely separate water bodies (clipped_m is still
+        # scoped to poly_m, the original charted component) and can never
+        # punch through solid land (land_m is subtracted here exactly like
+        # every other raster in this pipeline).
+        local_ids = list(G_local.nodes)
+        local_lonlat = np.array([G_local.nodes[n]["lonlat"] for n in local_ids])
+        d_i = np.hypot(local_lonlat[:, 0] - coords_wgs84[i][0], local_lonlat[:, 1] - coords_wgs84[i][1])
+        d_j = np.hypot(local_lonlat[:, 0] - coords_wgs84[j][0], local_lonlat[:, 1] - coords_wgs84[j][1])
+        node_near_i = local_ids[int(np.argmin(d_i))]
+        node_near_j = local_ids[int(np.argmin(d_j))]
+        comp = nx.node_connected_component(G_local, node_near_i)
+        if node_near_j not in comp:
+            return 0
+
+        # Confirmed connected -- merge G_local into self.graph. Endpoints of each
+        # collapsed chain snap onto an existing nearby graph node (this
+        # component's own `ids`, extended as new nodes are created) within
+        # LOCAL_GAP_RESOLVE_SNAP_M, same discipline build_skeleton_network uses
+        # via _get_or_create_node's coordinate-rounding dedupe, just with an
+        # explicit wider tolerance since this bridges two independently-built
+        # meshes rather than deduping within one. Pool is pre-filtered to the
+        # remesh window (+ snap margin) rather than the whole component's
+        # `ids` -- a component can hold tens of thousands of nodes, and only
+        # ones inside this ~600m window can ever be within snap_m of a local
+        # skeleton node.
+        in_window = ((coords_m[:, 0] >= minx - LOCAL_GAP_RESOLVE_SNAP_M) &
+                     (coords_m[:, 0] <= maxx + LOCAL_GAP_RESOLVE_SNAP_M) &
+                     (coords_m[:, 1] >= miny - LOCAL_GAP_RESOLVE_SNAP_M) &
+                     (coords_m[:, 1] <= maxy + LOCAL_GAP_RESOLVE_SNAP_M))
+        window_idxs = np.flatnonzero(in_window)
+        pool_ids = [ids[k] for k in window_idxs]
+        pool_coords_m = coords_m[window_idxs].copy()
+        node_map = {}
+        for n in local_ids:
+            lon, lat = G_local.nodes[n]["lonlat"]
+            node_id, pt_m = self._snap_or_create_node(lon, lat, pool_ids, pool_coords_m, utm,
+                                                       LOCAL_GAP_RESOLVE_SNAP_M)
+            node_map[n] = node_id
+            if node_id not in pool_ids:
+                pool_ids.append(node_id)
+                pool_coords_m = np.vstack([pool_coords_m, [pt_m]])
+
+        added = 0
+        for u, v, d in G_local.edges(data=True):
+            full_pts, full_widths = d["pts"], d["width_profile"]
+            # G_local is undirected -- edge iteration does not guarantee u
+            # corresponds to full_pts[0]: a node already present in G_local
+            # from an EARLIER edge (in that edge's "end" role) is reported
+            # first regardless of the argument order THIS edge's own
+            # add_edge call used (confirmed via networkx directly). Resolve
+            # each end by matching against the two nodes' own recorded
+            # lonlat instead of assuming u/v order matches pts order --
+            # otherwise a multi-segment chain's outer hops can bind to the
+            # wrong endpoint node, producing a straight chord to the wrong
+            # place instead of following the validated centerline.
+            node_start = u if G_local.nodes[u]["lonlat"] == full_pts[0] else v
+            node_end = v if node_start == u else u
+            for sub_pts, sub_widths in self._resample_long_skeleton_edges(full_pts, full_widths, cfg.max_segment_m):
+                su = node_map[node_start] if sub_pts[0] == full_pts[0] else \
+                    self._get_or_create_node(sub_pts[0][0], sub_pts[0][1], "coastal")
+                sv = node_map[node_end] if sub_pts[-1] == full_pts[-1] else \
+                    self._get_or_create_node(sub_pts[-1][0], sub_pts[-1][1], "coastal")
+                if su == sv:
+                    continue
+                self._stamp_node(su, NODE_KIND_POINT, source_tier, source_id)
+                self._stamp_node(sv, NODE_KIND_POINT, source_tier, source_id)
+                wp = json.dumps({"min_m": min(sub_widths), "samples_m": sub_widths})
+                attrs = dict(edge_type="coastal", edge_kind_id=EDGE_KIND_CENTERLINE,
+                             width_profile=wp, min_width=min(sub_widths),
+                             source_tier=source_tier, source_id=source_id)
+                if not self.graph.has_edge(su, sv):
+                    self.graph.add_edge(su, sv, **attrs)
+                    self.graph.add_edge(sv, su, **attrs)
+                    added += 2
+
+        # Guarantee ids[i]/ids[j] themselves join the new structure: their own
+        # coordinate can sit mid-chain along the fine remesh's longer
+        # centerline (collapsed away, never a G_local node in its own right),
+        # so node_map's per-chain-endpoint snap above isn't guaranteed to have
+        # touched them directly. Same safety gates as the ordinary stitch
+        # passes (poly_prep containment + _crosses_land) apply here too --
+        # reuses the caller's already-built poly_prep (same poly_m this
+        # method received) rather than re-preparing the full-component
+        # polygon's edge index on every successful pair.
+        for idx in (i, j):
+            orig_id = ids[idx]
+            touched = set(node_map.values())
+            if orig_id in touched:
+                continue
+            olon, olat = coords_wgs84[idx]
+            best_id, best_d = None, None
+            for cand_id in touched:
+                clon, clat = self.graph.nodes[cand_id]["lon"], self.graph.nodes[cand_id]["lat"]
+                _, _, dist = self.geod.inv(olon, olat, clon, clat)
+                if best_d is None or dist < best_d:
+                    best_id, best_d = cand_id, dist
+            if best_id is None:
+                continue
+            best_lon, best_lat = self.graph.nodes[best_id]["lon"], self.graph.nodes[best_id]["lat"]
+            best_pt_m = gpd.GeoSeries([Point(best_lon, best_lat)], crs=self.CRS_WGS84).to_crs(utm).iloc[0]
+            candidate_m = LineString([coords_m[idx], (best_pt_m.x, best_pt_m.y)])
+            if not poly_prep.contains(candidate_m):
+                continue
+            if self._crosses_land(LineString([(olon, olat), (best_lon, best_lat)])):
+                continue
+            attrs = dict(edge_type="coastal", edge_kind_id=EDGE_KIND_NAVMESH_BOUNDARY,
+                         source_tier=source_tier, source_id=source_id)
+            self.graph.add_edge(orig_id, best_id, **attrs)
+            self.graph.add_edge(best_id, orig_id, **attrs)
+            added += 2
+
+        return added
+
+    def _resolve_local_skeleton_gaps(self, ids, coords_m, coords_wgs84, poly_m, poly_prep, utm,
+                                     source_tier, source_id, parent, find, union) -> int:
+        """Last-resort local high-resolution re-mesh for node pairs still left in
+        different components after every pass above (see LOCAL_GAP_RESOLVE_*
+        constants' comment for the confirmed bug this fixes).
+
+        Rather than trying to guess *why* an earlier pass missed a given pair
+        (never sampled due to a per-component cap, or evaluated and rejected
+        by `_crosses_land`), this re-derives the answer directly per candidate
+        pair via `_remesh_local_gap`.
+        """
+        groups: Dict[Any, List[int]] = {}
+        for idx, n in enumerate(ids):
+            groups.setdefault(find(n), []).append(idx)
+        if len(groups) <= 1:
+            return 0
+
+        # Nearest-first candidate pairs across DIFFERENT groups. This has
+        # tried two simpler approaches first, each with a real failure mode:
+        #   1. A separate cKDTree per group, cross-queried against every
+        #      other group, is O(groups x nodes) -- Pass 0's own comment
+        #      above records 8440 union-find groups for one real component,
+        #      which would make that approach run hundreds of millions of
+        #      queries right when this last-resort pass is most likely to be
+        #      reached (a highly fragmented component).
+        #   2. A single tree over ALL nodes queried with a small fixed k has
+        #      Pass 0's own documented crowding failure: if a node has more
+        #      same-group neighbours than k closer than the true cross-group
+        #      candidate, that candidate never appears in its top-k and the
+        #      gap silently goes unresolved.
+        #   3. query_ball_point(r=LOCAL_GAP_RESOLVE_MAX_M) fixes the crowding
+        #      miss (returns every node in range, not just the k nearest),
+        #      but can materialize an unbounded same-group-inclusive
+        #      neighbour list before any group filtering happens -- a single
+        #      node sitting inside a large, densely-packed already-connected
+        #      mesh can return thousands of same-group hits that get thrown
+        #      away immediately after, real memory/time wasted for nothing.
+        # Escalating k bounds the DISCOVERY budget instead: start small,
+        # and only widen it for a node whose entire current top-k turned out
+        # to be same-group AND still has room before LOCAL_GAP_RESOLVE_MAX_M
+        # (i.e. genuinely crowded, not just sparse), up to a hard ceiling.
+        # Worst case is O(nodes x MAX_K), not O(nodes x local-density) or
+        # O(groups x nodes) -- a genuine miss is now only possible for a
+        # node with more than MAX_K same-group neighbours all closer than
+        # its true cross-group candidate, far rarer than the k=8 case this
+        # replaced and explicitly bounded rather than open-ended.
+        from scipy.spatial import cKDTree
+        all_tree = cKDTree(coords_m)
+        own_group = np.array([find(n) for n in ids])
+        n = len(ids)
+        MAX_K = min(256, n)
+        k = min(8, n)
+        seen_pairs = set()
+        candidates = []
+        remaining = np.arange(n)
+        while len(remaining):
+            dists, nns = all_tree.query(coords_m[remaining], k=k, distance_upper_bound=LOCAL_GAP_RESOLVE_MAX_M)
+            dists = np.atleast_2d(dists)
+            nns = np.atleast_2d(nns)
+            still_stuck = []
+            for local_a, a in enumerate(remaining):
+                found_cross = False
+                last_dist = -1.0
+                for dist, b in zip(dists[local_a], nns[local_a], strict=True):
+                    b = int(b)
+                    if b >= n or not np.isfinite(dist) or b == a:
+                        continue
+                    last_dist = dist
+                    if own_group[a] != own_group[b]:
+                        found_cross = True
+                        pair = (a, b) if a < b else (b, a)
+                        if pair not in seen_pairs:
+                            seen_pairs.add(pair)
+                            candidates.append((float(dist), pair[0], pair[1]))
+                if not found_cross and k < MAX_K and 0 <= last_dist < LOCAL_GAP_RESOLVE_MAX_M:
+                    still_stuck.append(a)
+            if k >= MAX_K:
+                break
+            remaining = np.array(still_stuck, dtype=int)
+            k = min(k * 2, MAX_K)
+        candidates.sort(key=lambda t: t[0])
+
+        added = 0
+        resolved = 0
+        attempted = set()
+        for dist, i, j in candidates:
+            if resolved >= MAX_LOCAL_GAP_RESOLVE_PER_COMPONENT:
+                break
+            if find(ids[i]) == find(ids[j]):
+                continue
+            key = (min(i, j), max(i, j))
+            if key in attempted:
+                continue
+            attempted.add(key)
+
+            candidate_m = LineString([coords_m[i], coords_m[j]])
+            if not poly_prep.contains(candidate_m):
+                continue
+
+            n_added = self._remesh_local_gap(i, j, ids, coords_m, coords_wgs84, poly_m, poly_prep, utm,
+                                             source_tier, source_id)
+            if n_added:
+                added += n_added
+                resolved += 1
+                union(ids[i], ids[j])
+
+        if resolved:
+            self.local_gap_resolve_stats["gaps_resolved"] += resolved
+            self.local_gap_resolve_stats["edges_added"] += added
         return added
 
     # ------------------------------------------------------------------
@@ -3415,6 +3759,11 @@ class NauticalRoutingPipeline:
         logger.info(f"Final coastal connectivity pass: added {total_added} stitching edges "
                     f"across {len(components)} components ({total_inland_candidates} in-polygon "
                     f"inland-node candidates included).")
+        lgrs = self.local_gap_resolve_stats
+        if lgrs["gaps_resolved"]:
+            logger.info(f"Local gap-resolve pass: reconnected {lgrs['gaps_resolved']} narrow-throat "
+                        f"gaps ({lgrs['edges_added']} edges added) that all passes above left "
+                        f"disconnected.")
 
     # ------------------------------------------------------------------
     # Round 25 cross-database seam stitching (STITCHING_DESIGN.md Section 3).
