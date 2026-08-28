@@ -163,11 +163,18 @@ def deploy(args):
 
     base_name = args.region
     inner_filename = f"{base_name}.sqlite"
-    gz_filename = f"{base_name}.sqlite.gz"
 
     # Region id must match generate_index.py's path-derived id exactly, or the
     # descriptor and a local file copy would show up as two separate regions.
     region_id = f"{args.continent}_{args.country}_{base_name}".lower()
+
+    # The release asset name must be globally unique across every region in
+    # the shared GitHub Release -- base_name alone isn't (e.g. two countries
+    # could both have a "zeeland"), so it's keyed on region_id instead.
+    gz_filename = f"{region_id}.sqlite.gz"
+    # Legacy pre-release deploys committed the .gz under the plain base_name;
+    # keep checking that name so the redundant-file note below still fires.
+    legacy_gz_filename = f"{base_name}.sqlite.gz"
 
     # The compressed asset is a build artifact, not repo content: it is staged
     # outside regions/ so it can never be picked up by `git add regions/`.
@@ -212,6 +219,8 @@ def deploy(args):
         upload_asset(gz_path, args.release_tag, args.gh_repo)
     else:
         print(f"Skipping upload (--no-upload). Asset staged at {gz_path}", file=sys.stderr)
+        print("Dry run complete. No descriptor or index was written.", file=sys.stderr)
+        return
 
     regions_dir = os.path.join(data_repo, 'regions', args.continent, args.country)
     os.makedirs(regions_dir, exist_ok=True)
@@ -224,7 +233,7 @@ def deploy(args):
     # A previously committed copy of this database would keep being served as
     # the catalog's `file` for older clients and keep bloating history — flag
     # it, but leave the removal to the operator.
-    legacy_gz = os.path.join(regions_dir, gz_filename)
+    legacy_gz = os.path.join(regions_dir, legacy_gz_filename)
     legacy_meta = os.path.join(regions_dir, f"{base_name}.metadata.json")
     for legacy in (legacy_gz, legacy_meta):
         if os.path.exists(legacy):
@@ -244,7 +253,8 @@ def deploy(args):
         )
         print(result.stderr, file=sys.stderr)
         if result.returncode != 0:
-            print(f"WARNING: index generation failed:\n{result.stdout}", file=sys.stderr)
+            print(f"ERROR: index generation failed:\n{result.stdout}", file=sys.stderr)
+            sys.exit(1)
 
     print(f"\nDone. Commit {os.path.relpath(descriptor_path, data_repo)} "
           f"(and routing-index.json) to publish.", file=sys.stderr)
