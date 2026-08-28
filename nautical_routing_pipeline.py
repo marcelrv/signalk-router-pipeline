@@ -86,6 +86,32 @@ def _candidates_by_bounds_static(gdf, geom, margin=0.0):
         return gdf.iloc[candidates]
     return gpd.GeoDataFrame()
 
+
+def _depare_candidate_beats(val, candidate_cscl, best, best_cscl) -> bool:
+    """Shared tie-break policy for DEPARE candidate selection, used by both
+    _edge_attr_worker and NauticalRoutingPipeline._compute_node_depths.
+
+    The primary rule (max DRVAL1 wins) is unchanged -- a deeper containing
+    claim is the more detailed one. But two overlapping cells (different
+    chart scales, both containing the same sample point) routinely tie on
+    the EXACT same DRVAL1, most commonly at 0.0 -- a standard band floor
+    every scale reuses. Before this, a tie kept whichever candidate
+    iterrows()/the spatial index happened to visit first: incidental
+    row/insertion order from the multi-cell merge, not anything tied to
+    chart quality. That could silently drop a genuine fine-scale harbor
+    reading's src_cscl in favour of a coarse cell's, or vice versa,
+    non-deterministically -- exactly the ambiguity TRUSTED_SURVEY_CSCL_MAX
+    exists to resolve, undermined by unstable tie-breaking. On a tie, prefer
+    the candidate with the smaller (finer) src_cscl. Only fires when BOTH
+    values are known -- an unlabeled candidate (older data without src_cscl
+    tagging) is not assumed worse than a labeled one, so the incumbent keeps
+    its seat rather than risk preferring an actually-coarser unlabeled cell.
+    """
+    if best is None or val > best:
+        return True
+    return (val == best and candidate_cscl is not None and best_cscl is not None
+            and candidate_cscl < best_cscl)
+
 def _edge_attr_worker(edge_chunk):
     geod = _EDGE_ATTR_GEOD
     gdfs = _EDGE_ATTR_GDFS
@@ -145,12 +171,15 @@ def _edge_attr_worker(edge_chunk):
                                 geom = row.geometry
                                 if geom is not None and geom.contains(pt):
                                     val = row['DRVAL1']
-                                    if pd.notna(val) and (best is None or float(val) > best):
-                                        best = float(val)
-                                        upper = row['DRVAL2'] if 'DRVAL2' in row else None
-                                        best_upper = float(upper) if pd.notna(upper) else None
+                                    if pd.notna(val):
+                                        val = float(val)
                                         cscl = row['src_cscl'] if 'src_cscl' in row else None
-                                        best_cscl = int(cscl) if pd.notna(cscl) else None
+                                        row_cscl = int(cscl) if pd.notna(cscl) else None
+                                        if _depare_candidate_beats(val, row_cscl, best, best_cscl):
+                                            best = val
+                                            upper = row['DRVAL2'] if 'DRVAL2' in row else None
+                                            best_upper = float(upper) if pd.notna(upper) else None
+                                            best_cscl = row_cscl
                             # See DRYING_BAND_IMPLAUSIBLE_DRVAL1_M: an implausibly
                             # extreme DRVAL1 (e.g. -50) with a plausible DRVAL2 is a
                             # coarse-band placeholder on the drying side, not a real
@@ -4307,12 +4336,13 @@ class NauticalRoutingPipeline:
                     any_containing = True
                     if "DRVAL1" in row and pd.notnull(row["DRVAL1"]):
                         val = float(row["DRVAL1"])
-                        if best is None or val > best:
+                        cscl = row["src_cscl"] if "src_cscl" in row else None
+                        row_cscl = int(cscl) if pd.notnull(cscl) else None
+                        if _depare_candidate_beats(val, row_cscl, best, best_cscl):
                             best = val
                             upper = row["DRVAL2"] if "DRVAL2" in row else None
                             best_upper = float(upper) if pd.notnull(upper) else None
-                            cscl = row["src_cscl"] if "src_cscl" in row else None
-                            best_cscl = int(cscl) if pd.notnull(cscl) else None
+                            best_cscl = row_cscl
             if not any_containing and nid in adopted_ids:
                 # No local DEPARE reaches this adopted node -- keep the depth
                 # spliced in verbatim from the seam registry rather than
