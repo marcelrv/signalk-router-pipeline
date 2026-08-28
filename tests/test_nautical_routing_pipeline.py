@@ -5,7 +5,6 @@ from nautical_routing_pipeline import (
     _is_entry_prohibited,
     _obstruction_depth_disposition,
     _default_data_sources,
-    DEFAULT_SOURCE_TIER,
 )
 
 
@@ -95,7 +94,10 @@ class TestDefaultDataSources:
     def test_inland_waterways_is_ienc_tier1(self):
         row = next(r for r in _default_data_sources() if r["name"] == "inland_waterways")
         assert row["source_type"] == "ienc"
-        assert row["default_tier"] == DEFAULT_SOURCE_TIER
+        # Asserts the literal expected value, not DEFAULT_SOURCE_TIER -- comparing
+        # against the same constant the source uses would pass even if that
+        # constant were changed to something other than tier 1 for the wrong reason.
+        assert row["default_tier"] == 1
 
     def test_enc_layers_are_source_type_enc(self):
         rows = _default_data_sources()
