@@ -70,7 +70,7 @@ Alternative considered and rejected: map `DRGARE` directly into `fairways_polygo
 - **Classification (`classify_water_body` / `_has_regulatory_structure`):** Broaden to `fairways_unified` (any overlap → laned). This restores US channels to directional-treatment eligibility.
 - **Bridge/lock crossing (`_add_opening_bridge_edges`, `_add_lock_crossing_edges`):** Already consumes fairway intersections — widen to `fairways_unified` so openings aligned to `DRGARE` channels are found.
 - **Navmesh depth split (`_split_deep_shallow`):** No direct change — it keys on `DEPARE`; `DRGARE` depth override is applied later as edge attribute, not as region geometry. Consider optional future use for boundary refinement.
-- **Provenance (`_default_data_sources`, `data_sources` table):** Add `dredged_areas` row (Tier 1, `source_type='enc'`), and retain `fairways` row. Edges derived from `DRGARE` get `source_id = dredged_areas` id.
+- **Provenance (`_default_data_sources`, `data_sources` table):** Add `dredged_areas` row (Tier 1, `source_type='enc'`), and retain `fairways` row. Edge-level `source_id` stays topology provenance (which layer's geometry produced the edge, e.g. `coastal_water`/`inland_waterways`) and is not reassigned by attribute-refining layers — `_edge_attr_worker` already applies this same rule to `DEPARE`, bridges, locks, and fairways, none of which reassign `source_id` either when they override an edge's depth/cost/width. `DRGARE`'s presence for a given edge is still fully queryable via the `dredged_areas` row's geometry (was this edge inside a `DRGARE` polygon?) without needing a redundant per-edge pointer.
 - **POIs (`add_pois_to_db.py`):** No change — fairway POIs remain from `FAIRWY` features; `DRGARE` does not generate POIs.
 
 ### 4.3 Database
