@@ -39,9 +39,9 @@ Consequences:
 
 ## 3. Is RECTRC safe? Depth?
 
-**No depth association — do not use as depth constraint.** `DRVAL1` is null by design; the track assumes the surrounding `DEPARE` water is deep enough. Safety comes from the *enclosing* `DEPARE`/`DRGARE` depth, not the line itself. Treat RECTRC as **soft preference only** (`cost_factor=0.8` where it exists), same as `FAIRWY`, never as `min_depth` override. This is the same stance as the fairway harmonization spec: `DRGARE` is the depth authority, `FAIRWY`/`RECTRC`/`NAVLNE` are topological preference.
+**No depth association — do not use as depth constraint.** `DRVAL1` was null on every `RECTRC` in the ~200-cell US sample. Note this is an observation, not a guarantee: IHO S-57 lists `RECTRC.DRVAL1` as *optional*, so a future ENC edition may populate it. The rule holds either way — a track's own `DRVAL1` must never override `min_depth`, because the track asserts a route, not a surveyed bottom. If a non-null value does appear, treat it as advisory metadata only and keep the enclosing `DEPARE`/`DRGARE` authoritative. Safety comes from the *enclosing* `DEPARE`/`DRGARE` depth, not the line itself. Treat RECTRC as **soft preference only** (`cost_factor=0.8` where it exists), same as `FAIRWY`, never as `min_depth` override. This is the same stance as the fairway harmonization spec: `DRGARE` is the depth authority, `FAIRWY`/`RECTRC`/`NAVLNE` are topological preference.
 
-`TRAFIC`/`ORIENT` can refine `traffic_mode` (one-way) exactly as `FAIRWY.TRAFIC` does in `_edge_attr_worker`.
+Treat RECTRC as **soft preference only** — but only under Option B, and only for `CATTRK=1`; offshore `CATTRK=2` tracks get no preference in either option (see §4). `TRAFIC`/`ORIENT` can refine `traffic_mode` (one-way) exactly as `FAIRWY.TRAFIC` does in `_edge_attr_worker`.
 
 ## 4. Proposed handling (no behaviour change for inland `WTWAXS`)
 
@@ -49,7 +49,7 @@ Keep `WTWAXS` (true inland axis, USACE IENC) in `inland_waterways_lines.geojson`
 
 For NOAA coastal `RECTRC`/`NAVLNE`, split at read time by `CATTRK`:
 
-- **Option A — minimal change (recommended for this spec):** Keep current merge, but document the distinction and add `CATTRK` to piped GeoJSON properties. No code change now; revisit if offshore track disconnection is observed in Great Lakes builds.
+- **Option A — minimal change (recommended for this spec):** Keep current merge, but document the distinction and add `CATTRK` to piped GeoJSON properties. No code change now; revisit if offshore track disconnection is observed in Great Lakes builds. **Under Option A no `cost_factor` preference is applied to `RECTRC` at all** — the `cost_factor=0.8` in §3 describes the treatment Option B would introduce, not current or Option A behaviour.
 - **Option B — faithful harmonization:** In `enc_preprocessor.py`, emit `RECTRC` to *both* layers — retain in `inland_waterways_lines.geojson` for backward compat, and additionally merge `CATTRK=1` tracks into `fairways_unified_polygons` (as buffered centerlines or as line-preference for `_edge_attr_worker` line-intersection cost). Implement as secondary line-intersection check in `_edge_attr_worker` alongside the polygon check: `if gdf_line.intersects(edge_geom): cost_factor=0.8`. This elevates harbour-approach recommended tracks to the same preference tier as `DRGARE`/`FAIRWY` without misclassifying them as inland rivers.
   - Offshore `CATTRK=2` tracks remain inland-like (long open-water connectors) — do *not* promote to fairway, keep line-cost only if desired.
 
@@ -57,6 +57,6 @@ Choice: **Ship Option A now, gate Option B on a Great Lakes/estuary re-build pro
 
 ## 5. Verification
 
-- Preprocessor on `US4NY1JH` + `US5NYCEG`: `inland_waterways_lines.geojson` gains ~75+35 line features with `CATTRK/TRAFIC/ORIENT` preserved; `fairways_unified` unchanged in Option A.
+- Preprocessor on `US4NY1JH` + `US5NYCEG`: `inland_waterways_lines.geojson` gains the **10 `RECTRC` lines those two cells actually hold** (8 + 2, per §1) with `CATTRK/TRAFIC/ORIENT` preserved; `fairways_unified` unchanged in Option A. The 75/35 figures in §1 are corpus-wide totals over ~200 cells and are the expectation for a corpus-wide run, not for this two-cell check.
 - Build NY + Lake Ontario: `waterway_crossing_stats` and Pass 0d counters for RECTRC-bearing builds should be >0 where tracks cross navmesh boundaries; no new `crosses_land` violations.
 - Route probe: harbour approach via `RECTRC CATTRK=1` should already be routable through existing inland↔coastal connector; offshore `CATTRK=2` track is optional preference, not safety-critical.
