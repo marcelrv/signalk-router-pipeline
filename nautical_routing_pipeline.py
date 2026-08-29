@@ -773,10 +773,82 @@ class ClassificationConfig:
     pixel_dim_divisor: float = 200.0    # adaptive px = clamp(min_dim / divisor, floor, ceiling)
     min_spur_length_m: float = 60.0     # prune skeleton dead-ends shorter than this
     max_segment_m: float = 100.0        # resample collapsed centerlines to segments this long (narrow channels need <200m so straight-chord edges stay inside bends)
+    # SPEC-GRAPH-DENSITY.md §4.1: sagitta-bounded adaptive resampling. 0.0 (default)
+    # disables it entirely -- _resample_long_skeleton_edges falls back to the
+    # unconditional max_segment_m cut above, byte-for-byte today's behaviour.
+    # Nothing ships until a build is measured against the §6 gates.
+    max_chord_sagitta_m: float = 0.0    # cap on chord-to-centerline deviation (m); 0.0 = disabled
+    sagitta_width_fraction: float = 0.5  # tolerance = min(cap, this * local channel width), per §4.1.1
 
     def pixel_size_for(self, min_dimension_m: float) -> float:
         return float(np.clip(min_dimension_m / self.pixel_dim_divisor,
                              self.pixel_min_m, self.pixel_max_m))
+
+
+# SPEC-GRAPH-DENSITY.md §4.1: the sentinel `_edge_attr_worker` falls back to when
+# a channel's width was never measured (see line ~369, "min_width = 999.0" default).
+# Per §4.1's width-exclusion rule, a width equal to this (or missing/non-positive)
+# must never be fed into the sagitta tolerance -- that would produce the LARGEST
+# tolerance exactly where the channel is least known.
+WIDTH_UNKNOWN_M = 999.0
+
+
+def _width_is_known(w) -> bool:
+    """True if w is a real measured channel width, not a missing/sentinel value."""
+    return (w is not None and np.isfinite(w) and w > 0.0
+            and abs(float(w) - WIDTH_UNKNOWN_M) > 1e-9)
+
+
+def _chain_has_known_width(widths) -> bool:
+    """True only if every vertex along the (pre-split) chain carries a real width.
+
+    Sagitta relaxation is an all-or-nothing decision per §4.1: a chain with any
+    unmeasured vertex keeps today's uniform max_segment_m behaviour in full,
+    rather than mixing relaxed and unrelaxed sub-segments.
+    """
+    return bool(widths) and all(_width_is_known(w) for w in widths)
+
+
+def _sagitta_tolerance_m(seg_widths, cap_m: float, width_fraction: float) -> float:
+    """tolerance = min(cap, width_fraction * local channel width), per §4.1.1.
+
+    `seg_widths` is assumed already known-good (caller gates on
+    `_chain_has_known_width` before this is ever used for relaxation).
+    """
+    return min(cap_m, width_fraction * min(seg_widths))
+
+
+def _max_sagitta_m(seg_pts) -> float:
+    """Max perpendicular deviation (metres) of seg_pts' interior vertices from the
+    straight chord seg_pts[0] -> seg_pts[-1].
+
+    seg_pts are (lon, lat) degrees; per §4.1 constraint 4 these are projected to
+    local equirectangular metres about seg_pts[0] (longitude scaled by cos(lat))
+    before measuring -- degrees are not a valid distance space for this comparison,
+    and the local-tangent-plane error over a <=max_segment_m span is negligible.
+    Vectorised over all interior points at once (no per-point Python loop) so a
+    long, nearly-straight chain does not turn quadratic in practice (§4.1
+    complexity note) -- callers additionally keep candidate segments short by
+    retaining max_segment_m as a hard backstop.
+    """
+    if len(seg_pts) < 3:
+        return 0.0
+    lon0, lat0 = seg_pts[0][0], seg_pts[0][1]
+    coslat = math.cos(math.radians(lat0))
+    arr = np.asarray(seg_pts, dtype=float)
+    x = (arr[:, 0] - lon0) * 111320.0 * coslat
+    y = (arr[:, 1] - lat0) * 111320.0
+    ax, ay = x[0], y[0]
+    bx, by = x[-1], y[-1]
+    abx, aby = bx - ax, by - ay
+    chord_len = math.hypot(abx, aby)
+    px = x[1:-1] - ax
+    py = y[1:-1] - ay
+    if chord_len < 1e-9:
+        # Degenerate chord (start == end): sagitta is just distance from the start.
+        return float(np.max(np.hypot(px, py)))
+    cross = np.abs(abx * py - aby * px)
+    return float(np.max(cross) / chord_len)
 
 
 def _iter_boundary_lines(geom):
@@ -939,7 +1011,8 @@ class NauticalRoutingPipeline:
                  stitch_registry_path: str = "",
                  coverage_bbox: Optional[Tuple[float, float, float, float]] = None,
                  stitch_band_m: float = 300.0, stitch_radius_m: float = 500.0,
-                 navmesh_edge_m: float = NAVMESH_TARGET_EDGE_M):
+                 navmesh_edge_m: float = NAVMESH_TARGET_EDGE_M,
+                 sagitta_cap: float = 0.0):
         self.data_paths = data_paths
         self.db_path = db_path
         self.country = country
@@ -952,7 +1025,8 @@ class NauticalRoutingPipeline:
         self.copyright = copyright
         self.architecture = architecture
         self.dataset_version = dataset_version
-        self.classification_config = ClassificationConfig(depth_ceiling_m=depth_ceiling)
+        self.classification_config = ClassificationConfig(depth_ceiling_m=depth_ceiling,
+                                                           max_chord_sagitta_m=sagitta_cap)
         self.geod = Geod(ellps="WGS84")
         self.CRS_WGS84 = "EPSG:4326"
         self.CRS_METRIC = "EPSG:3857"
@@ -3027,7 +3101,9 @@ class NauticalRoutingPipeline:
             # place instead of following the validated centerline.
             node_start = u if G_local.nodes[u]["lonlat"] == full_pts[0] else v
             node_end = v if node_start == u else u
-            for sub_pts, sub_widths in self._resample_long_skeleton_edges(full_pts, full_widths, cfg.max_segment_m):
+            for sub_pts, sub_widths in self._resample_long_skeleton_edges(
+                    full_pts, full_widths, cfg.max_segment_m,
+                    cfg.max_chord_sagitta_m, cfg.sagitta_width_fraction):
                 su = node_map[node_start] if sub_pts[0] == full_pts[0] else \
                     self._get_or_create_node(sub_pts[0][0], sub_pts[0][1], "coastal")
                 sv = node_map[node_end] if sub_pts[-1] == full_pts[-1] else \
@@ -3344,23 +3420,76 @@ class NauticalRoutingPipeline:
                             G.remove_node(n)
                     changed = True
 
-    def _resample_long_skeleton_edges(self, pts, widths, max_segment_m):
-        """Split a centerline polyline into segments no longer than max_segment_m.
+    def _resample_long_skeleton_edges(self, pts, widths, max_segment_m,
+                                       max_chord_sagitta_m=0.0,
+                                       sagitta_width_fraction=0.5):
+        """Split a centerline polyline into segments, closing each when EITHER its
+        sagitta (max chord-to-centerline deviation) would exceed tolerance, OR
+        max_segment_m is reached (retained as a hard backstop).
 
         Re-inserting nodes keeps the existing straight-chord depth sampler valid on
         curved channels (per BACKGROUND.md §5.1) without modifying that worker.
         Yields (sub_pts, sub_widths) tuples.
+
+        SPEC-GRAPH-DENSITY.md §4.1: max_chord_sagitta_m == 0.0 (the default) disables
+        this entirely and reproduces the unconditional max_segment_m cut byte-for-byte
+        -- see the fast path below, which is exactly the old function body. Sagitta
+        relaxation only engages when it is both enabled AND every vertex of this
+        (pre-split) chain carries a real measured width; a chain with any missing or
+        999.0-sentinel width keeps the uniform behaviour in full (§4.1's width-
+        exclusion rule -- an unmeasured channel must never simplify *more*
+        aggressively than a measured one).
         """
+        n = len(pts)
+        if n < 2:
+            return
+
+        sagitta_enabled = max_chord_sagitta_m > 0.0 and _chain_has_known_width(widths)
+
+        if not sagitta_enabled:
+            seg_start = 0
+            acc = 0.0
+            for i in range(1, n):
+                _, _, d = self.geod.inv(pts[i - 1][0], pts[i - 1][1], pts[i][0], pts[i][1])
+                acc += d
+                if acc >= max_segment_m or i == n - 1:
+                    yield pts[seg_start:i + 1], widths[seg_start:i + 1]
+                    seg_start = i
+                    acc = 0.0
+            return
+
+        # Sagitta-bounded adaptive path. Walks forward exactly once; a candidate
+        # extension that would push the segment's sagitta over tolerance closes the
+        # segment at the PREVIOUS point instead (re-evaluating the same i as the
+        # second point of the next segment, via `continue` without advancing i) --
+        # so every emitted segment already satisfies its own tolerance, and the
+        # very first extension of any new segment (2 points, no interior vertex)
+        # always trivially passes. max_segment_m stays live as a backstop on the
+        # non-sagitta-closed path, which also keeps candidate segments short
+        # (<= max_segment_m / min pixel step) so the O(k) sagitta recheck on each
+        # extension never turns quadratic in practice (§4.1 complexity note).
         seg_start = 0
         acc = 0.0
-        n = len(pts)
-        for i in range(1, n):
-            _, _, d = self.geod.inv(pts[i - 1][0], pts[i - 1][1], pts[i][0], pts[i][1])
-            acc += d
-            if acc >= max_segment_m or i == n - 1:
+        i = 1
+        while i < n:
+            _, _, step_len = self.geod.inv(pts[i - 1][0], pts[i - 1][1], pts[i][0], pts[i][1])
+            is_last = (i == n - 1)
+
+            if (i - seg_start) >= 2:
+                tol = _sagitta_tolerance_m(widths[seg_start:i + 1],
+                                            max_chord_sagitta_m, sagitta_width_fraction)
+                if _max_sagitta_m(pts[seg_start:i + 1]) > tol:
+                    yield pts[seg_start:i], widths[seg_start:i]
+                    seg_start = i - 1
+                    acc = 0.0
+                    continue
+
+            acc += step_len
+            if acc >= max_segment_m or is_last:
                 yield pts[seg_start:i + 1], widths[seg_start:i + 1]
                 seg_start = i
                 acc = 0.0
+            i += 1
 
     def build_skeleton_network(self, polygon, source_tier=DEFAULT_SOURCE_TIER, source_id=None):
         """Extract medial-axis centerlines for one channel polygon and emit them into the graph."""
@@ -3385,7 +3514,8 @@ class NauticalRoutingPipeline:
         node_occurrences: Dict[int, int] = {}
         for _, _, d in G.edges(data=True):
             for sub_pts, sub_widths in self._resample_long_skeleton_edges(
-                    d["pts"], d["width_profile"], cfg.max_segment_m):
+                    d["pts"], d["width_profile"], cfg.max_segment_m,
+                    cfg.max_chord_sagitta_m, cfg.sagitta_width_fraction):
                 u = self._get_or_create_node(sub_pts[0][0], sub_pts[0][1], "coastal")
                 v = self._get_or_create_node(sub_pts[-1][0], sub_pts[-1][1], "coastal")
                 if u == v:
@@ -4918,6 +5048,13 @@ if __name__ == "__main__":
                              "is meaningless and merely expensive.")
     parser.add_argument("--depth-ceiling", type=float, default=6.0,
                         help="Depth ceiling (m) for water-body classification (Step B; used from Session 2 onward)")
+    parser.add_argument("--sagitta-cap", type=float, default=0.0,
+                        help="Cap (m) on chord-to-centerline deviation for sagitta-bounded adaptive "
+                             "skeleton resampling (SPEC-GRAPH-DENSITY.md §4.1). The effective tolerance "
+                             "is min(this cap, 0.5 * local channel width) -- narrow channels always get a "
+                             "tighter tolerance than the cap. Default 0.0 DISABLES this entirely and "
+                             "reproduces today's unconditional max_segment_m resampling; edges with no "
+                             "measured width are excluded from relaxation regardless of this value.")
     parser.add_argument("--stitch-registry", nargs="?", const="data/seam_registry.sqlite", default="",
                         help="Enable Round 25 cross-database seam stitching (STITCHING_DESIGN.md "
                              "Section 3) against the shared global-node registry at this SQLite "
@@ -4977,5 +5114,6 @@ if __name__ == "__main__":
                                        coverage_bbox=coverage_bbox,
                                        stitch_band_m=args.stitch_band_m,
                                        stitch_radius_m=args.stitch_radius_m,
-                                       navmesh_edge_m=args.navmesh_edge_m)
+                                       navmesh_edge_m=args.navmesh_edge_m,
+                                       sagitta_cap=args.sagitta_cap)
     pipeline.run_pipeline()
