@@ -840,6 +840,26 @@ MAX_LOCAL_GAP_RESOLVE_PER_COMPONENT = 2000  # cap so a pathologically fragmented
 # Pass 2's own sample budget (raising MAX_TOTAL_SAMPLES 1500 -> 4000 did not
 # move its success count at all).
 #
+# STATUS (superseded -- kept for the measurement history above):
+# The "no change recovers connectivity" conclusion below was drawn against a
+# gate that turned out to be invalid. Both of its premises have since been
+# overturned INSIDE this same branch:
+#   1. The regression itself was largely a metric artifact. The gate measured
+#      largest-component / total NODES, which penalises removing nodes by
+#      construction. Measured by edge length the resampled build BEATS
+#      baseline (94.81% vs 92.35%), and a direct reachability check over 8,001
+#      real POI pairs lost ZERO routable pairs. See docs/SPEC-GRAPH-DENSITY.md
+#      section 6.1.
+#   2. Pass 2's candidate selection WAS genuinely weak, and was fixed -- by
+#      exactly the KD-tree nearest-cross-group-pair search this note proposed
+#      as future work. Pass 2 successes 14 -> 53 (baseline 27). See section 6.2
+#      and the fix comment at the Pass 2 block below.
+# The density-pinning experiments this note describes were removed as dead
+# code; the per-pass measurements are retained because they are what located
+# Pass 2 and the gap-resolve remesh as the only union-find-gated passes, which
+# is what made the real fix findable.
+#
+# ORIGINAL CONCLUSION (as written during the investigation, now superseded):
 # CONCLUSION: the regression is real, diagnosed, and NOT an accidental-
 # collision artifact -- it is that Pass 2 and the gap-resolve remesh
 # specifically lose their ability to find genuinely NEW distinct-group merges
@@ -859,27 +879,6 @@ MAX_LOCAL_GAP_RESOLVE_PER_COMPONENT = 2000  # cap so a pathologically fragmented
 # reverted to their original constants) -- kept in place, and its measured
 # numbers kept in this comment, as a documented starting point for that
 # follow-up rather than being deleted.
-STITCH_PIN_RADIUS_M = 250.0     # See investigation above -- NOT currently used
-                                 # (build_skeleton_network passes pin_start=
-                                 # pin_end=False). Kept at the value measured
-                                 # to spend roughly half the node budget of a
-                                 # full 500m pin for about the same recovery.
-STITCH_PIN_SEGMENT_M = 100.0    # matches ClassificationConfig.max_segment_m's
-                                 # own legacy default -- the density every pass
-                                 # above was originally tuned against
-STITCH_PIN_MIN_CHAIN_M = 1000.0  # a chain shorter than this never gets pinned at
-                                 # all, regardless of STITCH_PIN_RADIUS_M -- kept
-                                 # as its OWN constant, not "2 x STITCH_PIN_RADIUS_M",
-                                 # after measuring that tying them together made
-                                 # *lowering* the radius (to spend less node budget)
-                                 # perversely pull MORE medium-length chains into
-                                 # scope (a 600m chain is exempt at radius 500 --
-                                 # threshold 1000 -- but newly pinned at radius 250
-                                 # -- threshold 500), costing MORE nodes for a
-                                 # smaller per-chain radius. Decoupling means
-                                 # STITCH_PIN_RADIUS_M can be tuned purely on
-                                 # cost-per-qualifying-chain without also changing
-                                 # which chains qualify.
 
 
 @dataclass
@@ -1136,7 +1135,7 @@ class NauticalRoutingPipeline:
                  stitch_band_m: float = 300.0, stitch_radius_m: float = 500.0,
                  navmesh_edge_m: float = NAVMESH_TARGET_EDGE_M,
                  sagitta_cap: float = 0.0,
-                 max_segment_m: float = None):
+                 max_segment_m: Optional[float] = None):
         self.data_paths = data_paths
         self.db_path = db_path
         self.country = country
@@ -1183,6 +1182,11 @@ class NauticalRoutingPipeline:
         # _get_or_create_node. A node touched by >1 context is a genuine
         # cross-piece/cross-subsystem coordinate merge, not just a chain re-using
         # its own endpoint. Logged once at the end of build_network.
+        # Diagnostic only (see _log_node_origin_diag). Off unless
+        # SK_ROUTING_NODE_ORIGIN_DIAG is set: this keeps one set PER NODE for the
+        # whole build, which at full-country node counts is a permanent allocation
+        # with no production consumer (CodeRabbit, #13).
+        self._node_origin_diag = bool(os.environ.get('SK_ROUTING_NODE_ORIGIN_DIAG'))
         self._node_contexts = defaultdict(set)
         self._piece_counter = 0
 
@@ -1984,16 +1988,19 @@ class NauticalRoutingPipeline:
                 self.graph.add_node(node_id, lon=coord[0], lat=coord[1], node_type=node_type)
                 self.coords_to_node[coord] = node_id
                 if context is not None:
-                    self._node_contexts[node_id].add(context)
+                    if self._node_origin_diag:
+                        self._node_contexts[node_id].add(context)
                 return node_id
             if context is not None:
-                self._node_contexts[existing_id].add(context)
+                if self._node_origin_diag:
+                    self._node_contexts[existing_id].add(context)
             return existing_id
         node_id = self._coord_to_id(lon, lat, node_type)
         self.graph.add_node(node_id, lon=coord[0], lat=coord[1], node_type=node_type)
         self.coords_to_node[coord] = node_id
         if context is not None:
-            self._node_contexts[node_id].add(context)
+            if self._node_origin_diag:
+                self._node_contexts[node_id].add(context)
         return node_id
 
     def _build_inland_network(self):
@@ -2617,7 +2624,7 @@ class NauticalRoutingPipeline:
         sharp channel-mouth corners, so the seam can sit up to roughly one erosion
         radius away from where the (un-eroded) skeleton's medial axis actually
         terminates -- a smaller radius left most real seams unbridged in testing.
-        Connectivity-regression investigation (see STITCH_PIN_RADIUS_M's
+        Connectivity-regression investigation (see the STITCH-DENSITY INVESTIGATION note's
         comment): widening this to 700m when the sagitta resampler is active
         raised Pass 0/0b/0c's raw success counts (free in node-count terms --
         it only widens the SEARCH try_add's own poly-containment/
@@ -2999,7 +3006,7 @@ class NauticalRoutingPipeline:
             noninland_tree = cKDTree(noninland_coords)
 
             MAX_LOCAL_CONNECTORS_PER_INLAND_NODE = 2
-            # Connectivity-regression investigation (see STITCH_PIN_RADIUS_M's
+            # Connectivity-regression investigation (see the STITCH-DENSITY INVESTIGATION note's
             # comment): widening this to 500m when sagitta is active DID raise
             # Pass 0d's raw success count above the un-resampled baseline
             # (4835 -> 4854 on data/zeeland_clip), but largest-component
@@ -3113,7 +3120,7 @@ class NauticalRoutingPipeline:
         # between them. Repeatedly merge the two components with the globally nearest
         # valid (in-polygon) connector.
         #
-        # Connectivity-regression investigation and fix (see STITCH_PIN_RADIUS_M's
+        # Connectivity-regression investigation and fix (see the STITCH-DENSITY INVESTIGATION note's
         # comment for the earlier rounds of this investigation): Pass 2's success
         # count roughly HALVED under sagitta resampling (27 -> 12-14 on
         # data/zeeland_clip) even though total stitching edges elsewhere recovered
@@ -3815,8 +3822,7 @@ class NauticalRoutingPipeline:
 
     def _resample_long_skeleton_edges(self, pts, widths, max_segment_m,
                                        max_chord_sagitta_m=0.0,
-                                       sagitta_width_fraction=0.5,
-                                       pin_start=False, pin_end=False):
+                                       sagitta_width_fraction=0.5):
         """Split a centerline polyline into segments, closing each when EITHER its
         sagitta (max chord-to-centerline deviation) would exceed tolerance, OR
         max_segment_m is reached (retained as a hard backstop).
@@ -3835,7 +3841,7 @@ class NauticalRoutingPipeline:
         aggressively than a measured one).
 
         `pin_start`/`pin_end` (connectivity-regression investigation, see
-        STITCH_PIN_RADIUS_M's comment for the full status -- NOT currently
+        the STITCH-DENSITY INVESTIGATION note for the full status -- NOT currently
         shipped): whether to keep legacy segment density within
         STITCH_PIN_RADIUS_M of pts[0]/pts[-1] respectively, regardless of how
         generous max_segment_m or the sagitta tolerance would otherwise allow.
@@ -3845,7 +3851,7 @@ class NauticalRoutingPipeline:
         only real caller and currently passes False/False (measured
         insufficient alone -- recovers some largest-component connectivity at
         too high a node-count cost, and even combined with other fixes never
-        reached the target; see STITCH_PIN_RADIUS_M). An earlier attempt
+        reached the target; see the STITCH-DENSITY INVESTIGATION note). An earlier attempt
         restricting this to only degree-1 dead ends (excluding junction ends)
         erased almost the entire recovery that unconditional pinning did
         achieve, confirming Round 6's finding that a stitch candidate is
@@ -3909,7 +3915,7 @@ class NauticalRoutingPipeline:
                     continue
 
             # Stitch-density pin (connectivity-regression fix, see
-            # STITCH_PIN_RADIUS_M's comment above): within STITCH_PIN_RADIUS_M
+            # the STITCH-DENSITY INVESTIGATION note above): within STITCH_PIN_RADIUS_M
             # of a dead-end end of THIS chain, tighten the backstop to the
             # legacy density instead of the caller's (possibly kilometres-long)
             # max_segment_m. _stitch_component_pieces and
@@ -3930,10 +3936,7 @@ class NauticalRoutingPipeline:
             # "protect the ends of long ones" -- not the intended effect, and
             # not what the measured regression (driven by long collapsed
             # reaches) needs fixed.
-            near_an_end = (total_len > STITCH_PIN_MIN_CHAIN_M
-                           and ((pin_start and cum[seg_start] < STITCH_PIN_RADIUS_M)
-                                or (pin_end and (total_len - cum[i]) < STITCH_PIN_RADIUS_M)))
-            effective_max_segment_m = min(max_segment_m, STITCH_PIN_SEGMENT_M) if near_an_end else max_segment_m
+            effective_max_segment_m = max_segment_m
 
             acc += step_len
             if acc >= effective_max_segment_m or is_last:
@@ -3983,8 +3986,7 @@ class NauticalRoutingPipeline:
             # real fix for that specific deficit.
             for sub_pts, sub_widths in self._resample_long_skeleton_edges(
                     d["pts"], d["width_profile"], cfg.max_segment_m,
-                    cfg.max_chord_sagitta_m, cfg.sagitta_width_fraction,
-                    False, False):
+                    cfg.max_chord_sagitta_m, cfg.sagitta_width_fraction):
                 u = self._get_or_create_node(sub_pts[0][0], sub_pts[0][1], "coastal", context=piece_ctx)
                 v = self._get_or_create_node(sub_pts[-1][0], sub_pts[-1][1], "coastal", context=piece_ctx)
                 if u == v:
@@ -4629,6 +4631,8 @@ class NauticalRoutingPipeline:
         settle the graph's final topology -- calculate_edge_attributes/
         _compute_node_depths/export below never add or remove a node or edge.
         """
+        if not self._node_origin_diag:
+            return
         coastal_nodes = [n for n, d in self.graph.nodes(data=True) if d.get("node_type") != "inland"]
         total_nodes = len(coastal_nodes)
         no_context = 0
