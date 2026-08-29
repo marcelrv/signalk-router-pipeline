@@ -1,5 +1,6 @@
 import os
 import math
+import inspect
 import json
 import sqlite3
 import hashlib
@@ -22,6 +23,17 @@ from pyproj import Geod
 
 # Phase 0 navmesh-hybrid skeleton extraction (Step C). Hard deps per requirements.txt.
 from skimage.morphology import medial_axis
+# medial_axis breaks ties by processing pixels in an order drawn from a PRNG, and
+# defaults to a FRESH UNSEEDED generator on every call -- so two runs of the same
+# build produced different centerlines. Measured on one clip: node/edge counts moved
+# under 1%, but only 62.3% of coordinate-derived node ids were shared between runs,
+# i.e. 37.7% of nodes sat somewhere else. See docs/SPEC-GRAPH-DENSITY.md section 5.
+# The keyword has been spelled rng / random_state / seed across the versions
+# requirements.txt allows (scikit-image>=0.22), so bind whichever this one has.
+MEDIAL_AXIS_SEED = 0
+_MEDIAL_AXIS_RNG_KW = next(
+    (kw for kw in ("rng", "random_state", "seed")
+     if kw in inspect.signature(medial_axis).parameters), None)
 from rasterio.features import rasterize as _rio_rasterize
 from rasterio.transform import from_origin as _rio_from_origin
 # Phase 1 navmesh-region triangulation (Step B2). Hard dep per requirements.txt.
@@ -168,7 +180,8 @@ def _edge_attr_worker(edge_chunk):
     obstacles_soft_gdf = gdfs.get('obstacles_soft', gpd.GeoDataFrame())
 
     results = {}
-    for u, v, u_lon, u_lat, v_lon, v_lat, edge_type, is_opening_bridge_edge, requires_lock in edge_chunk:
+    for (u, v, u_lon, u_lat, v_lon, v_lat, edge_type, is_opening_bridge_edge,
+         requires_lock, existing_min_width) in edge_chunk:
         attrs = {}
         _, _, distance = geod.inv(u_lon, u_lat, v_lon, v_lat)
         attrs['distance'] = round(distance, 2)
@@ -345,13 +358,47 @@ def _edge_attr_worker(edge_chunk):
                     attrs['max_air_draft'] = min_clearance
 
         # Locks
-        attrs['min_width'] = 999.0
+        # Seed from whatever width the edge already carries -- build_skeleton_network
+        # measures a real medial-axis channel width and stores it (alongside the
+        # matching width_profile) when it creates the edge. This used to start at the
+        # 999.0 "unconstrained" default instead, and since calculate_edge_attributes
+        # writes every key this worker returns back onto the edge, that overwrote the
+        # measured width on EVERY edge: a real build had min_width=999.0 on all
+        # 137,718 edges, while width_profile still held the true values on 81,110 of
+        # them. See docs/SPEC-GRAPH-DENSITY.md section 4.1.2.
+        attrs['min_width'] = (float(existing_min_width) if existing_min_width is not None
+                              else 999.0)
         if not locks_gdf.empty:
             lock_candidates = _candidates_by_bounds_static(locks_gdf, edge_geom)
             if not lock_candidates.empty:
                 intersecting = lock_candidates[lock_candidates.intersects(edge_geom)]
-                if not intersecting.empty and 'HORCLR' in intersecting.columns:
-                    attrs['min_width'] = float(intersecting['HORCLR'].min())
+                if not intersecting.empty:
+                    # HORWID, not just HORCLR. This branch only ever looked for HORCLR,
+                    # which no lock in the RWS data carries -- of 304 lock polygons,
+                    # HORCLR is absent as a column entirely while HORWID holds a real
+                    # value on 247 -- so the lock width constraint never once applied.
+                    # S-57 uses HORCLR for a clearance between structures (the bridge
+                    # sense) and HORWID for a structure's own horizontal width, which is
+                    # what a lock chamber publishes; both express the navigable width
+                    # here, so prefer HORCLR where it exists and fall back to HORWID.
+                    # Same case-variant tolerance _s57_col gives the bridge attributes.
+                    # Look HORCLR up by name rather than taking the first matching
+                    # column: next() over .columns returns whichever the layer happens
+                    # to order first, so a merged layer listing HORWID before HORCLR
+                    # would let a wider HORWID mask a tighter HORCLR (CodeRabbit, #12).
+                    cols_by_lower = {str(c).lower(): c for c in intersecting.columns}
+                    width_col = cols_by_lower.get('horclr') or cols_by_lower.get('horwid')
+                    gate_w = (pd.to_numeric(intersecting[width_col], errors='coerce').min()
+                              if width_col is not None else None)
+                    # A 0 means "not surveyed" rather than a zero-width lock, exactly as
+                    # VERCLR=0 does for bridges above.
+                    if _is_valid(gate_w) and float(gate_w) > 0.0:
+                        # A lock gate NARROWS the channel -- it is one more constraint
+                        # along the edge, not a redefinition of it. Taking the min keeps
+                        # whichever is tighter, so a 12m gate still wins inside a 300m
+                        # basin while a 6m creek keeps its own width where the gate is
+                        # wider than the creek.
+                        attrs['min_width'] = min(attrs['min_width'], float(gate_w))
 
         # Fairway + one-way (TRAFIC)
         attrs['cost_factor'] = 1.2  # open water default
@@ -3203,8 +3250,17 @@ class NauticalRoutingPipeline:
 
     @staticmethod
     def _extract_medial_axis_skeleton(mask):
-        """medial_axis with the distance transform (width profile) in one call."""
-        skel, dist = medial_axis(mask, return_distance=True)
+        """medial_axis with the distance transform (width profile) in one call.
+
+        Seeded: see MEDIAL_AXIS_SEED. Without it the same input yields a different
+        centerline on every run, which makes builds irreproducible and -- because
+        node ids are coordinate-derived (_coord_to_id) -- means two independently
+        built adjacent regions cannot be relied on to agree about a shared seam node.
+        """
+        kwargs = {"return_distance": True}
+        if _MEDIAL_AXIS_RNG_KW is not None:
+            kwargs[_MEDIAL_AXIS_RNG_KW] = MEDIAL_AXIS_SEED
+        skel, dist = medial_axis(mask, **kwargs)
         return skel, dist
 
     def _skeleton_raster_to_graph(self, skel, dist, transform, utm_crs, pixel_size_m) -> nx.Graph:
@@ -4440,6 +4496,7 @@ class NauticalRoutingPipeline:
                     data.get("edge_type", "coastal"),
                     data.get("is_opening_bridge_edge", False),
                     data.get("requires_lock", False),
+                    data.get("min_width"),
                 )
 
         def chunked_iterable(iterable, size):
