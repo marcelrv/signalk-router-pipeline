@@ -758,6 +758,129 @@ MAX_LOCAL_GAP_RESOLVE_PER_COMPONENT = 2000  # cap so a pathologically fragmented
                                             # (e.g. the 8440-union-find-group one documented
                                             # above) this cap exists for in the first place.
 
+# --- Sagitta-resampler stitch-density pin: STATUS = NOT SUFFICIENT, KEPT INERT ---
+# Investigation into the connectivity regression that blocks enabling
+# SPEC-GRAPH-DENSITY.md §4.1 by default. _resample_long_skeleton_edges
+# collapses a long, straight, well-known-width reach down to a couple of nodes
+# kilometres apart; enabling it (data/zeeland_clip, cap 75 / seg 2000 vs the
+# cap 0 / seg 100 baseline, both builds bit-for-bit reproducible) drops
+# largest-component connectivity from 86.49% to 81.40% while cutting node
+# count 39.1% (33,057 -> 20,136) -- the intended win, but not shippable with
+# that regression.
+#
+# ROUND 1 (STITCH_DIAG instrumentation, per-pass attempt/outcome counters
+# across every pass in _stitch_component_pieces and _resolve_local_skeleton_gaps):
+# union-find fragment count going INTO the stitch passes barely moved
+# (1095 -> 1054 initial groups across 344 original water-body components),
+# but successful stitch connections dropped ~22% (7958 -> 6191 non-gap-resolve
+# connectors; 177 -> 138 last-resort local remeshes). The last-resort pass
+# never once reported a node with literally no cross-group candidate within
+# its 300m search radius in EITHER build (no_candidate_in_radius=0 both
+# times) -- candidates ARE being found, at similar distances (Pass 2's
+# nearest-sampled-pair-at-give-up averaged ~65m in both builds), but
+# poly_reject/land_reject counts on those candidates rose broadly (e.g. Pass
+# 0d success -24%, poly_reject +88%).
+#
+# ROUND 2 (coordinator's follow-up: is baseline connectivity actually built on
+# ACCIDENTAL coordinate collisions between independently-built pieces, made
+# common by dense pre-resample point spacing and rare by coarse resampling?
+# self._node_contexts tags every node _get_or_create_node touches with which
+# skeleton/navmesh piece or subsystem created/reused it; NODE_ORIGIN_DIAG
+# cross-tabs that against final degree). Measured on the SAME clip, checkpointed
+# both pre-stitch (right after build_network, before any stitch pass runs) and
+# post-stitch (after _ensure_coastal_connectivity):
+#
+#   |                      | baseline | cap75/seg2000 |
+#   |----------------------|---------:|---------------:|
+#   | pre_stitch junctions |    5,954 |          5,955 |
+#   | post_stitch junctions|   11,097 |          8,540 |
+#   | cross-context nodes  |       25 |             26 |
+#
+# The hypothesis is REFUTED: cross-context (genuinely different pieces/
+# subsystems landing on the same rounded, ~1m coordinate) nodes are ~25 in
+# EVERY build regardless of resampling -- noise, not a mechanism. But the
+# checkpoint split revealed something more useful: raw/native topology
+# (nodepix-derived, independent of resampling by construction) is IDENTICAL
+# between builds (5954 vs 5955) confirming resampling truly never touches it,
+# while ALL of the observed junction-count gap is downstream of the stitch
+# passes themselves creating far fewer connector edges under sparser candidate
+# density (5,143 stitching-created junctions in baseline vs only 2,585 in the
+# relaxed build, a 49.7% drop) -- i.e. this is the SAME mechanism Round 1
+# already found, just independently confirmed via degree distribution instead
+# of raw edge counts, not a second distinct mechanism.
+#
+# ROUND 3 (fix attempts, all measured on cap 75 / seg 2000): four
+# configurations were tried and NONE met both the >=86.49% largest-component
+# gate and the >=30% node-reduction gate simultaneously:
+#
+#   | config                                          | nodes  | reduction | largest |
+#   |--------------------------------------------------|-------:|----------:|--------:|
+#   | no fix                                            | 20,136 |     39.1% |  81.40% |
+#   | pin @500m, both ends unconditional                | 24,802 |     25.0% |  83.38% |
+#   | pin @500m, dead-ends only (excl. junction ends)   | 20,381 |     38.3% |  81.31% |
+#   | pin @250m + widened snap/inland radii + 4000 samples | 25,983 | 21.4%  |  83.55% |
+#   | NO pin, widened radii + 4000 samples only (free)  | 20,080 |     39.2% |  81.05% |
+#
+# The dead-ends-only variant confirms Round 6's older finding still holds: a
+# real stitch candidate is routinely a junction/mid-chain node, "never a dead
+# end, never seam-tagged" (see _stitch_component_pieces' Pass 0 docstring) --
+# restricting the pin to dead ends alone erases almost the entire recovery.
+# The free (node-cost-zero) widened-radius variant shows the sharpest,
+# most important result: it raised Pass 0/0b/0c/0d's raw success counts (some
+# above baseline) WITHOUT improving -- and slightly worsening -- largest-
+# component connectivity, because those four passes are NOT union-find gated
+# (Pass 0c/0d deliberately keep adding local edges after a region is already
+# globally connected, see Pass 0c's own docstring) -- their extra successes
+# are mostly redundant edges inside already-merged groups, not new distinct
+# merges. Only Pass 2 (global greedy nearest-pair merge) and the gap-resolve
+# remesh are union-find gated, i.e. only THEIR success counts can move
+# largest-component connectivity, and both stayed well below baseline in
+# EVERY configuration tried (Pass 2: 27 baseline -> 7-14; gap-resolve remesh:
+# 177 baseline -> 134-149), independent of pin radius, search radius, or
+# Pass 2's own sample budget (raising MAX_TOTAL_SAMPLES 1500 -> 4000 did not
+# move its success count at all).
+#
+# CONCLUSION: the regression is real, diagnosed, and NOT an accidental-
+# collision artifact -- it is that Pass 2 and the gap-resolve remesh
+# specifically lose their ability to find genuinely NEW distinct-group merges
+# under sparser candidate density, and no combination of resampler-side
+# density pinning, wider stitch-pass search radii, or a bigger Pass 2 sample
+# budget tried here recovers that without either giving back most of the
+# node-count win (failing the reduction gate) or leaving connectivity short
+# (failing the largest-component gate). Fixing this properly needs a real
+# algorithmic change to Pass 2 / gap-resolve's candidate selection (e.g.
+# querying the true nearest cross-group pair per group via a KD-tree instead
+# of a capped random-ish sample, or not giving up a round the instant the
+# first sampled candidate fails its safety check) -- not further parameter
+# tuning. Per the task's gate 4, none of this may change a `--sagitta-cap 0`
+# build, so the machinery below is gated on max_chord_sagitta_m > 0.0
+# wherever it touches shared code, and is currently called INERT (pin_start=
+# pin_end=False from build_skeleton_network, the widened search radii
+# reverted to their original constants) -- kept in place, and its measured
+# numbers kept in this comment, as a documented starting point for that
+# follow-up rather than being deleted.
+STITCH_PIN_RADIUS_M = 250.0     # See investigation above -- NOT currently used
+                                 # (build_skeleton_network passes pin_start=
+                                 # pin_end=False). Kept at the value measured
+                                 # to spend roughly half the node budget of a
+                                 # full 500m pin for about the same recovery.
+STITCH_PIN_SEGMENT_M = 100.0    # matches ClassificationConfig.max_segment_m's
+                                 # own legacy default -- the density every pass
+                                 # above was originally tuned against
+STITCH_PIN_MIN_CHAIN_M = 1000.0  # a chain shorter than this never gets pinned at
+                                 # all, regardless of STITCH_PIN_RADIUS_M -- kept
+                                 # as its OWN constant, not "2 x STITCH_PIN_RADIUS_M",
+                                 # after measuring that tying them together made
+                                 # *lowering* the radius (to spend less node budget)
+                                 # perversely pull MORE medium-length chains into
+                                 # scope (a 600m chain is exempt at radius 500 --
+                                 # threshold 1000 -- but newly pinned at radius 250
+                                 # -- threshold 500), costing MORE nodes for a
+                                 # smaller per-chain radius. Decoupling means
+                                 # STITCH_PIN_RADIUS_M can be tuned purely on
+                                 # cost-per-qualifying-chain without also changing
+                                 # which chains qualify.
+
 
 @dataclass
 class ClassificationConfig:
@@ -1047,6 +1170,21 @@ class NauticalRoutingPipeline:
         # Local gap-resolve summary counters, logged once at the end of
         # _ensure_coastal_connectivity (see LOCAL_GAP_RESOLVE_* above).
         self.local_gap_resolve_stats = {"gaps_resolved": 0, "edges_added": 0}
+        # DIAGNOSTIC (connectivity-regression investigation, not shipped as a
+        # feature): per-pass attempt/outcome counters for _stitch_component_pieces
+        # and _resolve_local_skeleton_gaps, plus aggregate union-find group counts
+        # before/after stitching. Logged once at the end of _ensure_coastal_connectivity.
+        self._stitch_diag = defaultdict(lambda: defaultdict(int))
+        self._stitch_group_stats = {"initial_groups": 0, "final_groups": 0,
+                                     "components_with_residual": 0, "residual_groups_total": 0}
+        # DIAGNOSTIC (coordinator's follow-up on the connectivity regression):
+        # per-node set of distinct "contexts" (skeleton/navmesh piece, or other
+        # node-creating subsystem) that ever requested this node's coordinate via
+        # _get_or_create_node. A node touched by >1 context is a genuine
+        # cross-piece/cross-subsystem coordinate merge, not just a chain re-using
+        # its own endpoint. Logged once at the end of build_network.
+        self._node_contexts = defaultdict(set)
+        self._piece_counter = 0
 
         # Round 25 cross-database seam stitching (STITCHING_DESIGN.md Section 3).
         # Empty stitch_registry_path (the default) means stitching is OFF and
@@ -1066,11 +1204,13 @@ class NauticalRoutingPipeline:
     def run_pipeline(self):
         self.parse_shapefiles()
         self.build_network()
+        self._log_node_origin_diag(label="pre_stitch")
         self._add_opening_bridge_edges()
         self._add_lock_crossing_edges()
         self._mark_edges_inside_locks()
         self._sanity_check_no_land_crossings()
         self._ensure_coastal_connectivity()
+        self._log_node_origin_diag(label="post_stitch")
         # Adopt pass runs BEFORE calculate_edge_attributes so the new
         # adopted-node connector edges go through normal edge-attribute
         # computation like every other edge (STITCHING_DESIGN.md Section 3.3).
@@ -1834,7 +1974,7 @@ class NauticalRoutingPipeline:
         unique_str = f"{poi_type}_{round(lat, 5)}_{round(lon, 5)}"
         return int(hashlib.md5(unique_str.encode("utf-8")).hexdigest()[:13], 16)
 
-    def _get_or_create_node(self, lon: float, lat: float, node_type: str = "coastal") -> int:
+    def _get_or_create_node(self, lon: float, lat: float, node_type: str = "coastal", context=None) -> int:
         coord = (round(lon, 5), round(lat, 5))
         if coord in self.coords_to_node:
             existing_id = self.coords_to_node[coord]
@@ -1843,11 +1983,17 @@ class NauticalRoutingPipeline:
                 node_id = self._coord_to_id(lon, lat, node_type)
                 self.graph.add_node(node_id, lon=coord[0], lat=coord[1], node_type=node_type)
                 self.coords_to_node[coord] = node_id
+                if context is not None:
+                    self._node_contexts[node_id].add(context)
                 return node_id
+            if context is not None:
+                self._node_contexts[existing_id].add(context)
             return existing_id
         node_id = self._coord_to_id(lon, lat, node_type)
         self.graph.add_node(node_id, lon=coord[0], lat=coord[1], node_type=node_type)
         self.coords_to_node[coord] = node_id
+        if context is not None:
+            self._node_contexts[node_id].add(context)
         return node_id
 
     def _build_inland_network(self):
@@ -1861,8 +2007,8 @@ class NauticalRoutingPipeline:
                 for i in range(len(coords) - 1):
                     u_lon, u_lat = coords[i]
                     v_lon, v_lat = coords[i+1]
-                    u = self._get_or_create_node(u_lon, u_lat, node_type="inland")
-                    v = self._get_or_create_node(v_lon, v_lat, node_type="inland")
+                    u = self._get_or_create_node(u_lon, u_lat, node_type="inland", context="inland")
+                    v = self._get_or_create_node(v_lon, v_lat, node_type="inland", context="inland")
                     self._stamp_node(u, NODE_KIND_POINT, DEFAULT_SOURCE_TIER, src_id)
                     self._stamp_node(v, NODE_KIND_POINT, DEFAULT_SOURCE_TIER, src_id)
                     self.graph.add_edge(u, v, **eattr)
@@ -1951,7 +2097,7 @@ class NauticalRoutingPipeline:
         MAX_EDGE_LEN = 0.015  # ~1.5km in degrees
         pt_to_id = {}
         for pt in points:
-            u = self._get_or_create_node(pt[0], pt[1], "coastal")
+            u = self._get_or_create_node(pt[0], pt[1], "coastal", context="navmesh_placeholder")
             self._stamp_node(u, NODE_KIND_POINT, source_tier, source_id)
             pt_to_id[(pt[0], pt[1])] = u
 
@@ -2220,7 +2366,7 @@ class NauticalRoutingPipeline:
                         f"within {WATERWAY_CONNECTOR_FALLBACK_MAX_M:.0f}m fallback); connecting anyway.")
 
         inland_lon, inland_lat = coords_wgs84[nearest_idx]
-        inland_node_id = self._get_or_create_node(inland_lon, inland_lat, "inland")
+        inland_node_id = self._get_or_create_node(inland_lon, inland_lat, "inland", context="waterway_crossing")
         if inland_node_id == node_id:
             return 0
         crossing_lon = self.graph.nodes[node_id]["lon"]
@@ -2258,6 +2404,12 @@ class NauticalRoutingPipeline:
         `build_network`'s cross-piece `_stitch_component_pieces` call to connect
         this region into the rest of its original connected water body.
         """
+        # DIAGNOSTIC (connectivity-regression investigation): tag every node this
+        # call creates/touches with a unique per-region context so
+        # _get_or_create_node can tell a genuine cross-piece coordinate merge
+        # apart from this region's own perimeter nodes.
+        self._piece_counter += 1
+        piece_ctx = f"navmesh:{self._piece_counter}"
         # Coarse boundary-output simplify pass (§5.2.3 item 1, NAVMESH_BOUNDARY_SIMPLIFY_M's
         # docstring above has the full rationale) -- applied here, after the caller already
         # computed seam_coord_set from the un-simplified wide/narrow and deep/shallow
@@ -2341,7 +2493,7 @@ class NauticalRoutingPipeline:
         for start, count in ring_ranges:
             for k in range(count):
                 i = start + k
-                node_id = self._get_or_create_node(float(lons[i]), float(lats[i]), "coastal")
+                node_id = self._get_or_create_node(float(lons[i]), float(lats[i]), "coastal", context=piece_ctx)
                 self._stamp_node(node_id, NODE_KIND_NAVMESH_VERTEX, source_tier, source_id)
                 perimeter_node_ids[i] = node_id
                 x, y = pslg["vertices"][i]
@@ -2465,6 +2617,16 @@ class NauticalRoutingPipeline:
         sharp channel-mouth corners, so the seam can sit up to roughly one erosion
         radius away from where the (un-eroded) skeleton's medial axis actually
         terminates -- a smaller radius left most real seams unbridged in testing.
+        Connectivity-regression investigation (see STITCH_PIN_RADIUS_M's
+        comment): widening this to 700m when the sagitta resampler is active
+        raised Pass 0/0b/0c's raw success counts (free in node-count terms --
+        it only widens the SEARCH try_add's own poly-containment/
+        _crosses_land safety gates still check), but largest-component
+        connectivity did not follow, and Pass 2 -- the pass that actually is
+        union-find gated, i.e. the one whose success count controls this
+        metric -- got WORSE (27 baseline -> 7 with this alone, worse than the
+        12-14 measured without it). Reverted to a flat 500m pending a real
+        fix for Pass 2 / gap-resolve specifically.
         """
         ids = list(node_ids)
         if len(ids) < 2:
@@ -2499,8 +2661,10 @@ class NauticalRoutingPipeline:
                 if nbr in id_set:
                     union(n, nbr)
 
-        if len({find(n) for n in ids}) <= 1:
+        initial_groups = len({find(n) for n in ids})
+        if initial_groups <= 1:
             return 0  # already one connected piece
+        self._stitch_group_stats["initial_groups"] += initial_groups
 
         coords_wgs84 = np.array([(self.graph.nodes[n]["lon"], self.graph.nodes[n]["lat"]) for n in ids])
         utm = self._local_utm_crs(component_polygon_wgs84)
@@ -2523,15 +2687,20 @@ class NauticalRoutingPipeline:
 
         added = 0
 
-        def try_add(i: int, j: int) -> bool:
+        def try_add(i: int, j: int, pass_name: str = "pass0") -> bool:
             nonlocal added
+            diag = self._stitch_diag[pass_name]
+            diag["calls"] += 1
             u, v = ids[i], ids[j]
             if find(u) == find(v):
+                diag["already_connected"] += 1
                 return False
             candidate_m = LineString([coords_m[i], coords_m[j]])
             if not poly_prep.contains(candidate_m):
+                diag["poly_reject"] += 1
                 return False
             if self._crosses_land(LineString([coords_wgs84[i], coords_wgs84[j]])):
+                diag["land_reject"] += 1
                 return False
             attrs = dict(edge_type="coastal", edge_kind_id=EDGE_KIND_NAVMESH_BOUNDARY,
                          source_tier=DEFAULT_SOURCE_TIER, source_id=None)
@@ -2539,6 +2708,7 @@ class NauticalRoutingPipeline:
             self.graph.add_edge(v, u, **attrs)
             union(u, v)
             added += 2
+            diag["success"] += 1
             return True
 
         # Pass 0: k-nearest-neighbor pass, independent of Pass 1's
@@ -2605,8 +2775,9 @@ class NauticalRoutingPipeline:
                         continue
                     gj = pass0_idx_list[int(local_j)]
                     if np.linalg.norm(coords_m[gi] - coords_m[gj]) > snap_radius_m:
+                        self._stitch_diag["pass0"]["radius_reject"] += 1
                         continue
-                    try_add(gi, gj)
+                    try_add(gi, gj, "pass0")
 
         # Pass 0b: cross-type k-nearest-neighbor pass, navmesh perimeter
         # vertices against everything else (skeleton chain nodes, etc).
@@ -2649,8 +2820,9 @@ class NauticalRoutingPipeline:
                 for local_j in neighbors:
                     gj = navmesh_idx[int(local_j)]
                     if np.linalg.norm(coords_m[gi] - coords_m[gj]) > snap_radius_m:
+                        self._stitch_diag["pass0b"]["radius_reject"] += 1
                         continue
-                    try_add(gi, gj)
+                    try_add(gi, gj, "pass0b")
 
             k_other = min(6, len(other_idx))
             _, nn_idxs2 = other_tree.query(navmesh_coords, k=k_other)
@@ -2661,8 +2833,9 @@ class NauticalRoutingPipeline:
                 for local_j in neighbors:
                     gj = other_idx[int(local_j)]
                     if np.linalg.norm(coords_m[gi] - coords_m[gj]) > snap_radius_m:
+                        self._stitch_diag["pass0b"]["radius_reject"] += 1
                         continue
-                    try_add(gi, gj)
+                    try_add(gi, gj, "pass0b")
 
             # Pass 0c: LOCAL adjacency guarantee for navmesh perimeter
             # vertices -- unlike every pass above (and try_add's own
@@ -2709,17 +2882,22 @@ class NauticalRoutingPipeline:
 
             cross_count = {ids[gi]: _existing_cross_connector_count(ids[gi]) for gi in navmesh_idx}
 
-            def try_add_local(i: int, j: int) -> bool:
+            def try_add_local(i: int, j: int, pass_name: str = "pass0c") -> bool:
                 """Same safety gates and edge attrs as try_add, but WITHOUT
                 the union-find gate -- see the Pass 0c comment above."""
                 nonlocal added
+                diag = self._stitch_diag[pass_name]
+                diag["calls"] += 1
                 u, v = ids[i], ids[j]
                 if self.graph.has_edge(u, v):
+                    diag["already_edge"] += 1
                     return False
                 candidate_m = LineString([coords_m[i], coords_m[j]])
                 if not poly_prep.contains(candidate_m):
+                    diag["poly_reject"] += 1
                     return False
                 if self._crosses_land(LineString([coords_wgs84[i], coords_wgs84[j]])):
+                    diag["land_reject"] += 1
                     return False
                 attrs = dict(edge_type="coastal", edge_kind_id=EDGE_KIND_NAVMESH_BOUNDARY,
                              source_tier=DEFAULT_SOURCE_TIER, source_id=None)
@@ -2727,6 +2905,7 @@ class NauticalRoutingPipeline:
                 self.graph.add_edge(v, u, **attrs)
                 union(u, v)
                 added += 2
+                diag["success"] += 1
                 return True
 
             # Direction A: each navmesh vertex -> its k nearest cross-type
@@ -2750,6 +2929,7 @@ class NauticalRoutingPipeline:
                         break
                     gj = other_idx[int(local_j)]
                     if np.linalg.norm(coords_m[gi] - coords_m[gj]) > snap_radius_m:
+                        self._stitch_diag["pass0c"]["radius_reject"] += 1
                         continue
                     if try_add_local(gi, gj):
                         cross_count[u] += 1
@@ -2781,6 +2961,7 @@ class NauticalRoutingPipeline:
                     if cross_count[u] >= MAX_CROSS_CONNECTORS_PER_NAVMESH_NODE:
                         continue
                     if np.linalg.norm(coords_m[gi] - coords_m[gj]) > snap_radius_m:
+                        self._stitch_diag["pass0c"]["radius_reject"] += 1
                         continue
                     if try_add_local(gj, gi):
                         cross_count[u] += 1
@@ -2818,6 +2999,17 @@ class NauticalRoutingPipeline:
             noninland_tree = cKDTree(noninland_coords)
 
             MAX_LOCAL_CONNECTORS_PER_INLAND_NODE = 2
+            # Connectivity-regression investigation (see STITCH_PIN_RADIUS_M's
+            # comment): widening this to 500m when sagitta is active DID raise
+            # Pass 0d's raw success count above the un-resampled baseline
+            # (4835 -> 4854 on data/zeeland_clip), but largest-component
+            # connectivity did not follow -- Pass 0d isn't union-find gated
+            # (see Pass 0c's docstring), so most of that gain is redundant
+            # edges inside already-merged groups, not new distinct merges. Left
+            # at the original 300m pending a real fix for Pass 2 / gap-resolve,
+            # the two passes that ARE union-find gated and that measurement
+            # showed still degraded (Pass 2 success 27 -> 7-14 across every
+            # combination tried) regardless of this radius.
             INLAND_LOCAL_RADIUS_M = 300.0
 
             def _existing_noninland_count(node_id) -> int:
@@ -2831,13 +3023,18 @@ class NauticalRoutingPipeline:
             def try_add_inland_local(i: int, j: int) -> bool:
                 """Same safety gates/attrs as try_add_local -- see Pass 0c above."""
                 nonlocal added
+                diag = self._stitch_diag["pass0d"]
+                diag["calls"] += 1
                 u, v = ids[i], ids[j]
                 if self.graph.has_edge(u, v):
+                    diag["already_edge"] += 1
                     return False
                 candidate_m = LineString([coords_m[i], coords_m[j]])
                 if not poly_prep.contains(candidate_m):
+                    diag["poly_reject"] += 1
                     return False
                 if self._crosses_land(LineString([coords_wgs84[i], coords_wgs84[j]])):
+                    diag["land_reject"] += 1
                     return False
                 attrs = dict(edge_type="coastal", edge_kind_id=EDGE_KIND_NAVMESH_BOUNDARY,
                              source_tier=DEFAULT_SOURCE_TIER, source_id=None)
@@ -2845,6 +3042,7 @@ class NauticalRoutingPipeline:
                 self.graph.add_edge(v, u, **attrs)
                 union(u, v)
                 added += 2
+                diag["success"] += 1
                 return True
 
             # Direction A: each inland node -> its k nearest non-inland neighbours,
@@ -2863,6 +3061,7 @@ class NauticalRoutingPipeline:
                         break
                     gj = noninland_idx[int(local_j)]
                     if np.linalg.norm(coords_m[gi] - coords_m[gj]) > INLAND_LOCAL_RADIUS_M:
+                        self._stitch_diag["pass0d"]["radius_reject"] += 1
                         continue
                     if try_add_inland_local(gi, gj):
                         inland_cross_count[u] += 1
@@ -2884,6 +3083,7 @@ class NauticalRoutingPipeline:
                     if inland_cross_count[u] >= MAX_LOCAL_CONNECTORS_PER_INLAND_NODE:
                         continue
                     if np.linalg.norm(coords_m[gi] - coords_m[gj]) > INLAND_LOCAL_RADIUS_M:
+                        self._stitch_diag["pass0d"]["radius_reject"] += 1
                         continue
                     if try_add_inland_local(gj, gi):
                         inland_cross_count[u] += 1
@@ -2902,7 +3102,7 @@ class NauticalRoutingPipeline:
             from scipy.spatial import cKDTree
             tree = cKDTree(coords_m)
             for i, j in tree.query_pairs(snap_radius_m):
-                try_add(i, j)
+                try_add(i, j, "pass1")
 
         # Pass 2: guarantee, one merge round at a time. A region's exterior ring and
         # each interior (island) ring are separate cycles after ring-adjacency edges
@@ -2920,6 +3120,22 @@ class NauticalRoutingPipeline:
         # hundreds of components (real multi-island Zeeland regions) still produced a
         # tens-of-thousands-squared matrix (gigabytes) that ran for 15+ minutes and
         # got OOM-killed at full-dataset scale.
+        # Connectivity-regression investigation (see STITCH_PIN_RADIUS_M's
+        # comment): Pass 2's success count roughly HALVED under sagitta
+        # resampling (27 -> 12-14 on data/zeeland_clip) even though total
+        # stitching edges elsewhere recovered to at-or-above baseline with
+        # other fixes -- each Pass 2 success is a real distinct group merge
+        # (union-find gated, unlike Pass 0c/0d), making this the single most
+        # consequential deficit measured, and the one that actually controls
+        # largest-component connectivity. Raising this 1500 -> 4000 (gated to
+        # sagitta-active builds only, to protect gate 4) did NOT recover it
+        # (still 12 on the combination tested) -- group *count* going into
+        # this pass barely changes under resampling (~1050-1095 either way),
+        # so a bigger per-group sample budget was not the actual bottleneck.
+        # Reverted to the original 1500 pending a real fix (this constant's
+        # own comment above already documents the OOM risk of raising it much
+        # further at full-country scale, and the increase bought nothing here
+        # to justify that risk).
         MAX_TOTAL_SAMPLES = 1500
         MAX_ROUNDS = 30
         # Bounds the distance-MATRIX size, not the number of pairs walked off it --
@@ -2962,11 +3178,14 @@ class NauticalRoutingPipeline:
             # round (or the "could not find a connector" warning below if
             # MAX_ROUNDS runs out first).
             evaluated = 0
+            nearest_cross_group_m = None
             for flat_idx in np.argsort(dmat, axis=None):
                 si, sj = divmod(int(flat_idx), n_samples)
                 if si >= sj:
                     continue
-                if try_add(sample_idxs[si], sample_idxs[sj]):
+                if find(ids[sample_idxs[si]]) != find(ids[sample_idxs[sj]]) and nearest_cross_group_m is None:
+                    nearest_cross_group_m = float(dmat[si, sj])
+                if try_add(sample_idxs[si], sample_idxs[sj], "pass2"):
                     merged_this_round += 1
                 evaluated += 1
                 if evaluated >= MAX_EVALUATIONS_PER_ROUND:
@@ -2976,13 +3195,26 @@ class NauticalRoutingPipeline:
                 if remaining > 1:
                     logger.warning(f"  Stitch guarantee pass could not find a valid in-polygon "
                                    f"connector among sampled candidates; {remaining} components "
-                                   f"left unmerged.")
+                                   f"left unmerged. Nearest sampled cross-group pair was "
+                                   f"{nearest_cross_group_m:.0f}m apart (rejected by poly/land check)."
+                                   if nearest_cross_group_m is not None else
+                                   f"  Stitch guarantee pass could not find a valid in-polygon "
+                                   f"connector among sampled candidates; {remaining} components "
+                                   f"left unmerged. No cross-group pair was even sampled this round.")
+                    self._stitch_diag["pass2"]["gave_up_components"] += 1
+                    if nearest_cross_group_m is not None:
+                        self._stitch_diag["pass2"]["gave_up_nearest_m_sum"] += nearest_cross_group_m
                 break
 
         if len({find(n) for n in ids}) > 1:
             added += self._resolve_local_skeleton_gaps(
                 ids, coords_m, coords_wgs84, poly_m, poly_prep, utm,
                 DEFAULT_SOURCE_TIER, None, parent, find, union)
+        final_groups = len({find(n) for n in ids})
+        self._stitch_group_stats["final_groups"] += final_groups
+        if final_groups > 1:
+            self._stitch_group_stats["components_with_residual"] += 1
+            self._stitch_group_stats["residual_groups_total"] += final_groups
         return added
 
     def _snap_or_create_node(self, lon, lat, pool_ids, pool_coords_m, utm, snap_m, node_type="coastal"):
@@ -2996,7 +3228,7 @@ class NauticalRoutingPipeline:
             k = int(np.argmin(d))
             if d[k] <= snap_m:
                 return pool_ids[k], (pt_m.x, pt_m.y)
-        node_id = self._get_or_create_node(lon, lat, node_type)
+        node_id = self._get_or_create_node(lon, lat, node_type, context="gap_resolve")
         return node_id, (pt_m.x, pt_m.y)
 
     def _remesh_local_gap(self, i: int, j: int, ids, coords_m, coords_wgs84, poly_m, poly_prep, utm,
@@ -3108,9 +3340,9 @@ class NauticalRoutingPipeline:
                     full_pts, full_widths, cfg.max_segment_m,
                     cfg.max_chord_sagitta_m, cfg.sagitta_width_fraction):
                 su = node_map[node_start] if sub_pts[0] == full_pts[0] else \
-                    self._get_or_create_node(sub_pts[0][0], sub_pts[0][1], "coastal")
+                    self._get_or_create_node(sub_pts[0][0], sub_pts[0][1], "coastal", context="gap_resolve")
                 sv = node_map[node_end] if sub_pts[-1] == full_pts[-1] else \
-                    self._get_or_create_node(sub_pts[-1][0], sub_pts[-1][1], "coastal")
+                    self._get_or_create_node(sub_pts[-1][0], sub_pts[-1][1], "coastal", context="gap_resolve")
                 if su == sv:
                     continue
                 self._stamp_node(su, NODE_KIND_POINT, source_tier, source_id)
@@ -3239,10 +3471,15 @@ class NauticalRoutingPipeline:
                 if not found_cross and k < MAX_K and 0 <= last_dist < LOCAL_GAP_RESOLVE_MAX_M:
                     still_stuck.append(a)
             if k >= MAX_K:
+                # These nodes found NO cross-group candidate within
+                # LOCAL_GAP_RESOLVE_MAX_M even after widening k to MAX_K -- the
+                # "no candidate within radius" failure mode by construction.
+                self._stitch_diag["gap_resolve"]["no_candidate_in_radius"] += len(still_stuck)
                 break
             remaining = np.array(still_stuck, dtype=int)
             k = min(k * 2, MAX_K)
         candidates.sort(key=lambda t: t[0])
+        self._stitch_diag["gap_resolve"]["candidate_pairs_found"] += len(candidates)
 
         added = 0
         resolved = 0
@@ -3259,6 +3496,7 @@ class NauticalRoutingPipeline:
 
             candidate_m = LineString([coords_m[i], coords_m[j]])
             if not poly_prep.contains(candidate_m):
+                self._stitch_diag["gap_resolve"]["poly_reject"] += 1
                 continue
 
             n_added = self._remesh_local_gap(i, j, ids, coords_m, coords_wgs84, poly_m, poly_prep, utm,
@@ -3267,6 +3505,9 @@ class NauticalRoutingPipeline:
                 added += n_added
                 resolved += 1
                 union(ids[i], ids[j])
+                self._stitch_diag["gap_resolve"]["remesh_success"] += 1
+            else:
+                self._stitch_diag["gap_resolve"]["remesh_failed"] += 1
 
         if resolved:
             self.local_gap_resolve_stats["gaps_resolved"] += resolved
@@ -3425,7 +3666,8 @@ class NauticalRoutingPipeline:
 
     def _resample_long_skeleton_edges(self, pts, widths, max_segment_m,
                                        max_chord_sagitta_m=0.0,
-                                       sagitta_width_fraction=0.5):
+                                       sagitta_width_fraction=0.5,
+                                       pin_start=False, pin_end=False):
         """Split a centerline polyline into segments, closing each when EITHER its
         sagitta (max chord-to-centerline deviation) would exceed tolerance, OR
         max_segment_m is reached (retained as a hard backstop).
@@ -3442,6 +3684,25 @@ class NauticalRoutingPipeline:
         999.0-sentinel width keeps the uniform behaviour in full (§4.1's width-
         exclusion rule -- an unmeasured channel must never simplify *more*
         aggressively than a measured one).
+
+        `pin_start`/`pin_end` (connectivity-regression investigation, see
+        STITCH_PIN_RADIUS_M's comment for the full status -- NOT currently
+        shipped): whether to keep legacy segment density within
+        STITCH_PIN_RADIUS_M of pts[0]/pts[-1] respectively, regardless of how
+        generous max_segment_m or the sagitta tolerance would otherwise allow.
+        Both default to False -- pure sagitta/max_segment_m behaviour, as
+        tested below -- because pinning is a stitching-pass concern, not a
+        property of this chain in isolation. build_skeleton_network is the
+        only real caller and currently passes False/False (measured
+        insufficient alone -- recovers some largest-component connectivity at
+        too high a node-count cost, and even combined with other fixes never
+        reached the target; see STITCH_PIN_RADIUS_M). An earlier attempt
+        restricting this to only degree-1 dead ends (excluding junction ends)
+        erased almost the entire recovery that unconditional pinning did
+        achieve, confirming Round 6's finding that a stitch candidate is
+        routinely a junction/mid-chain node, "never a dead end, never
+        seam-tagged" (see _stitch_component_pieces' Pass 0 docstring) -- so if
+        this is revisited, pin BOTH kinds of end, not dead ends only.
         """
         n = len(pts)
         if n < 2:
@@ -3471,11 +3732,22 @@ class NauticalRoutingPipeline:
         # non-sagitta-closed path, which also keeps candidate segments short
         # (<= max_segment_m / min pixel step) so the O(k) sagitta recheck on each
         # extension never turns quadratic in practice (§4.1 complexity note).
+        #
+        # Cumulative arc length from the chain's own start, precomputed once so
+        # the stitch-density pin below can also see distance-to-END without a
+        # second pass -- same geod.inv calls the loop needed anyway, just made
+        # available up front.
+        cum = [0.0] * n
+        for k in range(1, n):
+            _, _, d = self.geod.inv(pts[k - 1][0], pts[k - 1][1], pts[k][0], pts[k][1])
+            cum[k] = cum[k - 1] + d
+        total_len = cum[-1]
+
         seg_start = 0
         acc = 0.0
         i = 1
         while i < n:
-            _, _, step_len = self.geod.inv(pts[i - 1][0], pts[i - 1][1], pts[i][0], pts[i][1])
+            step_len = cum[i] - cum[i - 1]
             is_last = (i == n - 1)
 
             if (i - seg_start) >= 2:
@@ -3487,8 +3759,35 @@ class NauticalRoutingPipeline:
                     acc = 0.0
                     continue
 
+            # Stitch-density pin (connectivity-regression fix, see
+            # STITCH_PIN_RADIUS_M's comment above): within STITCH_PIN_RADIUS_M
+            # of a dead-end end of THIS chain, tighten the backstop to the
+            # legacy density instead of the caller's (possibly kilometres-long)
+            # max_segment_m. _stitch_component_pieces and
+            # _resolve_local_skeleton_gaps both search within a few hundred
+            # metres of exactly these ends for a cross-piece candidate; a long
+            # relaxed segment there was measured to remove the redundant nearby
+            # nodes those passes depend on without shortening the actual gap.
+            # A junction end is excluded (pin_start/pin_end False) -- it is
+            # already part of this piece's own connected interior via its other
+            # chains, so protecting it buys no stitching benefit, only cost.
+            # The chain's INTERIOR -- where the node-count win actually comes
+            # from -- is untouched. Only engages for chains longer than
+            # STITCH_PIN_MIN_CHAIN_M, a threshold kept independent of
+            # STITCH_PIN_RADIUS_M (see that constant's comment) -- a chain
+            # shorter than it is, by construction, within reach of one of its
+            # own ends for most/all of its length, so pinning it would
+            # collapse to "never relax short chains at all" rather than
+            # "protect the ends of long ones" -- not the intended effect, and
+            # not what the measured regression (driven by long collapsed
+            # reaches) needs fixed.
+            near_an_end = (total_len > STITCH_PIN_MIN_CHAIN_M
+                           and ((pin_start and cum[seg_start] < STITCH_PIN_RADIUS_M)
+                                or (pin_end and (total_len - cum[i]) < STITCH_PIN_RADIUS_M)))
+            effective_max_segment_m = min(max_segment_m, STITCH_PIN_SEGMENT_M) if near_an_end else max_segment_m
+
             acc += step_len
-            if acc >= max_segment_m or is_last:
+            if acc >= effective_max_segment_m or is_last:
                 yield pts[seg_start:i + 1], widths[seg_start:i + 1]
                 seg_start = i
                 acc = 0.0
@@ -3496,6 +3795,10 @@ class NauticalRoutingPipeline:
 
     def build_skeleton_network(self, polygon, source_tier=DEFAULT_SOURCE_TIER, source_id=None):
         """Extract medial-axis centerlines for one channel polygon and emit them into the graph."""
+        # DIAGNOSTIC (connectivity-regression investigation): see build_navmesh_region's
+        # matching comment -- same per-piece context tagging for this skeleton piece.
+        self._piece_counter += 1
+        piece_ctx = f"skel:{self._piece_counter}"
         cfg = self.classification_config
         utm = self._local_utm_crs(polygon)
         poly_m = gpd.GeoSeries([polygon], crs="EPSG:4326").to_crs(utm).iloc[0]
@@ -3516,11 +3819,25 @@ class NauticalRoutingPipeline:
         added = 0
         node_occurrences: Dict[int, int] = {}
         for _, _, d in G.edges(data=True):
+            # Stitch-density pin (STITCH_PIN_RADIUS_M): investigated, NOT
+            # currently enabled -- see that constant's comment for the full
+            # measurement history. Unconditional pinning at both ends (dead
+            # end AND junction -- restricting to dead-ends-only erased almost
+            # all of the recovery, since a real stitch candidate is routinely
+            # a junction/mid-chain node) recovered some largest-component
+            # connectivity but at too high a node-count cost, and even
+            # combined with wider stitch-pass search radii never closed the
+            # gap to the required 86.49% -- Pass 2 / gap-resolve, the only
+            # union-find-gated passes (the ones that actually control this
+            # metric), stayed degraded regardless. Passing False/False here
+            # keeps this function's sagitta path fully unaffected pending a
+            # real fix for that specific deficit.
             for sub_pts, sub_widths in self._resample_long_skeleton_edges(
                     d["pts"], d["width_profile"], cfg.max_segment_m,
-                    cfg.max_chord_sagitta_m, cfg.sagitta_width_fraction):
-                u = self._get_or_create_node(sub_pts[0][0], sub_pts[0][1], "coastal")
-                v = self._get_or_create_node(sub_pts[-1][0], sub_pts[-1][1], "coastal")
+                    cfg.max_chord_sagitta_m, cfg.sagitta_width_fraction,
+                    False, False):
+                u = self._get_or_create_node(sub_pts[0][0], sub_pts[0][1], "coastal", context=piece_ctx)
+                v = self._get_or_create_node(sub_pts[-1][0], sub_pts[-1][1], "coastal", context=piece_ctx)
                 if u == v:
                     continue
                 self._stamp_node(u, NODE_KIND_POINT, source_tier, source_id)
@@ -3594,7 +3911,7 @@ class NauticalRoutingPipeline:
             bridge_src = self.layer_source_ids.get("bridges") if hasattr(self, "layer_source_ids") else None
             for pt in opening_pts:
                 c_lon, c_lat = pt.x, pt.y
-                b_id = self._get_or_create_node(c_lon, c_lat, node_type="coastal")
+                b_id = self._get_or_create_node(c_lon, c_lat, node_type="coastal", context="bridge")
                 self.graph.nodes[b_id]["node_depth"] = 99.0
                 self._stamp_node(b_id, NODE_KIND_POINT, DEFAULT_SOURCE_TIER, bridge_src)
 
@@ -3789,7 +4106,7 @@ class NauticalRoutingPipeline:
             side_node_ids = []
             for pt in side_pts:
                 c_lon, c_lat = pt.x, pt.y
-                n_id = self._get_or_create_node(c_lon, c_lat, node_type="coastal")
+                n_id = self._get_or_create_node(c_lon, c_lat, node_type="coastal", context="lock_crossing")
                 self.graph.nodes[n_id]["node_depth"] = 99.0
                 self._stamp_node(n_id, NODE_KIND_POINT, DEFAULT_SOURCE_TIER, lock_src)
                 side_node_ids.append(n_id)
@@ -4133,6 +4450,61 @@ class NauticalRoutingPipeline:
             logger.info(f"Local gap-resolve pass: reconnected {lgrs['gaps_resolved']} narrow-throat "
                         f"gaps ({lgrs['edges_added']} edges added) that all passes above left "
                         f"disconnected.")
+
+        # DIAGNOSTIC (connectivity-regression investigation): dump per-pass
+        # attempt/outcome counters and aggregate union-find group counts. Not
+        # part of the shipped feature -- read by scratchpad analysis scripts.
+        gs = self._stitch_group_stats
+        logger.info(f"STITCH_DIAG group_stats: initial_groups={gs['initial_groups']} "
+                    f"final_groups={gs['final_groups']} "
+                    f"components_with_residual={gs['components_with_residual']} "
+                    f"residual_groups_total={gs['residual_groups_total']}")
+        for pass_name in sorted(self._stitch_diag.keys()):
+            d = self._stitch_diag[pass_name]
+            parts = " ".join(f"{k}={v}" for k, v in sorted(d.items()))
+            logger.info(f"STITCH_DIAG pass={pass_name} {parts}")
+
+    def _log_node_origin_diag(self, label="post_stitch"):
+        """DIAGNOSTIC (coordinator's follow-up on the connectivity-regression
+        investigation): distinguish a genuine cross-piece/cross-subsystem
+        coordinate merge (a node whose coordinate was independently requested by
+        >1 context -- see self._node_contexts' comment in __init__) from a piece
+        just reusing its own node, and cross-tab against final (undirected)
+        degree. A degree>=3 "junction" in the exported graph that only ever had
+        ONE context is a real raster nodepix junction (build_skeleton_network's
+        own degree>=3 pixel, or build_navmesh_region's own perimeter branching);
+        one with >1 context exists only because two independently-created things
+        (different skeleton/navmesh pieces, or a bridge/lock/waterway-crossing
+        node, or a gap-resolve remesh) landed on the exact same rounded
+        (5-decimal, ~1m) coordinate. Run once, right after all stitching passes
+        settle the graph's final topology -- calculate_edge_attributes/
+        _compute_node_depths/export below never add or remove a node or edge.
+        """
+        coastal_nodes = [n for n, d in self.graph.nodes(data=True) if d.get("node_type") != "inland"]
+        total_nodes = len(coastal_nodes)
+        no_context = 0
+        cross_context = 0
+        junctions_total = 0
+        junctions_single_ctx = 0
+        junctions_multi_ctx = 0
+        for n in coastal_nodes:
+            ctxs = self._node_contexts.get(n)
+            n_ctx = len(ctxs) if ctxs else 0
+            if n_ctx == 0:
+                no_context += 1
+            elif n_ctx > 1:
+                cross_context += 1
+            undirected_deg = len(set(self.graph.successors(n)) | set(self.graph.predecessors(n)))
+            if undirected_deg >= 3:
+                junctions_total += 1
+                if n_ctx > 1:
+                    junctions_multi_ctx += 1
+                else:
+                    junctions_single_ctx += 1
+        logger.info(f"NODE_ORIGIN_DIAG label={label} total_coastal_nodes={total_nodes} "
+                    f"no_context_tracked={no_context} cross_context_nodes={cross_context} "
+                    f"junctions_total={junctions_total} junctions_single_context={junctions_single_ctx} "
+                    f"junctions_multi_context={junctions_multi_ctx}")
 
     # ------------------------------------------------------------------
     # Round 25 cross-database seam stitching (STITCHING_DESIGN.md Section 3).
