@@ -3111,85 +3111,206 @@ class NauticalRoutingPipeline:
         # that loops back close to itself (e.g. around a peninsula) can *also* leave
         # locally-dense clusters more than snap_radius_m apart along the direct path
         # between them. Repeatedly merge the two components with the globally nearest
-        # valid (in-polygon) connector -- sorting ALL sample pairs (not just each
-        # sample's own k-nearest) greedily merges the single best pair first each
-        # round, which reconnects far more of the graph per round than a per-sample
-        # k-nearest-neighbor query does. A full pairwise distance matrix is only safe
-        # because MAX_TOTAL_SAMPLES bounds it to a fixed, small size regardless of how
-        # many components exist -- an earlier version capped only *per group*, so
-        # hundreds of components (real multi-island Zeeland regions) still produced a
-        # tens-of-thousands-squared matrix (gigabytes) that ran for 15+ minutes and
-        # got OOM-killed at full-dataset scale.
-        # Connectivity-regression investigation (see STITCH_PIN_RADIUS_M's
-        # comment): Pass 2's success count roughly HALVED under sagitta
-        # resampling (27 -> 12-14 on data/zeeland_clip) even though total
-        # stitching edges elsewhere recovered to at-or-above baseline with
-        # other fixes -- each Pass 2 success is a real distinct group merge
-        # (union-find gated, unlike Pass 0c/0d), making this the single most
-        # consequential deficit measured, and the one that actually controls
-        # largest-component connectivity. Raising this 1500 -> 4000 (gated to
-        # sagitta-active builds only, to protect gate 4) did NOT recover it
-        # (still 12 on the combination tested) -- group *count* going into
-        # this pass barely changes under resampling (~1050-1095 either way),
-        # so a bigger per-group sample budget was not the actual bottleneck.
-        # Reverted to the original 1500 pending a real fix (this constant's
-        # own comment above already documents the OOM risk of raising it much
-        # further at full-country scale, and the increase bought nothing here
-        # to justify that risk).
-        MAX_TOTAL_SAMPLES = 1500
+        # valid (in-polygon) connector.
+        #
+        # Connectivity-regression investigation and fix (see STITCH_PIN_RADIUS_M's
+        # comment for the earlier rounds of this investigation): Pass 2's success
+        # count roughly HALVED under sagitta resampling (27 -> 12-14 on
+        # data/zeeland_clip) even though total stitching edges elsewhere recovered
+        # to at-or-above baseline with other fixes -- each Pass 2 success is a real
+        # distinct group merge (union-find gated, unlike Pass 0c/0d), making this
+        # the single most consequential deficit measured, and the one that
+        # actually controls largest-component connectivity.
+        #
+        # ROOT CAUSE (superseding the version of this comment that shipped
+        # inert): this pass used to pick a FIXED number of representative nodes
+        # per union-find group (`MAX_TOTAL_SAMPLES // len(groups)`, floored to at
+        # least 1) via list-order striding (`member_idxs[::step][:cap]`), then ran
+        # a full pairwise `cdist` over just those representatives. Whether two
+        # groups merged depended on whether their arbitrary representatives
+        # happened to be close, not on whether the groups had a close connector
+        # ANYWHERE along their real boundary. Instrumented directly (logging
+        # `len(groups)`/`per_group_cap` per round) on this exact clip: the
+        # dominant, most-fragmented component enters this pass with ~380-410
+        # groups (NOT the ~1050-1095 an earlier round of this investigation
+        # assumed -- that figure was the union-find group count from BEFORE
+        # Pass 0/0b/0c/0d run, most of which they already merge away; the
+        # earlier per_group_cap==1 diagnosis is REFUTED). Real per_group_cap on
+        # that component is 3-4, both with and without resampling, against
+        # average group sizes of 45-73 nodes -- still only a handful of
+        # arbitrarily-chosen points standing in for each group, which is why
+        # raising MAX_TOTAL_SAMPLES 1500 -> 4000 (cap 3-4 -> roughly 9-10) never
+        # moved Pass 2's success count: more arbitrary strided picks per group is
+        # not the same as picking the actual nearest one.
+        #
+        # FIX: replace per-group sampling with a per-NODE nearest-cross-group
+        # search over a single cKDTree built on EVERY node in this component (no
+        # sampling at all), escalating each node's k only when its immediate
+        # neighbourhood turns out to be entirely same-group -- the identical
+        # discovery strategy `_resolve_local_skeleton_gaps` below already uses
+        # safely at full-country scale, just without that function's fixed
+        # LOCAL_GAP_RESOLVE_MAX_M distance cap, since Pass 2's whole job is to
+        # guarantee connectivity regardless of how far apart two groups' nearest
+        # points are. This finds the geometrically NEAREST cross-group connector
+        # for every node, not the nearest pair among a handful of arbitrary
+        # per-group picks, and costs O(n log n) per round rather than
+        # O(samples^2) -- there is no longer a distance matrix to bound.
+        #
+        # NOT unconditional. Gate 4 requires a `--sagitta-cap 0` build to
+        # reproduce the exact legacy node/edge counts byte-for-bit, and Pass 2
+        # runs in EVERY build. Measured directly: swapping this search in
+        # unconditionally changes which pairs merge even at cap 0 (32,845
+        # nodes / 86,159 edges instead of the required 33,057 / 86,617) --
+        # different candidate discovery order picks different, differently-
+        # ordered valid connectors even though both algorithms are internally
+        # deterministic, so this is a real behaviour change to the shipping
+        # pipeline, not a rounding artifact. Gated on `max_chord_sagitta_m >
+        # 0.0` (same condition the earlier widened-radius/sample-budget
+        # experiments in this investigation used, see STITCH_PIN_RADIUS_M's
+        # comment), so a cap-0 build takes the untouched legacy per-group
+        # sample + `cdist` path below and a sagitta-active build takes this
+        # one -- the fix applies exactly where the regression was measured
+        # and nowhere else.
+        use_geometric_search = self.classification_config.max_chord_sagitta_m > 0.0
         MAX_ROUNDS = 30
-        # Bounds the distance-MATRIX size, not the number of pairs walked off it --
-        # a highly-fragmented component (many small groups, e.g. an estuary split
-        # into hundreds of laned/skeleton pieces at full Zeeland scale) drives
-        # per_group_cap down near 1, so nearly every one of the up to
-        # MAX_TOTAL_SAMPLES**2/2 sorted pairs below is still cross-group early on
-        # and falls through to try_add's expensive `within(poly_m)` +
-        # `_crosses_land` checks. Confirmed against the real machine: without this
-        # cap, one real Zeeland component's stitch pass alone ran for 1h45m+
-        # before being killed, still stuck in this same loop (no multiprocessing
-        # workers had even spawned yet for the next pipeline stage). Bounding the
-        # number of *evaluated* pairs, not just the matrix they're sorted from, is
-        # what actually fixes it -- same "constant regardless of dataset size"
-        # idea as MAX_TOTAL_SAMPLES/MAX_ROUNDS above, just applied one level down.
+        # Legacy (cap-0) path only -- unchanged from the pre-fix implementation,
+        # including this cap's original role: bounding the number of expensive
+        # `try_add` (poly-containment + `_crosses_land`) calls walked off the
+        # up-to-MAX_TOTAL_SAMPLES**2/2 sorted distance-matrix pairs below.
+        # Confirmed against the real machine: an earlier *per-group-only* cap
+        # (no total-sample bound at all) produced a tens-of-thousands-squared
+        # distance matrix that ran for 1h45m+ before being OOM-killed at
+        # full-country scale.
         MAX_EVALUATIONS_PER_ROUND = 20000
+        MAX_TOTAL_SAMPLES = 1500
+        # Geometric (sagitta-active) path only: bounds the same `try_add` calls,
+        # but sized against a fundamentally different candidate list. There is
+        # no O(candidates^2) matrix here -- `candidates` is built directly from
+        # each node's own (escalating) k-nearest-neighbour query, so its size is
+        # O(n_ids * avg_k), not O(n_ids^2); measured on data/zeeland_clip's most
+        # fragmented component (17,516 nodes, 387 groups): ~93,000-98,000
+        # candidates per round, about 5.6 per node. A first attempt reused
+        # MAX_EVALUATIONS_PER_ROUND (20000) for this path too and regressed
+        # exactly the way the diagnosis predicted, just one level down: capped=
+        # True every round (confirmed via round-level logging), silently
+        # dropping ~75,000 already-discovered, already-sorted-nearest-first
+        # candidates per round before evaluating even one of them, so rounds
+        # kept reporting 0 merges and giving up with genuine cross-group
+        # candidates still sitting unevaluated past position 20000. This is
+        # the exact "give up on a group pair after the first sampled candidate
+        # fails" failure mode the task called out, just relocated from
+        # candidate SELECTION (fixed above) to candidate EVALUATION -- fixing
+        # one without the other reproduces the same symptom. Sized generously
+        # above the largest measured count (with headroom for full-country
+        # scale, where the most-fragmented single component is larger) rather
+        # than removed outright, so a pathological future input still has a
+        # bound instead of an open-ended per-round walk.
+        PASS2_GEOMETRIC_MAX_EVALUATIONS_PER_ROUND = 500_000
+        # Geometric (sagitta-active) path only: per-node escalation ceiling,
+        # matching _resolve_local_skeleton_gaps' own MAX_K exactly (see that
+        # function's docstring for why this specific bound: worst case
+        # O(nodes x MAX_K), not O(nodes x local-density) or O(groups x nodes)
+        # -- a genuine miss is only possible for a node with more than MAX_K
+        # same-group neighbours all closer than its true cross-group
+        # candidate).
+        PASS2_MAX_K = min(256, len(ids))
         from scipy.spatial.distance import cdist
+        from scipy.spatial import cKDTree
+        n_ids = len(ids)
+        # Built once outside the round loop (geometric path only) -- `coords_m`
+        # never changes across rounds, only which group each node belongs to does.
+        pass2_tree = cKDTree(coords_m) if use_geometric_search else None
         for _round in range(MAX_ROUNDS):
             groups: Dict[Any, List[int]] = {}
             for idx, node in enumerate(ids):
                 groups.setdefault(find(node), []).append(idx)
             if len(groups) <= 1:
                 break
-            per_group_cap = max(1, MAX_TOTAL_SAMPLES // len(groups))
-            sample_idxs: List[int] = []
-            for member_idxs in groups.values():
-                step = max(1, len(member_idxs) // per_group_cap)
-                sample_idxs.extend(member_idxs[::step][:per_group_cap])
-            sample_coords = coords_m[sample_idxs]
-            n_samples = len(sample_idxs)
-            dmat = cdist(sample_coords, sample_coords)
-            np.fill_diagonal(dmat, np.inf)
-            merged_this_round = 0
-            # Walk the sorted candidate list, merging every valid pair found (not
-            # just the first) -- `find()` inside try_add skips pairs that have
-            # already been merged earlier in this same pass, so one sort serves
-            # many merges instead of recomputing groups/samples/distances per
-            # merge. Capped at MAX_EVALUATIONS_PER_ROUND pairs (see above); an
-            # unfinished round still leaves the remaining groups to the next
-            # round (or the "could not find a connector" warning below if
-            # MAX_ROUNDS runs out first).
-            evaluated = 0
-            nearest_cross_group_m = None
-            for flat_idx in np.argsort(dmat, axis=None):
-                si, sj = divmod(int(flat_idx), n_samples)
-                if si >= sj:
-                    continue
-                if find(ids[sample_idxs[si]]) != find(ids[sample_idxs[sj]]) and nearest_cross_group_m is None:
-                    nearest_cross_group_m = float(dmat[si, sj])
-                if try_add(sample_idxs[si], sample_idxs[sj], "pass2"):
-                    merged_this_round += 1
-                evaluated += 1
-                if evaluated >= MAX_EVALUATIONS_PER_ROUND:
-                    break
+
+            if use_geometric_search:
+                # Escalating-k cross-group candidate search over every node in
+                # the component (see the fix comment above). Unlike
+                # _resolve_local_skeleton_gaps, there is deliberately no
+                # distance cap: Pass 2 must still find a valid connector even
+                # when the two nearest groups are genuinely far apart.
+                own_group = np.array([find(n) for n in ids])
+                k = min(8, n_ids)
+                seen_pairs = set()
+                candidates: List[Tuple[float, int, int]] = []
+                search_remaining = np.arange(n_ids)
+                while len(search_remaining):
+                    dists, nns = pass2_tree.query(coords_m[search_remaining], k=k)
+                    dists = np.atleast_2d(dists)
+                    nns = np.atleast_2d(nns)
+                    still_stuck = []
+                    for local_a, a in enumerate(search_remaining):
+                        found_cross = False
+                        for dist, b in zip(dists[local_a], nns[local_a], strict=True):
+                            b = int(b)
+                            if b >= n_ids or b == a:
+                                continue
+                            if own_group[a] != own_group[b]:
+                                found_cross = True
+                                pair = (a, b) if a < b else (b, a)
+                                if pair not in seen_pairs:
+                                    seen_pairs.add(pair)
+                                    candidates.append((float(dist), pair[0], pair[1]))
+                        if not found_cross and k < PASS2_MAX_K:
+                            still_stuck.append(a)
+                    if k >= PASS2_MAX_K:
+                        break
+                    search_remaining = np.array(still_stuck, dtype=int)
+                    k = min(k * 2, PASS2_MAX_K)
+                candidates.sort(key=lambda t: t[0])
+
+                merged_this_round = 0
+                evaluated = 0
+                nearest_cross_group_m = None
+                for dist, i, j in candidates:
+                    if nearest_cross_group_m is None:
+                        nearest_cross_group_m = dist
+                    if evaluated >= PASS2_GEOMETRIC_MAX_EVALUATIONS_PER_ROUND:
+                        break
+                    if try_add(i, j, "pass2"):
+                        merged_this_round += 1
+                    evaluated += 1
+            else:
+                # Legacy path -- byte-for-bit unchanged from before this fix.
+                # See the fix comment above for why this must stay untouched:
+                # gate 4 requires a `--sagitta-cap 0` build to reproduce the
+                # exact pre-fix node/edge counts.
+                per_group_cap = max(1, MAX_TOTAL_SAMPLES // len(groups))
+                sample_idxs: List[int] = []
+                for member_idxs in groups.values():
+                    step = max(1, len(member_idxs) // per_group_cap)
+                    sample_idxs.extend(member_idxs[::step][:per_group_cap])
+                sample_coords = coords_m[sample_idxs]
+                n_samples = len(sample_idxs)
+                dmat = cdist(sample_coords, sample_coords)
+                np.fill_diagonal(dmat, np.inf)
+                merged_this_round = 0
+                # Walk the sorted candidate list, merging every valid pair found (not
+                # just the first) -- `find()` inside try_add skips pairs that have
+                # already been merged earlier in this same pass, so one sort serves
+                # many merges instead of recomputing groups/samples/distances per
+                # merge. Capped at MAX_EVALUATIONS_PER_ROUND pairs (see above); an
+                # unfinished round still leaves the remaining groups to the next
+                # round (or the "could not find a connector" warning below if
+                # MAX_ROUNDS runs out first).
+                evaluated = 0
+                nearest_cross_group_m = None
+                for flat_idx in np.argsort(dmat, axis=None):
+                    si, sj = divmod(int(flat_idx), n_samples)
+                    if si >= sj:
+                        continue
+                    if find(ids[sample_idxs[si]]) != find(ids[sample_idxs[sj]]) and nearest_cross_group_m is None:
+                        nearest_cross_group_m = float(dmat[si, sj])
+                    if try_add(sample_idxs[si], sample_idxs[sj], "pass2"):
+                        merged_this_round += 1
+                    evaluated += 1
+                    if evaluated >= MAX_EVALUATIONS_PER_ROUND:
+                        break
+
             if merged_this_round == 0:
                 remaining = len({find(n) for n in ids})
                 if remaining > 1:
@@ -3207,6 +3328,34 @@ class NauticalRoutingPipeline:
                 break
 
         if len({find(n) for n in ids}) > 1:
+            # Connectivity-regression investigation (Pass 2 fix comment above):
+            # once Pass 2 fully converges (evaluates every discovered
+            # cross-group candidate, not just a capped subset -- see that
+            # comment), any STILL-residual fragmentation in a large,
+            # sagitta-resampled component is a genuine straight-line
+            # geometric wall, confirmed directly on data/zeeland_clip: the
+            # dominant 17,516-node component's Pass 2 round loop evaluated
+            # 78,079 fully-discovered cross-group candidates in its final
+            # round and merged zero of them.
+            #
+            # This call's own straight-line prefilter (see its docstring) was
+            # twice tried as a further lever here -- once removed globally,
+            # once removed only for this one large/fragmented component (via
+            # an `ids`-size gate) -- and BOTH measured net NEGATIVE for
+            # largest-component connectivity on data/zeeland_clip, despite
+            # each raising raw `remesh_success` substantially (127 -> 429
+            # global; 127 -> 269 scoped) and shrinking aggregate residual
+            # fragmentation. Reason: `_remesh_local_gap` mints new nodes for
+            # every successful local remesh, including the (large majority
+            # of) successes that stitch two SMALL side-fragments to each
+            # other rather than onto the one dominant group -- so total node
+            # count (the fraction's denominator) grew faster than the
+            # dominant group itself (the numerator) in both trials (global:
+            # 19,895 -> 22,830 nodes, largest fraction 83.88% -> 78.69%;
+            # scoped: 19,895 -> 22,083 nodes, 83.88% -> 81.18%). Left as the
+            # unmodified original call below -- the Pass 2 fix above is the
+            # net-positive change; this pass's own candidate-acceptance logic
+            # is a separate, currently-net-negative lever, not a free one.
             added += self._resolve_local_skeleton_gaps(
                 ids, coords_m, coords_wgs84, poly_m, poly_prep, utm,
                 DEFAULT_SOURCE_TIER, None, parent, find, union)
