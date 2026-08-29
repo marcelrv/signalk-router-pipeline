@@ -1,6 +1,6 @@
 # Spec: Graph Node Density — Over-Sampling and Fairway Duplication
 
-Status: Draft. Analysis, plus the §4.1.2 fix implemented (the prerequisite for §4.1)
+Status: §4.1 implemented and verified. §4.1.2, §4.1.3, §5.1 and §6.1 fixed. Not enabled by default.
 Complements: `SPEC-RECOMMENDED-TRACK.md`, `SPEC-FAIRWAY-HARMONIZATION.md`
 Scope: `nautical_routing_pipeline.py` (`build_skeleton_network`, `_resample_long_skeleton_edges`, `_skeleton_raster_to_graph`, `ClassificationConfig`)
 Measured against: `data/zeeland_full.sqlite` (48,553 nodes / 137,718 directed edges), RWS source GeoJSON
@@ -96,7 +96,7 @@ constant pays the worst-case price everywhere, which is precisely the 48.3% spik
 
 Ordered by measured payoff. Each is independent.
 
-### 4.1 Sagitta-bounded adaptive resampling (largest win)
+### 4.1 Sagitta-bounded adaptive resampling (largest win) — IMPLEMENTED
 
 Replace the uniform `max_segment_m` cut in `_resample_long_skeleton_edges` with a split
 rule driven by chord deviation: walk the pixel-resolution polyline and close a segment
@@ -334,10 +334,64 @@ Covered by `tests/test_medial_axis_determinism.py`.
 - Re-measure the Krammersluizen view (342 nodes today; DP@10 m suggests ~272 is reachable).
 - Route-quality probe: compare a set of Zeeland routes before/after for distance and
   `min_depth` along the path. Depth must not become more optimistic anywhere.
-- Largest-component connectivity **must not fall below** the current Zeeland baseline of
-  87.1% (largest connected component / total nodes, measured on the same clip and
-  commit). Resampling may legitimately improve it, so this is a non-regression gate,
-  not an equality check.
+- Largest-component connectivity must not regress — but measured **by edge length, not
+  node count**. See §6.1: the node-count form of this gate is invalid for comparing
+  graphs of different densities, and cost two full investigations before that was
+  spotted.
+
+### 6.1 The connectivity gate was measuring the wrong thing
+
+The gate above originally read "largest connected component / total **nodes**". That is
+invalid for judging a change whose entire purpose is to remove nodes.
+
+Resampling strips interior vertices from long chains, and those chains live
+overwhelmingly in the main component. Small disconnected fragments are short, so they
+keep almost all their nodes. The main component therefore shrinks *as a fraction of
+nodes* while the water it covers is unchanged — the metric penalises exactly the
+intended effect.
+
+Measured three ways on `data/zeeland_clip`:
+
+| build | nodes | main comp | total | **% by length** | % by nodes |
+|---|---|---|---|---|---|
+| baseline (`--sagitta-cap 0`) | 33,057 | 4,154 km | 4,498 km | **92.35%** | 86.49% |
+| cap 75 / seg 2000, no Pass 2 fix | 20,136 | 4,097 km | 4,382 km | 93.51% | 81.40% |
+| cap 75 / seg 2000 + Pass 2 fix | 19,895 | **4,138 km** | 4,364 km | **94.81%** | 83.88% |
+
+By navigable length the resampled build is **better** than baseline (94.81% vs 92.35%),
+with the main component covering 4,138 km against 4,154 km — a 0.4% difference.
+
+Reachability confirms it directly. Taking the 127 named harbour/lock/bridge POIs, snapping
+each to its nearest node in both builds, and comparing all 8,001 pairs:
+
+| | |
+|---|---|
+| Mutually routable in both builds | 7,626 (95.31%) |
+| Routable in baseline, **lost** after the change | **0** |
+| Gained | 0 |
+
+Not one real place-pair lost routability. Mean POI-to-nearest-node snap distance rises
+54 m → 68 m, the expected cost of sparser nodes.
+
+**Use edge-length share plus the POI-pair reachability check as the gate.** The node-count
+form sent two investigations chasing a 2.61pp "regression" that does not exist, and caused
+a working gap-resolve improvement to be reverted because minting nodes inflated its
+denominator.
+
+### 6.2 Pass 2 candidate selection was weak independently of resampling
+
+`_stitch_component_pieces` Pass 2 sampled per-group representatives by list-insertion
+stride rather than geometry, then compared them pairwise. With the dominant component
+entering at ~380-410 groups the per-group cap is 3-4, so the true nearest cross-group
+connector was routinely never evaluated. Replaced with a per-node escalating-k `cKDTree`
+nearest-cross-group-pair search, mirroring `_resolve_local_skeleton_gaps`' own pattern.
+Pass 2 successes 14 → 53 under resampling, against a baseline of 27.
+
+It is gated to sagitta-active builds only, because ungating it changes `--sagitta-cap 0`
+output. Worth noting what that trial measured: ungated, **today's pipeline gains 1.11pp
+connectivity (86.49% → 87.60%)**. So this weakness is costing connectivity in every
+database currently shipped, not only under resampling. Ungating it is a candidate
+follow-up, deliberately not taken here because it changes shipping output.
 
 ## 7. Risks
 
