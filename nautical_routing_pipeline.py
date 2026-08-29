@@ -382,8 +382,12 @@ def _edge_attr_worker(edge_chunk):
                     # what a lock chamber publishes; both express the navigable width
                     # here, so prefer HORCLR where it exists and fall back to HORWID.
                     # Same case-variant tolerance _s57_col gives the bridge attributes.
-                    width_col = next((c for c in intersecting.columns
-                                      if str(c).lower() in ('horclr', 'horwid')), None)
+                    # Look HORCLR up by name rather than taking the first matching
+                    # column: next() over .columns returns whichever the layer happens
+                    # to order first, so a merged layer listing HORWID before HORCLR
+                    # would let a wider HORWID mask a tighter HORCLR (CodeRabbit, #12).
+                    cols_by_lower = {str(c).lower(): c for c in intersecting.columns}
+                    width_col = cols_by_lower.get('horclr') or cols_by_lower.get('horwid')
                     gate_w = (pd.to_numeric(intersecting[width_col], errors='coerce').min()
                               if width_col is not None else None)
                     # A 0 means "not surveyed" rather than a zero-width lock, exactly as

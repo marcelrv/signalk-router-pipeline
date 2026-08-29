@@ -31,7 +31,7 @@ Impact:
 
 - **Authority:** US Army Corps of Engineers, via `ienccloud.us`. Public domain, update cycle weekly/biweekly. Organized by river system (e.g. Upper Mississippi, Ohio, GIWW), not by NOAA state ZIPs. Distribution is S-57 `.000` cells with Inland ENC object catalogue (`wtwaxs`, `comare`, `berths`, `wtnare`, `bridges` with `verclr`, etc.), analogous to RWS IENC.
 - **Coordinate/Catalogue:** Same S-57 `.000` container, readable by GDAL `S57` driver with same `OGR_S57_OPTIONS`. Inland-specific layers: `wtwaxs` (line, waterway axis, the inland equivalent of `DRGARE`/`FAIRWY` for topology), `comare` (communication area), `berths`, `hrbare`, `notmrk`, `wtnare` etc. `LNDARE`/`DEPARE` semantics differ slightly (river depth may be charted via `depare`/`SOUNDG` but often via `wtwaxs` attribution).
-- **Coverage confirmation:** European inland (`eurisportal.eu`) and NL RWS are the reference; USACE mirrors the standard. No USACE `.000` is currently cached in `data/raw/*` — verified by glob `*ienc*` = 0 hits.
+- **Coverage confirmation:** European inland (`eurisportal.eu`) and NL RWS are the reference; USACE mirrors the standard. No USACE `.000` is currently cached. Verified by a recursive inventory rather than a name glob (a `*ienc*` glob proves nothing, since USACE cells are not named for the scheme): all **2,874** `.000` files under `data/raw/` carry NOAA `US<band><state>` cell names — 553 `USFL`, 439 `USNY`, 295 `USNC`, and so on — with **zero** non-`US[1-6]*` cells.
 - **License/attribution:** Federal public domain, same as NOAA — no share-alike encumbrance, compatible with `signalk-router-data` `LICENSE-DATA.md`. Adds a `data_sources` row (`source_type='ienc'`, `contributor='USACE'`).
 
 ## 3. Design

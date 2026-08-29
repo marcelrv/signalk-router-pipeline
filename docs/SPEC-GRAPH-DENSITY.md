@@ -105,10 +105,20 @@ when the perpendicular distance from any skipped vertex to the running chord wou
 backstop) is hit.
 
 - Straight reaches collapse to a handful of long edges; bends keep — or gain — density
-  exactly where the sampler needs it. This is strictly *more* faithful than today at bends
-  and only relaxes where relaxing is provably free.
+  exactly where the sampler needs it. This is strictly *more* faithful than today at bends.
+  It is **not** free on straight reaches: sagitta bounds chord-to-centerline deviation, but
+  `_edge_attr_worker` still samples depth at only 5 points along that chord, so a longer
+  edge can step over a shoal or a dredged-channel boundary between samples (§7). The
+  depth-non-optimism probe in §6 is therefore a **release gate**, not a nice-to-have —
+  no straight-reach relaxation ships until it passes.
 - Tolerance must be **coupled to local channel width**, not flat. See §4.1.1 — this is
   the decision that matters; the cap on top of it barely does.
+- **Edges with no measured width are excluded from relaxation.** `width_profile` is absent
+  on 18,002 of 99,112 centerline edges (navmesh-boundary, lock-transit, inland), and
+  §4.1.2's `min_width` fallback for those is 999.0 — feeding that into
+  `min(cap, 0.5 × width)` would apply the *most* aggressive simplification exactly where
+  the channel is least known. Such edges keep today's uniform `max_segment_m` behaviour
+  unchanged. The rebuild results must report how many edges took this fallback.
 - `min_width` / `width_profile` merge safely: both are minima over the span, and a
   minimum over a union is the min of the minima. Depth is sampled after the split, so it
   picks up the new geometry automatically.
@@ -324,7 +334,10 @@ Covered by `tests/test_medial_axis_determinism.py`.
 - Re-measure the Krammersluizen view (342 nodes today; DP@10 m suggests ~272 is reachable).
 - Route-quality probe: compare a set of Zeeland routes before/after for distance and
   `min_depth` along the path. Depth must not become more optimistic anywhere.
-- Largest-component connectivity must hold at 87.1% (the current Zeeland figure).
+- Largest-component connectivity **must not fall below** the current Zeeland baseline of
+  87.1% (largest connected component / total nodes, measured on the same clip and
+  commit). Resampling may legitimately improve it, so this is a non-regression gate,
+  not an equality check.
 
 ## 7. Risks
 

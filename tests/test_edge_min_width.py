@@ -103,3 +103,36 @@ class TestLockWidthAttribute:
                        (4.1630, 51.6605), (4.1590, 51.6605)])
         bare = gpd.GeoDataFrame({"OBJNAM": ["Krammersluizen"]}, geometry=[box], crs="EPSG:4326")
         assert _run(_edge(142.8), bare)["min_width"] == pytest.approx(142.8)
+
+
+class TestHorclrPrecedence:
+    """HORCLR must win over HORWID regardless of column order. Selecting the first
+    matching column instead let a layer that happens to list HORWID first mask a
+    tighter HORCLR, so the edge reported the wider value and would admit
+    width-limited routes the preferred constraint should reject (CodeRabbit, #12).
+    """
+
+    @staticmethod
+    def _two_col_lock(first, second, horclr, horwid):
+        box = Polygon([(4.1590, 51.6595), (4.1630, 51.6595),
+                       (4.1630, 51.6605), (4.1590, 51.6605)])
+        vals = {"HORCLR": horclr, "HORWID": horwid}
+        return gpd.GeoDataFrame({first: [vals[first]], second: [vals[second]]},
+                                geometry=[box], crs="EPSG:4326")
+
+    def test_horclr_wins_when_listed_first(self):
+        lock = self._two_col_lock("HORCLR", "HORWID", horclr=12.0, horwid=20.0)
+        assert _run(_edge(300.0), lock)["min_width"] == pytest.approx(12.0)
+
+    def test_horclr_wins_when_listed_second(self):
+        # The reversed order: the regression this guards.
+        lock = self._two_col_lock("HORWID", "HORCLR", horclr=12.0, horwid=20.0)
+        assert _run(_edge(300.0), lock)["min_width"] == pytest.approx(12.0)
+
+    def test_horclr_wins_even_when_it_is_the_wider_of_the_two(self):
+        # Precedence is by attribute meaning, not by which value is smaller.
+        lock = self._two_col_lock("HORWID", "HORCLR", horclr=20.0, horwid=12.0)
+        assert _run(_edge(300.0), lock)["min_width"] == pytest.approx(20.0)
+
+    def test_horwid_used_when_horclr_column_is_absent(self):
+        assert _run(_edge(300.0), _lock(12.0, "HORWID"))["min_width"] == pytest.approx(12.0)
