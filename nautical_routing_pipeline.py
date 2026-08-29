@@ -1012,7 +1012,8 @@ class NauticalRoutingPipeline:
                  coverage_bbox: Optional[Tuple[float, float, float, float]] = None,
                  stitch_band_m: float = 300.0, stitch_radius_m: float = 500.0,
                  navmesh_edge_m: float = NAVMESH_TARGET_EDGE_M,
-                 sagitta_cap: float = 0.0):
+                 sagitta_cap: float = 0.0,
+                 max_segment_m: float = None):
         self.data_paths = data_paths
         self.db_path = db_path
         self.country = country
@@ -1027,6 +1028,8 @@ class NauticalRoutingPipeline:
         self.dataset_version = dataset_version
         self.classification_config = ClassificationConfig(depth_ceiling_m=depth_ceiling,
                                                            max_chord_sagitta_m=sagitta_cap)
+        if max_segment_m is not None:
+            self.classification_config.max_segment_m = float(max_segment_m)
         self.geod = Geod(ellps="WGS84")
         self.CRS_WGS84 = "EPSG:4326"
         self.CRS_METRIC = "EPSG:3857"
@@ -5055,6 +5058,12 @@ if __name__ == "__main__":
                              "tighter tolerance than the cap. Default 0.0 DISABLES this entirely and "
                              "reproduces today's unconditional max_segment_m resampling; edges with no "
                              "measured width are excluded from relaxation regardless of this value.")
+    parser.add_argument("--max-segment-m", type=float, default=None,
+                        help="Override ClassificationConfig.max_segment_m, the hard length "
+                             "backstop on resampled centerline segments (default 100.0). "
+                             "Raise it when --sagitta-cap is active: at 100m the backstop "
+                             "binds before the sagitta rule on every straight reach, which "
+                             "is exactly where the node reduction was supposed to come from.")
     parser.add_argument("--stitch-registry", nargs="?", const="data/seam_registry.sqlite", default="",
                         help="Enable Round 25 cross-database seam stitching (STITCHING_DESIGN.md "
                              "Section 3) against the shared global-node registry at this SQLite "
@@ -5115,5 +5124,6 @@ if __name__ == "__main__":
                                        stitch_band_m=args.stitch_band_m,
                                        stitch_radius_m=args.stitch_radius_m,
                                        navmesh_edge_m=args.navmesh_edge_m,
-                                       sagitta_cap=args.sagitta_cap)
+                                       sagitta_cap=args.sagitta_cap,
+                                       max_segment_m=args.max_segment_m)
     pipeline.run_pipeline()
