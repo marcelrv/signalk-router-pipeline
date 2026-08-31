@@ -89,14 +89,57 @@ def _edge_attr_init(geod, gdfs):
     _EDGE_ATTR_GEOD = geod
     _EDGE_ATTR_GDFS = gdfs
 
-def _candidates_by_bounds_static(gdf, geom, margin=0.0):
+def _candidates_by_bounds_static(gdf, geom, margin=0.0, margin_lon=None):
+    """Bounding-box prefilter, expanded by `margin` degrees on the lat axis and
+    `margin_lon` degrees on the lon axis (defaults to `margin` when omitted, so
+    every pre-existing single-margin call site is unaffected).
+
+    A caller converting a METRE margin into degrees must not reuse the same
+    converted value for both axes: 111320 m/deg is (approximately) constant for
+    latitude everywhere, but a degree of longitude is only 111320*cos(latitude)
+    metres -- at 51.5N (Zeeland) that is already a ~0.62 factor, worse further
+    north. See `_lonlat_margin_deg`, which callers needing a metre margin should
+    use to get both axes right instead of computing `metres / 111320.0` once and
+    passing it as `margin` alone.
+    """
     bounds = geom.bounds
-    if margin:
-        bounds = (bounds[0] - margin, bounds[1] - margin, bounds[2] + margin, bounds[3] + margin)
+    m_lon = margin_lon if margin_lon is not None else margin
+    if margin or m_lon:
+        bounds = (bounds[0] - m_lon, bounds[1] - margin, bounds[2] + m_lon, bounds[3] + margin)
     candidates = list(gdf.sindex.intersection(bounds))
     if candidates:
         return gdf.iloc[candidates]
     return gpd.GeoDataFrame()
+
+
+def _lonlat_margin_deg(polygon_wgs84, metres):
+    """Convert a metre distance into (margin_lon_deg, margin_lat_deg) for a WGS84
+    bbox prefilter margin, safe across polygon_wgs84's own latitude extent.
+
+    Latitude: 111320 m/deg is the (near-)constant conversion, so a flat margin
+    there is always at least as generous as needed, never too tight.
+
+    Longitude: a degree of longitude is 111320*cos(latitude) metres, which
+    SHRINKS at higher latitude -- reusing the latitude constant for longitude
+    (as this file did before CodeRabbit's PR #14 review caught it) silently
+    under-covers the east-west search radius, worse the further from the
+    equator: ~0.62x at Zeeland's 51.5N, and the planned US East Coast rebuild
+    reaches Maine at ~45N (~0.71x) off a Florida start at ~25N (~0.90x) -- a
+    wider and generally worse range than Zeeland alone. A candidate line or
+    lock polygon offset mainly east-west from a piece's bbox could be silently
+    excluded before reprojection ever ran, purely because of which direction it
+    happened to be offset in.
+
+    Uses whichever of the polygon's own min/max latitude has the larger
+    abs(lat) (closer to a pole, smaller cos(lat)) as the reference, so the
+    resulting margin_lon is conservative -- at least as generous as needed --
+    for every point in the piece, not just its centroid.
+    """
+    minx, miny, maxx, maxy = polygon_wgs84.bounds
+    ref_lat = max(abs(miny), abs(maxy))
+    margin_lat_deg = metres / 111320.0
+    margin_lon_deg = metres / (111320.0 * max(math.cos(math.radians(ref_lat)), 1e-6))
+    return margin_lon_deg, margin_lat_deg
 
 
 def _depare_candidate_sort_key(drval1, cscl, drval2):
@@ -3786,8 +3829,9 @@ class NauticalRoutingPipeline:
         if locks_gdf is None or locks_gdf.empty:
             return np.zeros(shape_hw, dtype=bool)
 
-        margin_deg = buffer_m / 111320.0
-        candidates = _candidates_by_bounds_static(locks_gdf, polygon_wgs84, margin=margin_deg)
+        margin_lon_deg, margin_lat_deg = _lonlat_margin_deg(polygon_wgs84, buffer_m)
+        candidates = _candidates_by_bounds_static(locks_gdf, polygon_wgs84,
+                                                    margin=margin_lat_deg, margin_lon=margin_lon_deg)
         if candidates.empty:
             return np.zeros(shape_hw, dtype=bool)
 
@@ -3838,12 +3882,15 @@ class NauticalRoutingPipeline:
         # _candidates_by_bounds_static's other callers use, so a piece never pays to
         # rasterize the whole inland_waterways dataset. Margin covers the cap distance
         # so a line just outside the piece's own bbox -- but within suppression range of
-        # a water pixel near the piece's edge -- is not missed. 111320 m/deg is
-        # latitude's constant, the largest real metres-per-degree at any latitude, so
-        # converting the (metric) cap through it is always at least as generous as
-        # needed, never too tight.
-        margin_deg = cfg.axis_dedup_cap_m / 111320.0
-        candidates = _candidates_by_bounds_static(inland_gdf, polygon_wgs84, margin=margin_deg)
+        # a water pixel near the piece's edge -- is not missed. Uses _lonlat_margin_deg
+        # rather than a single 111320 m/deg conversion applied to both axes: that
+        # constant is correct for latitude but overstates longitude's degree length at
+        # any latitude away from the equator, silently under-covering the east-west
+        # search radius (CodeRabbit PR #14 review finding 1 -- see that function's
+        # docstring for the measured impact).
+        margin_lon_deg, margin_lat_deg = _lonlat_margin_deg(polygon_wgs84, cfg.axis_dedup_cap_m)
+        candidates = _candidates_by_bounds_static(inland_gdf, polygon_wgs84,
+                                                    margin=margin_lat_deg, margin_lon=margin_lon_deg)
         if candidates.empty:
             return np.zeros(mask.shape, dtype=bool)
 
@@ -3875,7 +3922,12 @@ class NauticalRoutingPipeline:
                                               cfg.axis_dedup_cap_m)
         if protect.any():
             suppress = suppress & ~protect
-        return suppress
+        # Limit to actual water pixels (CodeRabbit PR #14 review finding 2): axis_dist_m
+        # is computed over the whole raster grid, so suppress can be True on land near
+        # an axis line. The carve (mask & ~suppress) was already unaffected either way,
+        # but callers computing a suppression RATE against mask.sum() need this to not
+        # overcount the numerator.
+        return mask & suppress
 
     @staticmethod
     def _extract_medial_axis_skeleton(mask):

@@ -145,10 +145,14 @@ class TestToleranceScalesWithLocalWidth:
 
 class TestFloorIsRespected:
     def test_never_suppresses_below_the_5m_floor(self):
-        # A very narrow channel where fraction*width (3m) would fall BELOW the 5m
-        # floor if the floor weren't applied -- use 1m pixels so a 6m-tall band is
-        # representable. width_est at the centre ~6m -> fraction*width = 3m, but the
-        # floor must clip that up to 5m.
+        # A very narrow channel where fraction*width falls BELOW the 5m floor at the
+        # band's own edge rows if the floor weren't applied -- use 1m pixels so a
+        # 6m-tall band (rows 47:53) is representable. width_est at rows 47/52 (the
+        # band's top/bottom edge, closest to the water/land boundary) is ~2m ->
+        # fraction*width = 1m, but the floor must clip that up to 5m. Both rows
+        # checked are ON the water mask -- CodeRabbit PR #14 review finding 2 fixed
+        # `_axis_dedup_suppression_mask` to only ever return water pixels, so an
+        # off-mask assertion can no longer observe this (see the off-mask test below).
         px = 1.0
         transform = _transform(px=px)
         mask = _channel_mask(47, 53, rows=ROWS, cols=COLS)  # 6 rows tall @ 1m px = 6m
@@ -158,17 +162,22 @@ class TestFloorIsRespected:
 
         suppress = pipeline._axis_dedup_suppression_mask(mask, transform, UTM_CRS, px, polygon)
 
-        # 4m from the axis row (row 49 -> row 45, 4 rows @ 1m): inside the 5m floor,
-        # so suppressed, even though fraction*width alone (3m) would not have reached
-        # this far.
-        assert suppress[45, 100]
-        # 3m from the axis (row 46): also inside the floor.
-        assert suppress[46, 100]
+        # Row 47 (band's top edge, on-mask): axis_dist=2m from the row-49 axis line.
+        # Without the floor, tol there would be fraction*width=1m (2m > 1m -> NOT
+        # suppressed); with the floor, tol=5m (2m < 5m -> suppressed).
+        assert suppress[47, 100]
+        # Row 52 (band's bottom edge, on-mask): axis_dist=3m, same floor-dependent story.
+        assert suppress[52, 100]
 
-    def test_floor_does_not_shrink_tolerance_below_5m_even_off_channel(self):
-        # Confirms the floor applies to EVERY pixel's tol, not just ones inside a
-        # channel -- distance_transform_edt(mask) is 0 off-mask, so width_est is 0
-        # there, and fraction*0=0 would give tol=0 without the floor.
+    def test_off_mask_pixels_are_never_suppressed_regardless_of_floor(self):
+        # CodeRabbit PR #14 review finding 2: `_axis_dedup_suppression_mask` computes
+        # axis_dist_m/tol_m over the WHOLE raster grid (so the floor alone would flag
+        # a land pixel close enough to the axis line, even with zero local width), but
+        # the function must only ever return water pixels -- callers compute a
+        # suppression RATE against mask.sum(), and the carve itself (mask & ~suppress)
+        # only cares about water pixels anyway. Confirms the fix: a pixel well within
+        # the floor's own reach of the axis row, but off the water mask, is not
+        # suppressed.
         px = 1.0
         transform = _transform(px=px)
         mask = _channel_mask(47, 53, rows=ROWS, cols=COLS)
@@ -178,9 +187,10 @@ class TestFloorIsRespected:
 
         suppress = pipeline._axis_dedup_suppression_mask(mask, transform, UTM_CRS, px, polygon)
 
-        # Off-mask pixel 4m from the axis row: still within the 5m floor tolerance,
-        # even though it carries zero local width.
-        assert suppress[45, 5]  # far from the channel's own columns, but same row band
+        # Row 45 is off-mask (band is rows 47:53) but only 4m from the axis row --
+        # well within the 5m floor's reach -- yet must not be suppressed.
+        assert not suppress[45, 5]
+        assert not mask[45, 5]  # sanity: this pixel really is off the water mask
 
 
 class TestNoProximityLeavesMaskUntouched:
@@ -441,3 +451,68 @@ class TestLockPolygonsAreNeverSuppressed:
         suppress = pipeline._axis_dedup_suppression_mask(mask, transform, UTM_CRS, PX_M, polygon)
 
         assert suppress[49, 100]  # unaffected by a lock nowhere near this piece
+
+
+class TestBboxPrefilterMarginIsLatitudeAware:
+    """CodeRabbit PR #14 review finding 1: `_candidates_by_bounds_static` applied one
+    scalar margin to both the lat and lon axes of a bbox. Both callers here convert a
+    metre margin via `metres / 111320.0` -- correct for latitude everywhere, but
+    longitude shrinks by cos(latitude), so the same converted value under-covers the
+    east-west search radius (~0.62x at Zeeland's 51.45N). `_lock_protection_mask` is
+    where this is actually observable: it buffers a candidate LOCK polygon by
+    `axis_dedup_cap_m` AFTER the bbox prefilter, so a lock whose true (unbuffered)
+    position is beyond the buggy margin but within a correct one is excluded before
+    buffering ever gets a chance to reach back into the piece.
+    """
+
+    def test_symmetric_margin_excludes_a_lock_the_correct_margin_includes(self):
+        # Reproduces the reviewer's suggested fixture directly against
+        # _candidates_by_bounds_static: a lock polygon 40m east of the piece's own
+        # bbox, at Zeeland's latitude (~51.45N, cos~0.623). The old single-margin
+        # metres/111320.0 conversion gives an effective east-west reach of only
+        # ~31m (50 * 0.623) -- short of 40m, so the candidate is wrongly excluded.
+        # _lonlat_margin_deg's longitude-aware conversion reaches the full 50m.
+        transform = _transform()
+        lock_utm = box(EASTING0 + COLS * PX_M + 40.0, NORTHING0_TOP - 56 * PX_M,
+                        EASTING0 + COLS * PX_M + 45.0, NORTHING0_TOP - 44 * PX_M)
+        lock_wgs84 = gpd.GeoSeries([lock_utm], crs=UTM_CRS).to_crs("EPSG:4326").iloc[0]
+        locks_gdf = gpd.GeoDataFrame(geometry=[lock_wgs84], crs="EPSG:4326")
+        polygon = _polygon_wgs84_covering_raster(transform)
+
+        from nautical_routing_pipeline import _candidates_by_bounds_static, _lonlat_margin_deg
+
+        old_buggy_margin_deg = 50.0 / 111320.0
+        old_candidates = _candidates_by_bounds_static(locks_gdf, polygon, margin=old_buggy_margin_deg)
+        assert old_candidates.empty  # confirms the bug really would have missed it
+
+        margin_lon_deg, margin_lat_deg = _lonlat_margin_deg(polygon, 50.0)
+        new_candidates = _candidates_by_bounds_static(
+            locks_gdf, polygon, margin=margin_lat_deg, margin_lon=margin_lon_deg)
+        assert len(new_candidates) == 1
+
+    def test_lock_protection_reaches_a_lock_offset_east_of_the_piece(self):
+        # End-to-end version through the real code path: without the fix, this lock
+        # (40m east of the piece, buffered by the 50m cap to reach 10m into the
+        # piece's own east edge) would never even be considered, and the axis-dedup
+        # suppression at the piece's east edge would go unprotected -- fails before
+        # the fix, passes after.
+        transform = _transform()
+        mask = _channel_mask(30, 70)
+        pipeline = _pipeline(axis_dedup_cap_m=50.0)
+        pipeline.gdfs["inland_waterways"] = _inland_gdf(_axis_line_wgs84(transform, 49))
+        lock_utm = box(EASTING0 + COLS * PX_M + 40.0, NORTHING0_TOP - 56 * PX_M,
+                        EASTING0 + COLS * PX_M + 45.0, NORTHING0_TOP - 44 * PX_M)
+        lock_wgs84 = gpd.GeoSeries([lock_utm], crs=UTM_CRS).to_crs("EPSG:4326").iloc[0]
+        pipeline.gdfs["locks"] = gpd.GeoDataFrame(
+            geometry=[lock_wgs84], data={"OBJNAM": ["Test Lock East"]}, crs="EPSG:4326")
+        polygon = _polygon_wgs84_covering_raster(transform)
+
+        suppress = pipeline._axis_dedup_suppression_mask(mask, transform, UTM_CRS, PX_M, polygon)
+
+        # The lock's 50m buffer reaches ~10m into the piece's east edge (last two
+        # columns) -- protected, even though the axis line itself still runs the full
+        # width at row 49.
+        assert not suppress[49, 198]
+        assert not suppress[49, 199]
+        # Far from the lock, ordinary suppression is unaffected.
+        assert suppress[49, 100]
