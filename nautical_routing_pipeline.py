@@ -901,6 +901,17 @@ class ClassificationConfig:
     # Nothing ships until a build is measured against the §6 gates.
     max_chord_sagitta_m: float = 0.0    # cap on chord-to-centerline deviation (m); 0.0 = disabled
     sagitta_width_fraction: float = 0.5  # tolerance = min(cap, this * local channel width), per §4.1.1
+    # SPEC-GRAPH-DENSITY.md §4.3: axis dedup. Carve water pixels near an authoritative
+    # inland_waterways axis (wtwaxs/RECTRC/NAVLNE) out of the raster BEFORE skeletonizing,
+    # so build_skeleton_network never generates a redundant medial-axis "twin" next to a
+    # centerline _build_inland_network already ingested. 0.0 (default) disables it entirely
+    # -- build_skeleton_network's mask is then byte-identical to today's, matching
+    # --sagitta-cap's convention. Nothing ships until a build is measured against §4.3.3's
+    # gates. Constants below are §4.3.1's measured values, not guesses: tol = clip(
+    # axis_dedup_fraction * local_channel_width, axis_dedup_floor_m, axis_dedup_cap_m).
+    axis_dedup_cap_m: float = 0.0       # cap (m) on suppression distance from the axis; 0.0 = disabled
+    axis_dedup_fraction: float = 0.5    # tolerance = clip(this * local channel width, floor, cap)
+    axis_dedup_floor_m: float = 5.0     # never suppress below this -- sits under pixel_min_m's 2.0m raster floor
 
     def pixel_size_for(self, min_dimension_m: float) -> float:
         return float(np.clip(min_dimension_m / self.pixel_dim_divisor,
@@ -1135,7 +1146,8 @@ class NauticalRoutingPipeline:
                  stitch_band_m: float = 300.0, stitch_radius_m: float = 500.0,
                  navmesh_edge_m: float = NAVMESH_TARGET_EDGE_M,
                  sagitta_cap: float = 0.0,
-                 max_segment_m: Optional[float] = None):
+                 max_segment_m: Optional[float] = None,
+                 axis_dedup_cap: float = 0.0):
         self.data_paths = data_paths
         self.db_path = db_path
         self.country = country
@@ -1149,7 +1161,8 @@ class NauticalRoutingPipeline:
         self.architecture = architecture
         self.dataset_version = dataset_version
         self.classification_config = ClassificationConfig(depth_ceiling_m=depth_ceiling,
-                                                           max_chord_sagitta_m=sagitta_cap)
+                                                           max_chord_sagitta_m=sagitta_cap,
+                                                           axis_dedup_cap_m=axis_dedup_cap)
         if max_segment_m is not None:
             self.classification_config.max_segment_m = float(max_segment_m)
         self.geod = Geod(ellps="WGS84")
@@ -1169,6 +1182,11 @@ class NauticalRoutingPipeline:
         # Local gap-resolve summary counters, logged once at the end of
         # _ensure_coastal_connectivity (see LOCAL_GAP_RESOLVE_* above).
         self.local_gap_resolve_stats = {"gaps_resolved": 0, "edges_added": 0}
+        # SPEC-GRAPH-DENSITY.md §4.3 axis-dedup summary counters, logged once at
+        # the end of build_network. All stay 0 when axis_dedup_cap_m == 0.0 (the
+        # code path that computes them is only entered when the feature is on).
+        self.axis_dedup_stats = {"pieces_processed": 0, "pieces_with_suppression": 0,
+                                  "suppressed_px": 0, "total_water_px": 0}
         # DIAGNOSTIC (connectivity-regression investigation, not shipped as a
         # feature): per-pass attempt/outcome counters for _stitch_component_pieces
         # and _resolve_local_skeleton_gaps, plus aggregate union-find group counts
@@ -1477,6 +1495,13 @@ class NauticalRoutingPipeline:
         if wcs["regions"]:
             logger.info(f"Inland-waterway x navmesh crossings: {wcs['nodes']} crossing nodes added "
                         f"across {wcs['regions']} regions, {wcs['edges']} connector edges.")
+        ads = self.axis_dedup_stats
+        if ads["pieces_processed"]:
+            pct = (100.0 * ads["suppressed_px"] / ads["total_water_px"]) if ads["total_water_px"] else 0.0
+            logger.info(f"Axis-dedup (SPEC-GRAPH-DENSITY.md §4.3): suppressed {ads['suppressed_px']} of "
+                        f"{ads['total_water_px']} raster water pixels ({pct:.1f}%) across "
+                        f"{ads['pieces_with_suppression']}/{ads['pieces_processed']} skeleton pieces "
+                        f"before skeletonizing, to avoid duplicating an authoritative inland_waterways axis.")
         logger.info(f"Network built with {self.graph.number_of_nodes()} nodes and {self.graph.number_of_edges()} edges.")
 
     # ------------------------------------------------------------------
@@ -3724,6 +3749,134 @@ class NauticalRoutingPipeline:
             mask = np.where(land_mask == 1, 0, mask)
         return mask.astype(bool), transform, px
 
+    def _lock_protection_mask(self, shape_hw, transform, utm_crs, polygon_wgs84, buffer_m):
+        """Pixels within `buffer_m` of any `locks` polygon -- these must never be
+        suppressed by axis-dedup, regardless of how close an inland_waterways axis runs.
+
+        Root cause this exists to close (verified directly on data/zeeland_live_clip,
+        Krammersluizen lock): `_add_lock_crossing_edges` derives its chamber entry/exit
+        points from where an hw line crosses the LOCK POLYGON's own boundary, then
+        hooks a quadrant search onto whatever coastal graph nodes already exist nearby --
+        it runs after build_network, so it can only connect to nodes that already exist
+        by then. A lock chamber is exactly the kind of place an inland_waterways axis
+        line runs through (it's the whole point of the lock), so axis-dedup suppressing
+        the coastal centerline there is the worst possible case for it: measured against
+        a real build, the node axis-dedup removed at Krammersluizen (51.66105, 4.15994,
+        `requires_lock` edges to both banks) sat AT 0.0m from the lock polygon's own
+        boundary (i.e. inside/on it) -- not near it, inside it. POI-pair reachability
+        (§6.1's method) went from 0 lost pairs to 278/10,878 (2.56%), 100% of them
+        through Krammersluizen, once the fix below was added this dropped back to 0.
+
+        `buffer_m` reuses `axis_dedup_cap_m` rather than introducing a second guessed
+        constant: suppression itself can never reach farther than that cap from any
+        axis line (tol = clip(fraction*width, floor, cap) <= cap always), so buffering
+        every lock polygon by that same cap guarantees no pixel axis-dedup could
+        possibly have suppressed near a lock is left unprotected, while leaving
+        suppression fully unaffected everywhere more than a cap-width away from any
+        lock (i.e. everywhere axis-dedup's own reach could not have touched lock
+        infrastructure in the first place). Lock polygons in this dataset run
+        37.5-302m on their major axis (20 named locks measured directly), so this
+        buffer is a modest addition on top of already-lock-scaled geometry, not the
+        dominant term.
+
+        Returns a boolean array shaped `shape_hw` -- all-False (cheap) when no lock
+        polygon falls near this piece.
+        """
+        locks_gdf = self.gdfs.get("locks")
+        if locks_gdf is None or locks_gdf.empty:
+            return np.zeros(shape_hw, dtype=bool)
+
+        margin_deg = buffer_m / 111320.0
+        candidates = _candidates_by_bounds_static(locks_gdf, polygon_wgs84, margin=margin_deg)
+        if candidates.empty:
+            return np.zeros(shape_hw, dtype=bool)
+
+        cand_utm = candidates.to_crs(utm_crs)
+        buffered = [(geom.buffer(buffer_m), 1) for geom in cand_utm.geometry
+                    if geom is not None and not geom.is_empty]
+        if not buffered:
+            return np.zeros(shape_hw, dtype=bool)
+
+        protect = _rio_rasterize(buffered, out_shape=shape_hw, transform=transform,
+                                  fill=0, dtype="uint8", all_touched=True)
+        return protect.astype(bool)
+
+    def _axis_dedup_suppression_mask(self, mask, transform, utm_crs, pixel_size_m, polygon_wgs84):
+        """SPEC-GRAPH-DENSITY.md §4.3.2: per-pixel suppression mask for water pixels
+        that sit within a width-coupled tolerance of an authoritative inland_waterways
+        axis line (wtwaxs/RECTRC/NAVLNE), so build_skeleton_network never generates a
+        redundant medial-axis "twin" next to a centerline _build_inland_network already
+        ingested from the same source.
+
+        `tol = clip(axis_dedup_fraction * local_width, axis_dedup_floor_m,
+        axis_dedup_cap_m)` -- §4.3.1's measured constants (cap=50m, fraction=0.5,
+        floor=5m), applied per water pixel. Local channel width is measured from the
+        ORIGINAL, uncarved `mask` (step 1 of §4.3.2) so estimates near the axis are not
+        distorted by the carving this function's own output goes on to do.
+
+        Lock polygons are then excluded from the result entirely (see
+        `_lock_protection_mask`) -- a lock chamber is precisely where an authoritative
+        axis line is expected to run, but `_add_lock_crossing_edges` needs real coastal
+        graph nodes there to hook its own chamber-transit edges onto, and that need does
+        not go away just because the water also happens to be near a WTWAXS line.
+
+        Returns a boolean array shaped like `mask` -- all-False (cheaply, no rasterize
+        call) when no inland_waterways line falls near this piece. Caller (only
+        build_skeleton_network) is responsible for gating this on
+        `axis_dedup_cap_m > 0.0`; this method does not re-check that itself, so it must
+        never be called from the `axis_dedup_cap_m == 0.0` path (gate 1: that path's
+        mask must be byte-identical to before this feature existed).
+        """
+        cfg = self.classification_config
+        from scipy.ndimage import distance_transform_edt
+
+        inland_gdf = self.gdfs.get("inland_waterways")
+        if inland_gdf is None or inland_gdf.empty:
+            return np.zeros(mask.shape, dtype=bool)
+
+        # Bounding-box prefilter against this piece's extent, same pattern
+        # _candidates_by_bounds_static's other callers use, so a piece never pays to
+        # rasterize the whole inland_waterways dataset. Margin covers the cap distance
+        # so a line just outside the piece's own bbox -- but within suppression range of
+        # a water pixel near the piece's edge -- is not missed. 111320 m/deg is
+        # latitude's constant, the largest real metres-per-degree at any latitude, so
+        # converting the (metric) cap through it is always at least as generous as
+        # needed, never too tight.
+        margin_deg = cfg.axis_dedup_cap_m / 111320.0
+        candidates = _candidates_by_bounds_static(inland_gdf, polygon_wgs84, margin=margin_deg)
+        if candidates.empty:
+            return np.zeros(mask.shape, dtype=bool)
+
+        cand_utm = candidates.to_crs(utm_crs)
+        line_shapes = [(geom, 1) for geom in cand_utm.geometry if geom is not None and not geom.is_empty]
+        if not line_shapes:
+            return np.zeros(mask.shape, dtype=bool)
+
+        # Step 1: local channel width per water pixel, from the ORIGINAL (uncarved)
+        # mask -- exactly the quantity width_m() in _skeleton_raster_to_graph turns into
+        # width_profile downstream, computed here for every water pixel instead of only
+        # skeleton pixels (§4.3.2).
+        width_est_m = distance_transform_edt(mask) * pixel_size_m * 2.0
+
+        # Step 2: rasterize the candidate axis lines onto the SAME grid as mask, then
+        # distance-transform the inverse to get each pixel's distance to the nearest
+        # axis line.
+        axis_raster = _rio_rasterize(line_shapes, out_shape=mask.shape, transform=transform,
+                                      fill=0, dtype="uint8", all_touched=True)
+        axis_dist_m = distance_transform_edt(axis_raster == 0) * pixel_size_m
+
+        # Step 3: tol = clip(fraction * width_est, floor, cap); suppress = axis_dist < tol.
+        tol_m = np.clip(cfg.axis_dedup_fraction * width_est_m, cfg.axis_dedup_floor_m, cfg.axis_dedup_cap_m)
+        suppress = axis_dist_m < tol_m
+
+        # Never suppress near a lock -- see _lock_protection_mask's docstring for the
+        # measured Krammersluizen failure this closes.
+        protect = self._lock_protection_mask(mask.shape, transform, utm_crs, polygon_wgs84,
+                                              cfg.axis_dedup_cap_m)
+        if protect.any():
+            suppress = suppress & ~protect
+        return suppress
+
     @staticmethod
     def _extract_medial_axis_skeleton(mask):
         """medial_axis with the distance transform (width profile) in one call.
@@ -3962,6 +4115,26 @@ class NauticalRoutingPipeline:
         mask, transform, px = self._rasterize_water_polygon(poly_m, land_m, px)
         if mask is None or int(mask.sum()) < 3:
             return
+
+        # SPEC-GRAPH-DENSITY.md §4.3: carve the mask BEFORE skeletonizing, so a
+        # redundant medial-axis twin next to an authoritative inland_waterways axis
+        # line is never generated (not generated-then-pruned). Gated on
+        # axis_dedup_cap_m > 0.0 -- the default 0.0 skips this block entirely, so
+        # gate 1 (byte-identical mask at cap 0) holds by construction, not by a
+        # runtime check inside _axis_dedup_suppression_mask.
+        if cfg.axis_dedup_cap_m > 0.0:
+            total_px = int(mask.sum())
+            suppress = self._axis_dedup_suppression_mask(mask, transform, utm, px, polygon)
+            n_suppressed = int(suppress.sum())
+            self.axis_dedup_stats["pieces_processed"] += 1
+            self.axis_dedup_stats["total_water_px"] += total_px
+            if n_suppressed:
+                mask = mask & ~suppress
+                self.axis_dedup_stats["pieces_with_suppression"] += 1
+                self.axis_dedup_stats["suppressed_px"] += n_suppressed
+                if int(mask.sum()) < 3:
+                    return
+
         skel, dist = self._extract_medial_axis_skeleton(mask)
         if int(skel.sum()) < 2:
             return
@@ -5589,6 +5762,16 @@ if __name__ == "__main__":
                              "Raise it when --sagitta-cap is active: at 100m the backstop "
                              "binds before the sagitta rule on every straight reach, which "
                              "is exactly where the node reduction was supposed to come from.")
+    parser.add_argument("--axis-dedup-cap", type=float, default=0.0,
+                        help="Cap (m) on suppression distance from an authoritative inland_waterways "
+                             "axis line (wtwaxs/RECTRC/NAVLNE) when carving the coastal-water raster "
+                             "before skeletonizing (SPEC-GRAPH-DENSITY.md §4.3). The effective "
+                             "tolerance is clip(0.5 * local channel width, 5.0, this cap) -- narrow "
+                             "channels always get a tighter tolerance than the cap. Default 0.0 "
+                             "DISABLES this entirely and reproduces today's skeleton raster byte-for-"
+                             "byte -- build_skeleton_network never generates a redundant medial-axis "
+                             "twin next to a channel the pipeline already ingested from the "
+                             "inland_waterways source.")
     parser.add_argument("--stitch-registry", nargs="?", const="data/seam_registry.sqlite", default="",
                         help="Enable Round 25 cross-database seam stitching (STITCHING_DESIGN.md "
                              "Section 3) against the shared global-node registry at this SQLite "
@@ -5650,5 +5833,6 @@ if __name__ == "__main__":
                                        stitch_radius_m=args.stitch_radius_m,
                                        navmesh_edge_m=args.navmesh_edge_m,
                                        sagitta_cap=args.sagitta_cap,
-                                       max_segment_m=args.max_segment_m)
+                                       max_segment_m=args.max_segment_m,
+                                       axis_dedup_cap=args.axis_dedup_cap)
     pipeline.run_pipeline()
