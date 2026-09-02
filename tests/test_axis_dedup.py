@@ -16,7 +16,12 @@ import geopandas as gpd
 from rasterio.transform import from_origin
 from shapely.geometry import LineString, box
 
-from nautical_routing_pipeline import ClassificationConfig, NauticalRoutingPipeline
+from nautical_routing_pipeline import (
+    ClassificationConfig,
+    NauticalRoutingPipeline,
+    _candidates_by_bounds_static,
+    _lonlat_margin_deg,
+)
 
 # A UTM zone-31N patch near Zeeland (3.7-3.75E, 51.44-51.45N) -- estimate_utm_crs()
 # on this extent returns exactly EPSG:32631, confirmed directly against pyproj.
@@ -615,17 +620,28 @@ class TestNavmeshPieceCarving:
         # outside the piece entirely, offset far enough north that no water pixel is
         # ever within the cap. Confirms the prefilter is only a cheap first pass, not
         # the actual suppression decision.
+        #
+        # CodeRabbit PR #14 review round 3 finding 2: the original version of this test
+        # placed the line 400m north of the piece's own north edge (y=5701000) against a
+        # 50m cap -- outside even the bbox+margin prefilter, so it never actually
+        # exercised "candidates non-empty, real suppression still empty" at all; it was
+        # silently exercising the SAME prefilter-rejects-it path other tests already
+        # cover. Moved to 40m north (inside the 50m margin, survives the prefilter, but
+        # still nowhere near any real pixel's tolerance) -- and the candidates-non-empty
+        # claim is now verified directly below, not just asserted in a comment.
         pipeline = _pipeline(axis_dedup_cap_m=50.0)
         piece = self._wide_piece()
-        # A short line near the piece's bbox corner, but 500m north of the piece's own
-        # north edge (y=5701000) -- inside the piece's bbox+margin (margin computed
-        # from the 50m cap is far smaller than 500m) is NOT the test here; instead
-        # this exercises the case where candidates is non-empty (line overlaps the
-        # piece's bbox due to being a long line) but suppression still ends up empty
-        # because no actual pixel is close enough.
-        far_but_bbox_overlapping = LineString([(500500.0, 5701400.0), (501500.0, 5701400.0)])
+        far_but_bbox_overlapping = LineString([(500500.0, 5701040.0), (501500.0, 5701040.0)])
         line_wgs84 = self._wgs84(far_but_bbox_overlapping)
         pipeline.gdfs["inland_waterways"] = gpd.GeoDataFrame(geometry=[line_wgs84], crs="EPSG:4326")
+
+        # Verify this test actually exercises its intended branch: the bbox prefilter
+        # must find this candidate (not reject it before rasterization even runs).
+        polygon_wgs84 = self._wgs84(piece)
+        margin_lon_deg, margin_lat_deg = _lonlat_margin_deg(polygon_wgs84, pipeline.classification_config.axis_dedup_cap_m)
+        candidates = _candidates_by_bounds_static(pipeline.gdfs["inland_waterways"], polygon_wgs84,
+                                                   margin=margin_lat_deg, margin_lon=margin_lon_deg)
+        assert len(candidates) == 1, "test setup bug: the line must survive the bbox prefilter"
 
         result = pipeline._axis_dedup_carve_navmesh_pieces(piece, self.NAVMESH_UTM_CRS)
 
@@ -714,3 +730,100 @@ class TestToleranceBoundaryIsKnownButAcceptedNearMiss:
         suppress = pipeline._axis_dedup_suppression_mask(mask, transform, UTM_CRS, px, polygon)
 
         assert not suppress[49, 100]
+
+
+class TestMultiLineStringCandidatesAreExcluded:
+    """CodeRabbit PR #14 review round 3 finding 1: `_build_inland_network` only ever
+    ingests `LineString` geometry (no `elif MultiLineString`) -- a MultiLineString
+    feature in `inland_waterways` contributes ZERO graph topology. Before this fix,
+    axis-dedup's candidate search had no geometry-type filter at all, so it would still
+    rasterize a MultiLineString as a valid suppression trigger -- suppressing coastal
+    water on the theory that "the authoritative line covers this" when the graph never
+    actually got that line. Confirmed harmless on tonight's Zeeland builds (both
+    inland_waterways_lines.geojson files in use are pure LineString) but a real,
+    plausible gap for NOAA/US ENC data.
+    """
+
+    def test_multilinestring_candidate_is_excluded_from_skeleton_suppression(self, caplog):
+        import logging
+        transform = _transform()
+        mask = _channel_mask(30, 70)
+        pipeline = _pipeline(axis_dedup_cap_m=50.0)
+        # Same position/shape that a plain LineString axis (TestCarvesWhenEnabled)
+        # demonstrably DOES suppress -- a MultiLineString wrapping the identical
+        # geometry must not.
+        line = _axis_line_wgs84(transform, 49)
+        from shapely.geometry import MultiLineString
+        mls = MultiLineString([list(line.coords)])
+        pipeline.gdfs["inland_waterways"] = gpd.GeoDataFrame(geometry=[mls], crs="EPSG:4326")
+        polygon = _polygon_wgs84_covering_raster(transform)
+
+        with caplog.at_level(logging.WARNING, logger="nautical_routing_pipeline"):
+            suppress = pipeline._axis_dedup_suppression_mask(mask, transform, UTM_CRS, PX_M, polygon)
+
+        assert not suppress.any()
+        assert any("not LineString geometry" in r.message for r in caplog.records)
+
+    def test_multilinestring_candidate_is_excluded_from_navmesh_carve(self, caplog):
+        import logging
+        piece = TestNavmeshPieceCarving()._wide_piece()
+        line_utm = TestNavmeshPieceCarving()._through_line_utm()
+        from shapely.geometry import MultiLineString
+        mls_utm = MultiLineString([list(line_utm.coords)])
+        mls_wgs84 = gpd.GeoSeries([mls_utm], crs=TestNavmeshPieceCarving.NAVMESH_UTM_CRS).to_crs("EPSG:4326").iloc[0]
+        pipeline = _pipeline(axis_dedup_cap_m=50.0)
+        pipeline.gdfs["inland_waterways"] = gpd.GeoDataFrame(geometry=[mls_wgs84], crs="EPSG:4326")
+
+        with caplog.at_level(logging.WARNING, logger="nautical_routing_pipeline"):
+            result = pipeline._axis_dedup_carve_navmesh_pieces(piece, TestNavmeshPieceCarving.NAVMESH_UTM_CRS)
+
+        assert len(result) == 1
+        assert result[0].equals(piece)
+        assert any("not LineString geometry" in r.message for r in caplog.records)
+
+    def test_a_real_linestring_candidate_alongside_a_multilinestring_still_suppresses(self):
+        # The filter must exclude only the MultiLineString, not poison the whole
+        # candidate list -- a genuine LineString in the same layer still works.
+        transform = _transform()
+        mask = _channel_mask(30, 70)
+        pipeline = _pipeline(axis_dedup_cap_m=50.0)
+        good_line = _axis_line_wgs84(transform, 49)
+        from shapely.geometry import MultiLineString
+        bad_mls = MultiLineString([[(4.20, 51.70), (4.21, 51.70)]])  # far away, irrelevant either way
+        pipeline.gdfs["inland_waterways"] = gpd.GeoDataFrame(geometry=[good_line, bad_mls], crs="EPSG:4326")
+        polygon = _polygon_wgs84_covering_raster(transform)
+
+        suppress = pipeline._axis_dedup_suppression_mask(mask, transform, UTM_CRS, PX_M, polygon)
+
+        assert suppress[49, 100]
+
+
+class TestAllZeroAxisRasterDoesNotPhantomSuppress:
+    """Found while hardening the prefilter-vs-real-tolerance test for CodeRabbit PR #14
+    review round 3 finding 2: when every candidate survives the coarse bbox+margin
+    prefilter (their bounding boxes overlap the piece) but NONE actually rasterizes onto
+    this piece's own grid -- a real case, since a line's bbox is a rectangle and a
+    diagonal/L-shaped feature can have its bbox reach into the margin while the line
+    itself passes nowhere near the piece -- `axis_raster` ends up all-zero.
+    `scipy.ndimage.distance_transform_edt` on an array with NO background pixel
+    anywhere does not mean "far away everywhere": it falls back to measuring from an
+    implicit point outside the array's own (0,0) corner, producing small, spurious
+    distances near that corner. Confirmed directly before this guard: a line 40m
+    outside a piece's own raster footprint still wrongly carved a ~1900 sq m sliver at
+    the piece's origin corner. Guarded with `if not axis_raster.any(): return zeros`.
+    """
+
+    def test_line_entirely_outside_the_piece_grid_does_not_carve_a_corner_sliver(self):
+        piece = TestNavmeshPieceCarving()._wide_piece()  # box(500000,5700000,502000,5701000)
+        # 40m north of the piece's own north edge (5701000) -- inside the 50m cap
+        # margin (survives the bbox prefilter) but never rasterizes onto this piece's
+        # own grid (entirely outside its real-world extent).
+        line_utm = LineString([(500500.0, 5701040.0), (501500.0, 5701040.0)])
+        line_wgs84 = gpd.GeoSeries([line_utm], crs=TestNavmeshPieceCarving.NAVMESH_UTM_CRS).to_crs("EPSG:4326").iloc[0]
+        pipeline = _pipeline(axis_dedup_cap_m=50.0)
+        pipeline.gdfs["inland_waterways"] = gpd.GeoDataFrame(geometry=[line_wgs84], crs="EPSG:4326")
+
+        result = pipeline._axis_dedup_carve_navmesh_pieces(piece, TestNavmeshPieceCarving.NAVMESH_UTM_CRS)
+
+        assert len(result) == 1
+        assert result[0].equals(piece)

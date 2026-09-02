@@ -3923,7 +3923,25 @@ class NauticalRoutingPipeline:
             return np.zeros(mask.shape, dtype=bool)
 
         cand_utm = candidates.to_crs(utm_crs)
-        line_shapes = [(geom, 1) for geom in cand_utm.geometry if geom is not None and not geom.is_empty]
+        # CodeRabbit PR #14 review round 3 finding 1: _build_inland_network (its own
+        # docstring/call site above) only ever ingests LineString geometry -- a
+        # MultiLineString feature is silently skipped there, contributing zero graph
+        # topology. Suppressing coastal water on the strength of a candidate that isn't
+        # actually in the graph would be a real hole (removing a "duplicate" that was
+        # never built), not a duplicate-removal, so this candidate list must match what
+        # _build_inland_network would actually ingest, not just "any non-empty geometry
+        # in the layer". Warn (don't silently drop, matching parse_shapefiles' missing-
+        # layer convention) rather than fail the build -- this is a data-quality gap in
+        # the source layer, not a reason to abort.
+        non_linestring = [g for g in cand_utm.geometry if g is not None and not g.is_empty
+                           and not isinstance(g, LineString)]
+        if non_linestring:
+            logger.warning(f"  Axis-dedup: {len(non_linestring)} inland_waterways candidate(s) near "
+                            f"this piece are not LineString geometry (e.g. MultiLineString) -- "
+                            f"_build_inland_network wouldn't ingest them either, so they are excluded "
+                            f"from suppression rather than claiming coverage the graph doesn't have.")
+        line_shapes = [(geom, 1) for geom in cand_utm.geometry
+                       if geom is not None and not geom.is_empty and isinstance(geom, LineString)]
         if not line_shapes:
             return np.zeros(mask.shape, dtype=bool)
 
@@ -3938,6 +3956,22 @@ class NauticalRoutingPipeline:
         # axis line.
         axis_raster = _rio_rasterize(line_shapes, out_shape=mask.shape, transform=transform,
                                       fill=0, dtype="uint8", all_touched=True)
+        if not axis_raster.any():
+            # Every candidate survived the coarse bbox+margin prefilter (their overall
+            # bounding boxes overlap this piece's extent) but NONE actually rasterizes
+            # onto this piece's grid -- a real, if narrow, case: a line's own bbox is a
+            # rectangle, so a diagonal or L-shaped feature can have its bbox reach into
+            # the margin while the line itself passes nowhere near the piece. Found
+            # while hardening tests/test_axis_dedup.py's own prefilter-vs-real-tolerance
+            # test (CodeRabbit PR #14 review round 3 finding 2's fix): feeding an
+            # all-zero axis_raster into distance_transform_edt does NOT yield "far away
+            # everywhere" -- with no background pixel anywhere in the array, scipy falls
+            # back to measuring from an implicit point outside the array's own (0,0)
+            # corner, producing small, spurious distances near that one corner
+            # regardless of where the real (unrasterized) line actually is. Confirmed
+            # directly: a line 40m outside a piece's own grid still wrongly carved a
+            # ~1900 m^2 sliver at the piece's raster-origin corner before this guard.
+            return np.zeros(mask.shape, dtype=bool)
         axis_dist_m = distance_transform_edt(axis_raster == 0) * pixel_size_m
 
         # Step 3: tol = clip(fraction * width_est, floor, cap); suppress = axis_dist < tol.
