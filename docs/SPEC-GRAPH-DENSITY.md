@@ -225,19 +225,113 @@ chain *before* `_resample_long_skeleton_edges` sees it. Targets the 25.1% of edg
 10–25 m band, which are raster discretisation, not channel shape. Cheap and independent
 of 4.1, though 4.1 subsumes part of it.
 
-### 4.3 Prefer the authoritative axis over a generated twin
+### 4.3 Prefer the authoritative axis over a generated twin — SCOPED, ready to implement
 
 Where a medial-axis centerline runs within a small tolerance of an imported
 `inland_waterways_lines` axis (`wtwaxs`/`RECTRC`/`NAVLNE`), keep the axis and drop the
 generated twin, rather than emitting both and stitching them. Addresses the 2,396 nodes
-in §2.3.
+in §2.3, and directly the case a rendered screenshot of Krammersluizen surfaced after the
+§4.1 resampler shipped: a tight cluster of medial-axis nodes sitting 3-10 m from a WTWAXS
+line the pipeline had already ingested as authoritative, because `build_skeleton_network`
+rasterizes and skeletonizes `coastal_water` with no awareness that `_build_inland_network`
+already covers the same channel from a separate source.
 
 This is the same lever `SPEC-RECOMMENDED-TRACK.md` §4 weighs as Option B, and the density
 argument is a second, independent reason to take it — that spec deferred Option B purely
 on feature count (75 US `RECTRC` lines). In NL the axis is dense (3,689 lines / 3,711 km),
 so the two specs should be decided together, not separately: **Option B is much better
-motivated by NL density than by US coverage.** Suggest gating on a `--prefer-axis`
-tolerance and measuring both regions before shipping.
+motivated by NL density than by US coverage.**
+
+#### 4.3.1 Tolerance — measured, not guessed, and NOT a flat number
+
+Naive framing: pick a flat distance (the screenshot suggested "50 m each side"). Measured
+against every coastal medial-axis node in the deployed Zeeland database against its actual
+`inland_waterways_lines` source (23,614 nodes with known local channel width):
+
+The raw distance-to-axis histogram has **no clean gap** to anchor a flat number on — it
+decays smoothly from 0 to 150 m+ rather than splitting into "duplicate" vs "not". A flat
+cutoff is provably wrong in both directions:
+
+- **Too loose in narrow water.** A flat 50 m rule flags nodes up to 50 m from the axis in a
+  channel that is only 24 m wide — i.e. it reaches past the channel's own far bank into
+  water the axis was never describing. 797 nodes in the Zeeland measurement would be
+  wrongly suppressed this way.
+- **Too tight (or simply wrong-shaped) in open water.** In a channel 833 m wide, a WTWAXS
+  thread 192 m from the medial axis's geometric center is very plausibly still the same
+  water body — the axis just doesn't run down the exact middle. A flat rule sized to catch
+  that case would need to be huge, and would then over-reach into every other narrow
+  channel it touches.
+
+**Use the same coupling shape as the §4.1 resampler:**
+`tolerance = max(floor, min(cap, fraction × local_channel_width))`, with **cap = 50 m,
+fraction = 0.5, floor = 5 m** (the floor sits below the medial-axis raster's own pixel
+resolution — `ClassificationConfig.pixel_min_m = 2.0` — so it never suppresses something
+the raster itself couldn't have resolved as distinct anyway).
+
+The cap and the fraction never fight each other — each governs a different regime:
+
+| width band | median dist to axis | flat-50 vs coupled-50/0.5 agreement | what the cap/fraction is doing |
+|---|---|---|---|
+| <25 m | 680 m | fraction binds (`0.5×width` ≤ 12.5 m), cap never reached | prevents the flat rule's over-reach into unrelated nearby channels |
+| 25–100 m | 385-406 m | fraction binds up to ~50 m | — |
+| >400 m | 962 m | **identical to flat** — `0.5×width` always exceeds the 50 m cap | cap bounds how far suppression reaches into open water regardless of width |
+
+Net effect on the deployed Zeeland database: **~8.0% of coastal centerline nodes** would
+never be generated (1,888 of 23,614 measured), concentrated in narrow channels and locks —
+only 289 of 4,507 nodes in water wider than 400 m (6.4%) are affected, so open-water medial
+axis coverage is barely touched.
+
+**Validated directly against the motivating screenshot.** Applying the rule to the 19
+Krammersluis-area nodes measured by hand: the exact tight cluster (3.2-9.7 m, local width
+24-73 m) is suppressed, two more just past it (17.1 m and 26.5 m, local width 69-73 m) are
+correctly pulled in as proportionally still inside the same channel, and everything
+genuinely separate (56 m+, and three nodes at 105-139 m in what is evidently a different,
+wider basin near the lock) is correctly kept.
+
+#### 4.3.2 Implementation — carve the raster before skeletonizing, not after
+
+Per the "better" option this spec's original draft named but didn't choose between: do
+this at raster time, in `_rasterize_water_polygon`/`_extract_medial_axis_skeleton`'s
+inputs, so the twin is never generated rather than generated and then pruned.
+
+Local channel width is already available at this stage without waiting for the skeleton:
+`medial_axis(mask, return_distance=True)`'s distance transform gives, at every water
+pixel, its distance to the nearest boundary — exactly the quantity `width_m()` in
+`_skeleton_raster_to_graph` already turns into `width_profile` downstream, just computed
+here for every water pixel instead of only skeleton pixels. Sketch:
+
+1. `width_est = scipy.ndimage.distance_transform_edt(mask) * pixel_size_m * 2` — local
+   channel width per water pixel, from the ORIGINAL (uncarved) mask, so estimates near the
+   axis are not distorted by the carving that hasn't happened yet.
+2. Rasterize the relevant `inland_waterways` lines (bounding-box prefiltered against this
+   piece, same pattern as `_candidates_by_bounds_static`) onto the same grid; run
+   `distance_transform_edt` on the inverse to get `axis_dist` per pixel.
+3. `tol = np.clip(fraction * width_est, floor, cap)`; `suppress = axis_dist < tol`.
+4. Feed `mask & ~suppress` into `_extract_medial_axis_skeleton` as usual.
+
+Carving can fragment a piece's mask into disconnected pieces along a channel the axis runs
+alongside. No new mechanism needed for that: `build_skeleton_network` already emits
+degree-1 dead ends into `navmesh_seam_node_ids` for the existing stitching passes to
+reconnect (§6.2's Pass 2 fix is exactly the machinery this would lean on), so a carved
+raster is not a fundamentally different case from the fragmentation the pipeline already
+handles.
+
+Ship disabled by default (a `--axis-dedup-cap` flag, `0.0` = off, matching `--sagitta-cap`'s
+convention) until verified on a real build.
+
+#### 4.3.3 Verification plan
+
+Same gates as §4.1, since this changes the same kind of thing (which nodes exist) for the
+same underlying reason (redundant density):
+
+- `crosses_land` must stay 0.
+- Largest-component connectivity measured **by edge length, not node count** (§6.1) — must
+  not regress against the build with `--axis-dedup-cap 0`.
+- POI-pair reachability (§6.1's method) — zero real place-pairs may lose routability.
+- Report the count of suppressed nodes and cross-check a sample against source `src_objl`/
+  `OBJL` to confirm suppression only fires near genuine `wtwaxs`/`RECTRC`/`NAVLNE` lines.
+- `--axis-dedup-cap 0` must reproduce the pre-change build exactly (same discipline as
+  `--sagitta-cap 0` in §4.1/§6).
 
 ### 4.4 Not recommended: post-hoc DP on the exported graph
 
