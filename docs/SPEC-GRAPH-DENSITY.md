@@ -536,26 +536,40 @@ induced dead end on either the skeleton or the navmesh path.
 
 #### 6.3.1 Design
 
+**Implemented** (Phases A–C, per §6.3.5's sequencing; D and E remain open). Two points
+below were corrected during implementation against what this section originally assumed
+— left visible rather than quietly fixed, since both were real gaps in the design as
+written, not just wording:
+
 1. **Identify carve-induced dead ends.** After skeleton extraction / navmesh
    triangulation completes for a piece where axis-dedup fired, find degree-1 nodes whose
-   position sits close to the suppression mask's own boundary (within roughly one pixel
-   width of where `axis_dist_m ≈ tol_m` was computed for that piece). A genuine dead end
-   — a real cul-de-sac — would not typically land exactly on that computed boundary; a
-   carve-induced one always does, by construction.
-2. **Identify the responsible line.** The carve step already knows, per suppressed
-   pixel, which candidate line(s) were within tolerance (`line_shapes`/`candidates` in
-   `_axis_dedup_suppression_mask`). Either track this association through the carve (the
-   cheaper option — no new nearest-line search needed) or, as a fallback, find the
-   nearest `inland_waterways` line to the dead end at reconnect time (this is what
-   `_inject_waterway_crossings` already does for its own trigger, so the code exists
-   either way).
+   position sits close to the suppression mask's own boundary. **Correction**: "roughly
+   one pixel width" was wrong — measured directly, `medial_axis`'s own end-cap
+   construction routinely sets a fragment's centerline terminus back from the true carved
+   edge by several pixels (confirmed: 3px in one synthetic case), not one, so the shipped
+   search radius (`AXIS_DEDUP_DEADEND_SEARCH_RADIUS_PX = 4`) is wider than originally
+   assumed. Also confirmed empirically: severing a channel does not reliably leave a
+   *clean* degree-1 node at the cut at all — `medial_axis` often produces a small
+   degree-2/3 junction knot there instead. This design's `occurrences == 1` test (reusing
+   the exact signal `navmesh_seam_node_ids` already relies on, unchanged) correctly
+   leaves a knot untouched, the same as it leaves a genuine dead end untouched —
+   reconnecting a knot would need different, junction-aware logic, out of scope here. So
+   coverage is real but partial: not every carve-induced dead end resolves to a shape
+   this mechanism reconnects, only the ones that surface as an actual degree-1 node.
+2. **Identify the responsible line.** **Correction**: the carve step did *not* already
+   know this — every candidate line was burned into one undifferentiated raster value,
+   destroying per-line identity before the distance transform ran. Implemented the
+   "cheaper option" anyway, since it turned out cheap to add properly: burn each
+   candidate with its own `inland_waterways` positional index instead of a shared
+   constant, and add `return_indices=True` to the distance transform `_axis_dedup_
+   suppression_mask` already runs — the same computation scipy already performs, no
+   second pass — to get each suppressed pixel's nearest-line lookup for free.
 3. **Call `_connect_waterway_crossing`** with the dead end's node id, the responsible
-   `line_iloc`, and its metric-CRS position. No new connector logic — reuse verbatim.
-4. **Wire this into both carve sites**: the skeleton path (`build_skeleton_network`,
-   after `_axis_dedup_suppression_mask` carves) and the navmesh path
-   (`_axis_dedup_carve_navmesh_pieces`, §7). Currently only the navmesh piece-boundary-
-   crossing trigger calls into this machinery at all; axis-dedup's own carve on *either*
-   path calls it not at all.
+   `line_iloc`, and its metric-CRS position. No new connector logic — reused verbatim.
+4. **Wired into both carve sites**: the skeleton path (`build_skeleton_network`, after
+   `_axis_dedup_suppression_mask` carves) and the navmesh path (`_axis_dedup_carve_
+   navmesh_pieces`, §7), sharing one `line_m_cache` per piece with the navmesh path's
+   existing `_inject_waterway_crossings` connector where both fire on the same piece.
 
 #### 6.3.2 Bundled: the raster-padding gap (CodeRabbit, PR #14 round 4)
 
@@ -630,19 +644,28 @@ Same five-gate discipline as §4.3.3, plus checks specific to this change:
 
 #### 6.3.5 Phased implementation
 
-- **Phase A** — wire `_connect_waterway_crossing` into the navmesh carve path (§7),
+- **Phase A** ✅ — wire `_connect_waterway_crossing` into the navmesh carve path (§7),
   since that path is where the connector mechanism already lives; smallest reuse
-  distance.
-- **Phase B** — wire the same mechanism into the skeleton carve path
+  distance. Shipped: `_axis_dedup_suppression_mask` returns per-suppressed-pixel line
+  identity, `_axis_dedup_carve_navmesh_pieces` returns carve-boundary seam coords +
+  responsible line, `build_navmesh_region` reconnects them in a second pass sharing
+  `line_m_cache` with the existing waterway-crossing connector. 3 new tests
+  (`TestNavmeshCarveReconnect`).
+- **Phase B** ✅ — wire the same mechanism into the skeleton carve path
   (`_axis_dedup_suppression_mask`'s caller in `build_skeleton_network`), which today has
-  no connection to this machinery at all.
-- **Phase C** — the raster-padding fix (§6.3.2), independent of A/B, can land alongside
-  either.
+  no connection to this machinery at all. Shipped: reuses the existing `occurrences==1`
+  degree-1 tracking (unchanged), a new pixel-radius adjacency check
+  (`AXIS_DEDUP_DEADEND_SEARCH_RADIUS_PX = 4`, corrected up from an assumed ~1px — see
+  §6.3.1's correction). 5 new tests (`TestSkeletonCarveReconnect`), including one
+  documenting the degree-2/3 junction-knot limitation found during implementation.
+- **Phase C** ✅ — the raster-padding fix (§6.3.2), independent of A/B, landed first
+  (smallest, fully isolated change, verified alone before A/B built on top of it).
 - **Phase D** — re-test `<=` (§6.3.3, first bullet), only once A–C are verified clean on
-  `<`.
+  `<` against a real rebuild (unit tests alone can't exercise this — see §6.3.4). Not
+  started.
 - **Phase E** — test removing `_lock_protection_mask` (§6.3.3, second bullet), only once
   D is settled (removing a safety net while also changing the tie-break at the same time
-  would make a regression, if one appeared, ambiguous to attribute).
+  would make a regression, if one appeared, ambiguous to attribute). Not started.
 
 ## 7. Risks
 
