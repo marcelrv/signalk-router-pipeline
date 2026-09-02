@@ -516,3 +516,201 @@ class TestBboxPrefilterMarginIsLatitudeAware:
         assert not suppress[49, 199]
         # Far from the lock, ordinary suppression is unaffected.
         assert suppress[49, 100]
+
+
+class TestNavmeshPieceCarving:
+    """SPEC-OVERRIDE-ZONES.md §7 follow-up: build_navmesh_region's PSLG/triangle path
+    never got axis-dedup treatment -- confirmed as a live gap against the deployed
+    Zeeland database (node 509788242410608, Oosterschelde approach, ~9-14m from a real
+    inland_waterways line, well inside the 50m cap, never suppressed because nothing
+    upstream of build_navmesh_region ever asked). `_axis_dedup_carve_navmesh_pieces`
+    bridges the raster suppression logic to the vector-polygon world navmesh pieces
+    live in, before they become PSLG/triangulate() input.
+    """
+
+    NAVMESH_UTM_CRS = "EPSG:32631"
+
+    @staticmethod
+    def _wgs84(geom_utm, crs=None):
+        return gpd.GeoSeries([geom_utm], crs=crs or TestNavmeshPieceCarving.NAVMESH_UTM_CRS).to_crs("EPSG:4326").iloc[0]
+
+    def _wide_piece(self):
+        # 2km x 1km rectangle -- big enough that local channel width near its centre
+        # (~1000m) is far past the 50m cap, so the cap binds throughout most of it,
+        # same regime real navmesh (min_navmesh_radius_m=800m disk) pieces are in.
+        return box(500000.0, 5700000.0, 502000.0, 5701000.0)
+
+    def _through_line_utm(self):
+        # Runs the full width of the piece (and beyond, like a real river), straight
+        # through the middle at y=500500 -- exactly the "axis running down the middle
+        # of an open piece" case.
+        return LineString([(499900.0, 5700500.0), (502100.0, 5700500.0)])
+
+    def test_disabled_by_default_returns_the_polygon_unchanged(self):
+        pipeline = _pipeline(axis_dedup_cap_m=0.0)
+        piece = self._wide_piece()
+        line_wgs84 = self._wgs84(self._through_line_utm())
+        pipeline.gdfs["inland_waterways"] = gpd.GeoDataFrame(geometry=[line_wgs84], crs="EPSG:4326")
+
+        result = pipeline._axis_dedup_carve_navmesh_pieces(piece, self.NAVMESH_UTM_CRS)
+
+        assert len(result) == 1
+        assert result[0].equals(piece)
+
+    def test_no_inland_waterways_layer_is_a_true_no_op(self, monkeypatch):
+        pipeline = _pipeline(axis_dedup_cap_m=50.0)
+        piece = self._wide_piece()
+        # No self.gdfs["inland_waterways"] at all.
+
+        def _fail_if_called(*a, **kw):
+            raise AssertionError("_rasterize_water_polygon must not be called with no candidates nearby")
+        monkeypatch.setattr(pipeline, "_rasterize_water_polygon", _fail_if_called)
+
+        result = pipeline._axis_dedup_carve_navmesh_pieces(piece, self.NAVMESH_UTM_CRS)
+
+        assert len(result) == 1
+        assert result[0].equals(piece)
+
+    def test_far_away_line_is_a_true_no_op_no_rasterization(self, monkeypatch):
+        pipeline = _pipeline(axis_dedup_cap_m=50.0)
+        piece = self._wide_piece()
+        far_line_wgs84 = self._wgs84(LineString([(10.0, 55.0), (10.1, 55.0)]), )
+        pipeline.gdfs["inland_waterways"] = gpd.GeoDataFrame(geometry=[far_line_wgs84], crs="EPSG:4326")
+
+        def _fail_if_called(*a, **kw):
+            raise AssertionError("_rasterize_water_polygon must not be called -- bbox prefilter should reject this")
+        monkeypatch.setattr(pipeline, "_rasterize_water_polygon", _fail_if_called)
+
+        result = pipeline._axis_dedup_carve_navmesh_pieces(piece, self.NAVMESH_UTM_CRS)
+
+        assert len(result) == 1
+        assert result[0].equals(piece)
+
+    def test_axis_line_through_the_middle_carves_and_fragments_the_piece(self):
+        pipeline = _pipeline(axis_dedup_cap_m=50.0, axis_dedup_fraction=0.5, axis_dedup_floor_m=5.0)
+        piece = self._wide_piece()
+        line_wgs84 = self._wgs84(self._through_line_utm())
+        pipeline.gdfs["inland_waterways"] = gpd.GeoDataFrame(geometry=[line_wgs84], crs="EPSG:4326")
+
+        result = pipeline._axis_dedup_carve_navmesh_pieces(piece, self.NAVMESH_UTM_CRS)
+
+        # The ~100m-wide suppressed band down the middle splits the 1km-tall piece
+        # into two fragments -- no water silently dropped, both halves preserved as
+        # separate polygons for the caller to triangulate independently.
+        assert len(result) == 2
+        total_area = sum(p.area for p in result)
+        assert total_area < piece.area  # something was actually carved out
+        assert total_area > 0.85 * piece.area  # but not the whole piece -- only a
+        # ~100m band (suppression is now <= tol, inclusive of the boundary pixel --
+        # see the tolerance comparison's own fix -- so the band is a touch over 100m)
+        # out of a 1000m-tall piece, so at most ~15% should be gone.
+        # Every returned fragment must be a genuine sub-piece of the original.
+        for p in result:
+            assert piece.buffer(1e-6).contains(p)
+
+    def test_no_suppression_when_line_is_outside_true_tolerance_but_inside_bbox_margin(self):
+        # A line whose bbox falls within the piece's own bbox+margin (so it survives
+        # the cheap prefilter and rasterization does happen), but that never actually
+        # comes within any pixel's real per-pixel tolerance -- e.g. running just
+        # outside the piece entirely, offset far enough north that no water pixel is
+        # ever within the cap. Confirms the prefilter is only a cheap first pass, not
+        # the actual suppression decision.
+        pipeline = _pipeline(axis_dedup_cap_m=50.0)
+        piece = self._wide_piece()
+        # A short line near the piece's bbox corner, but 500m north of the piece's own
+        # north edge (y=5701000) -- inside the piece's bbox+margin (margin computed
+        # from the 50m cap is far smaller than 500m) is NOT the test here; instead
+        # this exercises the case where candidates is non-empty (line overlaps the
+        # piece's bbox due to being a long line) but suppression still ends up empty
+        # because no actual pixel is close enough.
+        far_but_bbox_overlapping = LineString([(500500.0, 5701400.0), (501500.0, 5701400.0)])
+        line_wgs84 = self._wgs84(far_but_bbox_overlapping)
+        pipeline.gdfs["inland_waterways"] = gpd.GeoDataFrame(geometry=[line_wgs84], crs="EPSG:4326")
+
+        result = pipeline._axis_dedup_carve_navmesh_pieces(piece, self.NAVMESH_UTM_CRS)
+
+        assert len(result) == 1
+        assert result[0].equals(piece)
+
+    def test_full_consumption_returns_empty_list(self):
+        # A sliver piece where even the FLOOR tolerance (5m) reaches every point --
+        # the farthest any point in an 8m-tall piece can be from a centreline axis is
+        # 4m, under the floor regardless of local width -- so the whole piece is
+        # suppressed. Its water is already covered by the authoritative axis line via
+        # _build_inland_network.
+        pipeline = _pipeline(axis_dedup_cap_m=50.0, axis_dedup_fraction=0.5, axis_dedup_floor_m=5.0)
+        tiny_piece = box(500000.0, 5700000.0, 500060.0, 5700008.0)  # 60m x 8m
+        line_wgs84 = self._wgs84(LineString([(499900.0, 5700004.0), (500160.0, 5700004.0)]))
+        pipeline.gdfs["inland_waterways"] = gpd.GeoDataFrame(geometry=[line_wgs84], crs="EPSG:4326")
+
+        result = pipeline._axis_dedup_carve_navmesh_pieces(tiny_piece, self.NAVMESH_UTM_CRS)
+
+        assert result == []
+
+
+class TestToleranceBoundaryIsKnownButAcceptedNearMiss:
+    """SPEC-OVERRIDE-ZONES.md §7 follow-up's motivating-case verification found a real
+    node (51.6078N, 4.1061E, Oosterschelde approach) surviving axis-dedup despite being
+    well inside the 50m cap: at that exact pixel (10m/px resolution), axis_dist_m and
+    tol_m both landed on exactly 10.00m -- a genuine tie, not a rare coincidence, since
+    both are derived from the same pixel-quantized distance_transform_edt grid.
+
+    Tried `<=` instead of strict `<` to close it. REVERTED after measuring the real
+    effect: ties of this kind recur throughout a real dataset (suppression rose
+    670,804->729,973 px, 5.2%->5.7%, system-wide -- not a narrow single-pixel fix), and
+    the broader reach cost a real POI pair near Hansweert (unrelated to any axis line --
+    178m from the nearest one) that used to sit 3m from the main component and became a
+    fully isolated 5-node island. Gate 4 (zero POI-pair reachability loss) outranks
+    closing this one exact tie, so strict `<` stays -- these tests document the accepted
+    boundary behaviour (and the measurement that justified accepting it), not a bug.
+    """
+
+    def test_exact_tie_between_axis_distance_and_tolerance_is_not_suppressed(self):
+        # Reproduces the real tie exactly: px=10m, a channel band whose edge row sits
+        # 1 pixel (10m) from the water/land boundary -> width_est = 1*10*2 = 20m ->
+        # tol = clip(0.5*20, 5, 50) = 10m (fraction-bound, not cap-bound). The axis
+        # line sits exactly 1 row (10m) away from that same pixel -> axis_dist = 10m.
+        # axis_dist_m == tol_m == 10.0 exactly: strict < means NOT suppressed --
+        # a known, measured, deliberately-accepted near-miss (see class docstring).
+        px = 10.0
+        transform = _transform(px=px)
+        mask = _channel_mask(40, 50)  # band rows 40..49; row 40 is 1 pixel from row 39 (land)
+        pipeline = _pipeline(axis_dedup_cap_m=50.0, axis_dedup_fraction=0.5, axis_dedup_floor_m=5.0)
+        # Axis line at row 41 -- 1 row (10m) south of row 40.
+        pipeline.gdfs["inland_waterways"] = _inland_gdf(_axis_line_wgs84(transform, 41, col_hi=COLS))
+        polygon = _polygon_wgs84_covering_raster(transform)
+
+        suppress = pipeline._axis_dedup_suppression_mask(mask, transform, UTM_CRS, px, polygon)
+
+        assert not suppress[40, 100]
+
+    def test_a_pixel_just_inside_the_tie_is_still_suppressed(self):
+        # One pixel closer to the axis than the tie case above (row 41 itself, ON the
+        # axis line -- axis_dist=0) must still be suppressed regardless of the strict
+        # boundary comparison; only the exact-equality case is affected by <  vs <=.
+        px = 10.0
+        transform = _transform(px=px)
+        mask = _channel_mask(40, 50)
+        pipeline = _pipeline(axis_dedup_cap_m=50.0, axis_dedup_fraction=0.5, axis_dedup_floor_m=5.0)
+        pipeline.gdfs["inland_waterways"] = _inland_gdf(_axis_line_wgs84(transform, 41, col_hi=COLS))
+        polygon = _polygon_wgs84_covering_raster(transform)
+
+        suppress = pipeline._axis_dedup_suppression_mask(mask, transform, UTM_CRS, px, polygon)
+
+        assert suppress[41, 100]
+
+    def test_a_pixel_one_step_beyond_the_tie_is_not_suppressed(self):
+        # Same setup, one row further from the axis (row 39 would be off-mask, so use
+        # the OTHER band edge instead -- row 49, whose own width_est is also 20m by
+        # symmetry, with the axis still at row 41): axis_dist = |49-41| = 8 rows = 80m,
+        # tol there is still 10m (fraction-bound) -- 80m > 10m, not suppressed.
+        px = 10.0
+        transform = _transform(px=px)
+        mask = _channel_mask(40, 50)
+        pipeline = _pipeline(axis_dedup_cap_m=50.0, axis_dedup_fraction=0.5, axis_dedup_floor_m=5.0)
+        pipeline.gdfs["inland_waterways"] = _inland_gdf(_axis_line_wgs84(transform, 41, col_hi=COLS))
+        polygon = _polygon_wgs84_covering_raster(transform)
+
+        suppress = pipeline._axis_dedup_suppression_mask(mask, transform, UTM_CRS, px, polygon)
+
+        assert not suppress[49, 100]
