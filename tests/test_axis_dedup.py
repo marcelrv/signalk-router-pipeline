@@ -616,22 +616,27 @@ class TestNavmeshPieceCarving:
     def test_no_suppression_when_line_is_outside_true_tolerance_but_inside_bbox_margin(self):
         # A line whose bbox falls within the piece's own bbox+margin (so it survives
         # the cheap prefilter and rasterization does happen), but that never actually
-        # comes within any pixel's real per-pixel tolerance -- e.g. running just
-        # outside the piece entirely, offset far enough north that no water pixel is
-        # ever within the cap. Confirms the prefilter is only a cheap first pass, not
-        # the actual suppression decision.
+        # comes within any pixel's real per-pixel tolerance. Confirms the prefilter is
+        # only a cheap first pass, not the actual suppression decision.
         #
         # CodeRabbit PR #14 review round 3 finding 2: the original version of this test
         # placed the line 400m north of the piece's own north edge (y=5701000) against a
         # 50m cap -- outside even the bbox+margin prefilter, so it never actually
-        # exercised "candidates non-empty, real suppression still empty" at all; it was
-        # silently exercising the SAME prefilter-rejects-it path other tests already
-        # cover. Moved to 40m north (inside the 50m margin, survives the prefilter, but
-        # still nowhere near any real pixel's tolerance) -- and the candidates-non-empty
-        # claim is now verified directly below, not just asserted in a comment.
+        # exercised "candidates non-empty, real suppression still empty" at all.
+        #
+        # SPEC-GRAPH-DENSITY.md §6.3.2: a later version placed the line 40m due north of
+        # the piece's north edge -- but once the padding fix landed (rasterizing onto a
+        # grid padded by the cap, not just the piece's own unpadded grid), a line 40m
+        # north IS now correctly within the 50m cap of the piece's own edge pixels and
+        # gets carved -- see TestAllZeroAxisRasterDoesNotPhantomSuppress's sibling case
+        # for that scenario. This test now needs a placement the *rectangular*
+        # bbox+margin prefilter accepts (survives on x AND y margin independently) but
+        # whose true Euclidean distance from the piece's own nearest corner exceeds the
+        # cap -- i.e. diagonally past the NE corner by (45m, 45m), each axis within the
+        # ~50m margin/pad reach, but Euclidean distance sqrt(45^2+45^2)=~63.6m > 50m cap.
         pipeline = _pipeline(axis_dedup_cap_m=50.0)
         piece = self._wide_piece()
-        far_but_bbox_overlapping = LineString([(500500.0, 5701040.0), (501500.0, 5701040.0)])
+        far_but_bbox_overlapping = LineString([(502045.0, 5701045.0), (502545.0, 5701045.0)])
         line_wgs84 = self._wgs84(far_but_bbox_overlapping)
         pipeline.gdfs["inland_waterways"] = gpd.GeoDataFrame(geometry=[line_wgs84], crs="EPSG:4326")
 
@@ -811,14 +816,48 @@ class TestAllZeroAxisRasterDoesNotPhantomSuppress:
     distances near that corner. Confirmed directly before this guard: a line 40m
     outside a piece's own raster footprint still wrongly carved a ~1900 sq m sliver at
     the piece's origin corner. Guarded with `if not axis_raster.any(): return zeros`.
+
+    SPEC-GRAPH-DENSITY.md §6.3.2: the guard above caught the phantom-corner artifact
+    but not the underlying miss it was papering over -- a candidate within the cap
+    margin of the piece's own bbox can have real geometry that never touches the
+    piece's OWN (unpadded) raster grid at all, even though it's genuinely within
+    tolerance of water pixels near the piece's edge. `_axis_dedup_suppression_mask`
+    now rasterizes onto a grid padded by `axis_dedup_cap_m` before this guard runs, so
+    a line 40m outside the piece's edge (within the 50m cap) is no longer silently
+    dropped -- it's the case exercised below.
     """
 
-    def test_line_entirely_outside_the_piece_grid_does_not_carve_a_corner_sliver(self):
+    def test_line_just_outside_the_piece_grid_but_within_the_cap_now_carves(self):
         piece = TestNavmeshPieceCarving()._wide_piece()  # box(500000,5700000,502000,5701000)
         # 40m north of the piece's own north edge (5701000) -- inside the 50m cap
-        # margin (survives the bbox prefilter) but never rasterizes onto this piece's
-        # own grid (entirely outside its real-world extent).
+        # margin (survives the bbox prefilter) and, since §6.3.2's padding fix, now
+        # also within the padded raster grid the carve rasterizes onto.
         line_utm = LineString([(500500.0, 5701040.0), (501500.0, 5701040.0)])
+        line_wgs84 = gpd.GeoSeries([line_utm], crs=TestNavmeshPieceCarving.NAVMESH_UTM_CRS).to_crs("EPSG:4326").iloc[0]
+        pipeline = _pipeline(axis_dedup_cap_m=50.0)
+        pipeline.gdfs["inland_waterways"] = gpd.GeoDataFrame(geometry=[line_wgs84], crs="EPSG:4326")
+
+        result = pipeline._axis_dedup_carve_navmesh_pieces(piece, TestNavmeshPieceCarving.NAVMESH_UTM_CRS)
+
+        # The line is 40m from the piece's north edge -- within the 50m cap, so a strip
+        # along that edge is now carved away: real suppression, not a no-op, and not a
+        # spurious corner sliver (the whole north edge is affected, not just a corner).
+        assert len(result) == 1
+        assert result[0].area < piece.area
+        # Confirm this isn't the old phantom-corner artifact (~1900 sq m at one corner)
+        # but a real edge-wide carve along most of the piece's own north edge (~1000m
+        # long, ~10m deep -- 50m cap minus the 40m gap to the line -- ~10,000 sq m; a
+        # single-corner sliver could never reach this).
+        assert piece.area - result[0].area > 8000.0
+
+    def test_line_beyond_even_the_padded_cap_margin_does_not_carve_a_corner_sliver(self):
+        piece = TestNavmeshPieceCarving()._wide_piece()  # box(500000,5700000,502000,5701000)
+        # 40m north of the piece's own north edge is now reachable (padded grid, see
+        # above); push the line's bbox just far enough to still survive the +/-50m
+        # bbox+margin prefilter (a diagonal/L-shaped feature's bbox can reach in) while
+        # its actual geometry stays outside even the padded raster grid -- this must
+        # still return the original piece untouched, no phantom sliver anywhere.
+        line_utm = LineString([(500500.0, 5701049.0), (501500.0, 5701200.0)])
         line_wgs84 = gpd.GeoSeries([line_utm], crs=TestNavmeshPieceCarving.NAVMESH_UTM_CRS).to_crs("EPSG:4326").iloc[0]
         pipeline = _pipeline(axis_dedup_cap_m=50.0)
         pipeline.gdfs["inland_waterways"] = gpd.GeoDataFrame(geometry=[line_wgs84], crs="EPSG:4326")

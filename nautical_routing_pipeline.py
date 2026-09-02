@@ -3901,6 +3901,7 @@ class NauticalRoutingPipeline:
         """
         cfg = self.classification_config
         from scipy.ndimage import distance_transform_edt
+        from rasterio import Affine
 
         inland_gdf = self.gdfs.get("inland_waterways")
         if inland_gdf is None or inland_gdf.empty:
@@ -3951,28 +3952,54 @@ class NauticalRoutingPipeline:
         # skeleton pixels (§4.3.2).
         width_est_m = distance_transform_edt(mask) * pixel_size_m * 2.0
 
-        # Step 2: rasterize the candidate axis lines onto the SAME grid as mask, then
-        # distance-transform the inverse to get each pixel's distance to the nearest
-        # axis line.
-        axis_raster = _rio_rasterize(line_shapes, out_shape=mask.shape, transform=transform,
-                                      fill=0, dtype="uint8", all_touched=True)
-        if not axis_raster.any():
+        # Step 2: rasterize the candidate axis lines onto a grid padded by
+        # axis_dedup_cap_m in every direction (crop back to mask's own shape below),
+        # then distance-transform the inverse to get each pixel's distance to the
+        # nearest axis line.
+        #
+        # Padded, not rasterized directly onto mask's own unpadded grid: a candidate
+        # survives the bbox+margin prefilter above (its bbox overlaps this piece's
+        # extent plus a cap-sized margin) precisely because its true geometry CAN sit
+        # up to a cap's distance outside this piece's own raster footprint while still
+        # being within tolerance of a water pixel near the piece's edge -- rasterizing
+        # only onto the unpadded grid silently dropped exactly that case (the line
+        # never touches a single pixel of the piece's own grid, so it contributes
+        # nothing to axis_dist_m at all, regardless of how close it truly is to the
+        # piece's edge pixels). Reuses axis_dedup_cap_m as the pad margin for the same
+        # reason `_lock_protection_mask` reuses it as a buffer distance: suppression
+        # can never reach farther than the cap, so padding by exactly the cap is
+        # provably sufficient and never over-generous.
+        #
+        # The padded transform is a pure integer-pixel extension of the original (same
+        # pixel_size_m on both grids, origin shifted by whole pixels), so cropping the
+        # padded distance transform back to mask's own shape below is exact index
+        # slicing, not resampling -- no fractional-pixel misalignment is possible.
+        pad_px = int(np.ceil(cfg.axis_dedup_cap_m / pixel_size_m))
+        padded_shape = (mask.shape[0] + 2 * pad_px, mask.shape[1] + 2 * pad_px)
+        padded_transform = transform * Affine.translation(-pad_px, -pad_px)
+        axis_raster_padded = _rio_rasterize(line_shapes, out_shape=padded_shape, transform=padded_transform,
+                                             fill=0, dtype="uint8", all_touched=True)
+        if not axis_raster_padded.any():
             # Every candidate survived the coarse bbox+margin prefilter (their overall
             # bounding boxes overlap this piece's extent) but NONE actually rasterizes
-            # onto this piece's grid -- a real, if narrow, case: a line's own bbox is a
-            # rectangle, so a diagonal or L-shaped feature can have its bbox reach into
-            # the margin while the line itself passes nowhere near the piece. Found
-            # while hardening tests/test_axis_dedup.py's own prefilter-vs-real-tolerance
-            # test (CodeRabbit PR #14 review round 3 finding 2's fix): feeding an
-            # all-zero axis_raster into distance_transform_edt does NOT yield "far away
-            # everywhere" -- with no background pixel anywhere in the array, scipy falls
-            # back to measuring from an implicit point outside the array's own (0,0)
-            # corner, producing small, spurious distances near that one corner
-            # regardless of where the real (unrasterized) line actually is. Confirmed
-            # directly: a line 40m outside a piece's own grid still wrongly carved a
-            # ~1900 m^2 sliver at the piece's raster-origin corner before this guard.
+            # onto even the padded grid -- a real, if narrow, case: a line's own bbox is
+            # a rectangle, so a diagonal or L-shaped feature can have its bbox reach into
+            # the margin while the line itself passes nowhere near the piece, cap-padded
+            # margin included. Found while hardening tests/test_axis_dedup.py's own
+            # prefilter-vs-real-tolerance test (CodeRabbit PR #14 review round 3 finding
+            # 2's fix): feeding an all-zero axis raster into distance_transform_edt does
+            # NOT yield "far away everywhere" -- with no background pixel anywhere in the
+            # array, scipy falls back to measuring from an implicit point outside the
+            # array's own (0,0) corner, producing small, spurious distances near that one
+            # corner regardless of where the real (unrasterized) line actually is.
+            # Confirmed directly: a line 40m outside a piece's own (unpadded) grid still
+            # wrongly carved a ~1900 m^2 sliver at the piece's raster-origin corner
+            # before this guard existed; the padded grid now genuinely rasterizes that
+            # case, and this guard is left in place for the residual case of a line
+            # beyond even the padded margin.
             return np.zeros(mask.shape, dtype=bool)
-        axis_dist_m = distance_transform_edt(axis_raster == 0) * pixel_size_m
+        axis_dist_padded_m = distance_transform_edt(axis_raster_padded == 0) * pixel_size_m
+        axis_dist_m = axis_dist_padded_m[pad_px:pad_px + mask.shape[0], pad_px:pad_px + mask.shape[1]]
 
         # Step 3: tol = clip(fraction * width_est, floor, cap); suppress = axis_dist < tol.
         #
