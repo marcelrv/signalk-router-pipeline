@@ -1230,6 +1230,16 @@ class NauticalRoutingPipeline:
         # code path that computes them is only entered when the feature is on).
         self.axis_dedup_stats = {"pieces_processed": 0, "pieces_with_suppression": 0,
                                   "suppressed_px": 0, "total_water_px": 0}
+        # SPEC-OVERRIDE-ZONES.md §7 follow-up: same idea, for the navmesh/PSLG carve
+        # path (_axis_dedup_carve_navmesh_pieces). "checked" counts every navmesh piece
+        # this ran against (gated on axis_dedup_cap_m > 0.0); "rasterized" is the subset
+        # that actually paid the bbox-prefilter-passed rasterize cost -- the gap between
+        # the two IS the no-op fast path's hit rate. "rasterize_seconds" is wall-clock
+        # time inside _rasterize_water_polygon + _axis_dedup_suppression_mask, logged so
+        # the real per-build cost is measured, not estimated.
+        self.axis_dedup_navmesh_stats = {"pieces_checked": 0, "pieces_rasterized": 0,
+                                          "pieces_carved": 0, "pieces_fragmented": 0,
+                                          "pieces_fully_consumed": 0, "rasterize_seconds": 0.0}
         # DIAGNOSTIC (connectivity-regression investigation, not shipped as a
         # feature): per-pass attempt/outcome counters for _stitch_component_pieces
         # and _resolve_local_skeleton_gaps, plus aggregate union-find group counts
@@ -1529,7 +1539,16 @@ class NauticalRoutingPipeline:
                 for piece_wgs84 in skeleton_pieces:
                     self.build_skeleton_network(piece_wgs84, DEFAULT_SOURCE_TIER, src_id)
                 for piece_m, piece_utm, piece_seam_coords in navmesh_pieces:
-                    self.build_navmesh_region(piece_m, piece_utm, piece_seam_coords, DEFAULT_SOURCE_TIER, src_id)
+                    # SPEC-OVERRIDE-ZONES.md §7: give navmesh pieces the same axis-dedup
+                    # suppression build_skeleton_network already applies -- inert (single-
+                    # element list, `poly_m` unchanged) unless axis_dedup_cap_m > 0.0 AND
+                    # an inland_waterways line is actually within reach. May return more
+                    # than one polygon if carving fragments the piece; each fragment is
+                    # triangulated separately so no water is silently dropped (see that
+                    # method's docstring).
+                    for carved_piece_m in self._axis_dedup_carve_navmesh_pieces(piece_m, piece_utm):
+                        self.build_navmesh_region(carved_piece_m, piece_utm, piece_seam_coords,
+                                                   DEFAULT_SOURCE_TIER, src_id)
 
             logger.info(f"Coastal water: {len(polygons)} connected components split into "
                         f"skeleton={counts['skeleton']}, laned={counts['laned']}, "
@@ -1545,6 +1564,15 @@ class NauticalRoutingPipeline:
                         f"{ads['total_water_px']} raster water pixels ({pct:.1f}%) across "
                         f"{ads['pieces_with_suppression']}/{ads['pieces_processed']} skeleton pieces "
                         f"before skeletonizing, to avoid duplicating an authoritative inland_waterways axis.")
+        ans = self.axis_dedup_navmesh_stats
+        if ans["pieces_checked"]:
+            logger.info(f"Axis-dedup navmesh carve (SPEC-OVERRIDE-ZONES.md §7): {ans['pieces_rasterized']}/"
+                        f"{ans['pieces_checked']} navmesh pieces had an inland_waterways line within reach "
+                        f"(rasterized), {ans['pieces_checked'] - ans['pieces_rasterized']} skipped rasterization "
+                        f"entirely (bbox prefilter, no candidate nearby); {ans['pieces_carved']} actually carved "
+                        f"({ans['pieces_fragmented']} fragmented into >1 piece, {ans['pieces_fully_consumed']} "
+                        f"fully consumed); {ans['rasterize_seconds']:.2f}s total in rasterize+suppression-mask "
+                        f"across all navmesh pieces.")
         logger.info(f"Network built with {self.graph.number_of_nodes()} nodes and {self.graph.number_of_edges()} edges.")
 
     # ------------------------------------------------------------------
@@ -3913,6 +3941,24 @@ class NauticalRoutingPipeline:
         axis_dist_m = distance_transform_edt(axis_raster == 0) * pixel_size_m
 
         # Step 3: tol = clip(fraction * width_est, floor, cap); suppress = axis_dist < tol.
+        #
+        # Tried <= here (SPEC-OVERRIDE-ZONES.md §7 follow-up's motivating-case
+        # verification found a real near-miss: 51.6078N/4.1061E's node sat at
+        # axis_dist_m == tol_m == 10.00m exactly, at 10m/px resolution -- both values
+        # are derived from the SAME pixel-quantized distance_transform_edt grid, so an
+        # exact tie there is systematic, not a rare coincidence, and <= suppressed it).
+        # REVERTED: measured directly against a real rebuild, <= raised suppression
+        # 670,804->729,973 px (5.2%->5.7%) system-wide -- not a narrow, single-tie fix,
+        # a broad one, because ties of this kind recur throughout the dataset wherever
+        # fraction*width_est's own pixel-quantized value happens to land on a multiple
+        # of the pixel size. That broader reach cost a real POI pair: a 5-node stub near
+        # Hansweert (51.383N, 4.031E, no axis line within 178m -- nowhere near this
+        # comparison's own reach) went from connected (3m from the main component) to a
+        # fully isolated island, costing 138/10,878 POI-pairs (confirmed by rebuilding
+        # with <= removed: the node is back in the 45,012-node main component). Gate 4
+        # (zero reachability loss) is the harder, non-negotiable bar on this branch, so
+        # the motivating case's exact-tie near-miss is accepted as a known, narrow,
+        # already-measured limitation rather than traded for a real regression elsewhere.
         tol_m = np.clip(cfg.axis_dedup_fraction * width_est_m, cfg.axis_dedup_floor_m, cfg.axis_dedup_cap_m)
         suppress = axis_dist_m < tol_m
 
@@ -3928,6 +3974,107 @@ class NauticalRoutingPipeline:
         # but callers computing a suppression RATE against mask.sum() need this to not
         # overcount the numerator.
         return mask & suppress
+
+    def _axis_dedup_carve_navmesh_pieces(self, poly_m, utm_crs):
+        """SPEC-OVERRIDE-ZONES.md §7 / follow-up to SPEC-GRAPH-DENSITY.md §4.3: apply
+        the SAME axis-dedup suppression the skeleton path already does to a navmesh
+        (PSLG/triangle) piece, before it becomes triangulation input.
+
+        `build_skeleton_network` was the only caller of `_axis_dedup_suppression_mask`
+        until now -- `build_navmesh_region`'s wide-water triangulation path was never
+        touched, because axis-dedup's own computed buffer is typically narrow enough to
+        stay inside skeleton-classified (narrow) water. Verified this gap is real
+        against the deployed Zeeland database: node 509788242410608 (Oosterschelde
+        approach, a navmesh-perimeter vertex carrying a `navmesh_boundary` edge) sits
+        ~9-14m from a real `inland_waterways` line -- well inside the 50m cap -- and was
+        never suppressed, because nothing upstream of `build_navmesh_region` ever asked.
+
+        Bridges the two representations rather than reimplementing the tolerance
+        formula: rasterizes `poly_m` (reusing `_rasterize_water_polygon`, the exact
+        pixel-size convention `build_skeleton_network` uses), calls
+        `_axis_dedup_suppression_mask` (the real width-coupled formula, unchanged), then
+        vectorizes the resulting boolean mask back to a polygon (`rasterio.features.
+        shapes`) and subtracts it from `poly_m`.
+
+        Performance: gated FIRST on a cheap bbox prefilter (same `_lonlat_margin_deg` +
+        `_candidates_by_bounds_static` pattern as the skeleton path) against
+        `inland_waterways` -- a piece with no candidate line nearby returns `[poly_m]`
+        immediately, with NO rasterization at all. This matters here in a way it didn't
+        for skeleton pieces: navmesh pieces can be up to `NAVMESH_TILE_MAX_EXTENT_M`
+        (10km) per tile, so rasterizing unconditionally would be real, avoidable cost on
+        every open-water region in a build, not just ones actually near an axis line.
+
+        Carving can fragment a navmesh piece the same way it fragments a skeleton mask
+        (SPEC-GRAPH-DENSITY.md §4.3.2's reasoning) -- but unlike the raster skeleton
+        path, `build_navmesh_region` cannot triangulate a fragmented input in one call
+        (`triangle` takes one exterior ring + holes, not disjoint pieces -- the same
+        reason `_explode_polygonal` is already used everywhere else a navmesh piece
+        might come apart). Rather than let `build_navmesh_region`'s existing "keep only
+        the largest simplified fragment" behaviour (see its own boundary-simplify step)
+        silently DROP a whole carved-off sub-region from the graph, this returns every
+        surviving fragment as its own polygon, so the caller triangulates each one
+        separately -- no water disappears, only the suppressed strip along the axis
+        does. Reconnecting the resulting pieces is exactly the existing stitching
+        passes' job, same as any other multi-piece water body.
+
+        Returns a list of Polygons (metric CRS, same `utm_crs` as `poly_m`) -- `[poly_m]`
+        unchanged when disabled, no candidates, or nothing suppressed; `[]` if carving
+        consumes the entire piece (its water is already covered by the authoritative
+        axis line via `_build_inland_network`, same as a fully-consumed skeleton mask).
+        """
+        cfg = self.classification_config
+        if cfg.axis_dedup_cap_m <= 0.0:
+            return [poly_m]
+
+        stats = self.axis_dedup_navmesh_stats
+        stats["pieces_checked"] += 1
+
+        polygon_wgs84 = gpd.GeoSeries([poly_m], crs=utm_crs).to_crs(self.CRS_WGS84).iloc[0]
+
+        inland_gdf = self.gdfs.get("inland_waterways")
+        if inland_gdf is None or inland_gdf.empty:
+            return [poly_m]
+        margin_lon_deg, margin_lat_deg = _lonlat_margin_deg(polygon_wgs84, cfg.axis_dedup_cap_m)
+        candidates = _candidates_by_bounds_static(inland_gdf, polygon_wgs84,
+                                                    margin=margin_lat_deg, margin_lon=margin_lon_deg)
+        if candidates.empty:
+            return [poly_m]
+
+        import time
+        t0 = time.perf_counter()
+        stats["pieces_rasterized"] += 1
+
+        b = poly_m.bounds
+        min_dim = min(b[2] - b[0], b[3] - b[1])
+        px = cfg.pixel_size_for(min_dim)
+        land_m = self._land_union_for(polygon_wgs84, utm_crs)
+        mask, transform, px = self._rasterize_water_polygon(poly_m, land_m, px)
+        if mask is None or int(mask.sum()) < 3:
+            stats["rasterize_seconds"] += time.perf_counter() - t0
+            return [poly_m]
+
+        suppress = self._axis_dedup_suppression_mask(mask, transform, utm_crs, px, polygon_wgs84)
+        stats["rasterize_seconds"] += time.perf_counter() - t0
+        if not suppress.any():
+            return [poly_m]
+
+        from rasterio.features import shapes as _rio_shapes
+        from shapely.geometry import shape as _shapely_shape
+        suppress_polys = [_shapely_shape(geom) for geom, val in
+                           _rio_shapes(suppress.astype("uint8"), mask=suppress, transform=transform)]
+        if not suppress_polys:
+            return [poly_m]
+        suppression_poly_m = self._clean_polygonal(unary_union(suppress_polys))
+
+        carved = self._clean_polygonal(poly_m.difference(suppression_poly_m))
+        stats["pieces_carved"] += 1
+        if carved.is_empty:
+            stats["pieces_fully_consumed"] += 1
+            return []
+        pieces = self._explode_polygonal(carved)
+        if len(pieces) > 1:
+            stats["pieces_fragmented"] += 1
+        return pieces
 
     @staticmethod
     def _extract_medial_axis_skeleton(mask):
