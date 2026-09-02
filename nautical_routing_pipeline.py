@@ -751,6 +751,19 @@ WATERWAY_CROSSING_CAP_PER_LINE = 8     # sanity cap per (navmesh piece, line) --
 WATERWAY_CONNECTOR_MAX_M = 250.0       # normal connector search radius to the nearest inland vertex
 WATERWAY_CONNECTOR_FALLBACK_MAX_M = 500.0  # widened radius for sparsely-digitized lines (logged)
 
+# SPEC-GRAPH-DENSITY.md §6.3.1 Phase B: how far (in RASTER PIXELS, not metres --
+# distinct in kind from the metric-CRS WATERWAY_CONNECTOR_* radii above, which
+# instead govern _connect_waterway_crossing's own nearest-inland-vertex search)
+# a skeleton degree-1 dead end may look for an adjacent axis-dedup-suppressed
+# pixel before treating it as carve-induced (reconnect-eligible) rather than a
+# genuine dead end left to existing stitching passes. 4, not a tighter 1-2:
+# medial_axis's own end-cap construction sets a fragment's centerline terminus
+# back from the true carved edge by a few pixels (confirmed directly -- a
+# synthetic severed channel's dead end sat 3px from the nearest suppressed
+# pixel, not 1), so a narrower radius would systematically miss real
+# carve-induced dead ends, not just tighten a false-positive margin.
+AXIS_DEDUP_DEADEND_SEARCH_RADIUS_PX = 4
+
 # --- Local gap-resolve pass (_stitch_component_pieces' last resort) ---
 # Fix for a confirmed bug: build_skeleton_network rasterizes an entire narrow
 # water-body piece at ONE shared pixel size derived from that whole piece's
@@ -4147,6 +4160,29 @@ class NauticalRoutingPipeline:
             }
         return suppress, line_iloc_by_suppressed_px
 
+    @staticmethod
+    def _axis_dedup_nearest_line_for_suppressed_pixel(row, col, line_iloc_by_px,
+                                                        max_radius=AXIS_DEDUP_DEADEND_SEARCH_RADIUS_PX):
+        """SPEC-GRAPH-DENSITY.md §6.3.1 Phase B: is a skeleton degree-1 dead end at
+        raster pixel (row, col) carve-induced -- adjacent to a pixel axis-dedup
+        actually suppressed -- or genuine? Returns the nearest such neighbor's
+        line_iloc (its responsible inland_waterways line), or None if (row, col) has
+        no suppressed neighbor within max_radius pixels (a genuine dead end, left to
+        the existing stitching passes, not this reconnect mechanism).
+        """
+        best, best_d2 = None, None
+        for r in range(row - max_radius, row + max_radius + 1):
+            for c in range(col - max_radius, col + max_radius + 1):
+                if (r, c) == (row, col):
+                    continue
+                line_iloc = line_iloc_by_px.get((r, c))
+                if line_iloc is None:
+                    continue
+                d2 = (r - row) ** 2 + (c - col) ** 2
+                if best_d2 is None or d2 < best_d2:
+                    best_d2, best = d2, line_iloc
+        return best
+
     def _axis_dedup_carve_navmesh_pieces(self, poly_m, utm_crs):
         """SPEC-OVERRIDE-ZONES.md §7 / follow-up to SPEC-GRAPH-DENSITY.md §4.3: apply
         the SAME axis-dedup suppression the skeleton path already does to a navmesh
@@ -4558,6 +4594,18 @@ class NauticalRoutingPipeline:
         G = self._skeleton_raster_to_graph(skel, dist, transform, utm, px)
         self._prune_skeleton_spurs(G, cfg.min_spur_length_m)
 
+        # SPEC-GRAPH-DENSITY.md §6.3.1 Phase B: G's own nodes are raw raster pixel
+        # tuples (row, col) -- recover that pixel identity per rounded lon/lat (the
+        # same 5-decimal rounding _get_or_create_node itself applies) so a degree-1
+        # dead end created below can be tested for carve-adjacency below without a
+        # second geometric search. Built once here (not per dead end) and only when
+        # this piece actually had any suppression at all.
+        pixel_by_lonlat: Dict[Tuple[float, float], Tuple[int, int]] = {}
+        if line_iloc_by_suppressed_px:
+            for p, data in G.nodes(data=True):
+                lon, lat = data["lonlat"]
+                pixel_by_lonlat[(round(lon, 5), round(lat, 5))] = p
+
         added = 0
         node_occurrences: Dict[int, int] = {}
         for _, _, d in G.edges(data=True):
@@ -4601,6 +4649,35 @@ class NauticalRoutingPipeline:
         for node_id, occurrences in node_occurrences.items():
             if occurrences == 1:
                 self.navmesh_seam_node_ids.add(node_id)
+
+        # SPEC-GRAPH-DENSITY.md §6.3.1 Phase B: among those SAME degree-1 dead ends,
+        # reconnect the ones the carve above actually created -- adjacent to a
+        # suppressed pixel -- to the specific inland_waterways line responsible,
+        # rather than leaving them to generic stitching passes alone (the Hansweert
+        # regression this spec section is named for: a carve-induced stub 178m from
+        # any axis line went unrecovered because nothing looked for it specifically).
+        # A genuine dead end (no suppressed neighbor) is untouched, left to those same
+        # existing passes exactly as before.
+        if line_iloc_by_suppressed_px:
+            line_m_cache: Dict[int, Tuple[list, np.ndarray]] = {}
+            for node_id, occurrences in node_occurrences.items():
+                if occurrences != 1:
+                    continue
+                lon = self.graph.nodes[node_id]["lon"]
+                lat = self.graph.nodes[node_id]["lat"]
+                p = pixel_by_lonlat.get((lon, lat))
+                if p is None:
+                    continue
+                row, col = p
+                line_iloc = self._axis_dedup_nearest_line_for_suppressed_pixel(
+                    row, col, line_iloc_by_suppressed_px)
+                if line_iloc is None:
+                    continue
+                x_m, y_m = transform * (col + 0.5, row + 0.5)
+                self.axis_dedup_reconnect_stats["skeleton_candidates"] += 1
+                self.axis_dedup_reconnect_stats["skeleton_edges"] += self._connect_waterway_crossing(
+                    node_id, line_iloc, utm, (x_m, y_m), line_m_cache)
+
         logger.debug(f"  skeleton polygon -> {added} centerline edges (px={px:.1f}m)")
 
 

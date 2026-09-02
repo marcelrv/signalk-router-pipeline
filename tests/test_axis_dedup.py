@@ -68,6 +68,23 @@ def _axis_line_wgs84(transform, row, col_lo=0, col_hi=COLS):
     return gpd.GeoSeries([line_utm], crs=UTM_CRS).to_crs("EPSG:4326").iloc[0]
 
 
+def _axis_line_ns_wgs84(transform, col, row_lo=0, row_hi=ROWS, step=2):
+    """A straight north-south line at pixel column `col`, spanning [row_lo, row_hi),
+    with a vertex every `step` rows -- densely vertexed like a real inland_waterways
+    line, so _connect_waterway_crossing's own nearest-vertex search stays well within
+    WATERWAY_CONNECTOR_MAX_M for any carve-induced dead end along it. Perpendicular
+    sibling of _axis_line_wgs84, used to sever an east-west _channel_mask into two
+    disconnected fragments -- the natural way to produce a carve-induced skeleton
+    dead end."""
+    x, _ = transform * (col + 0.5, 0)
+    pts = []
+    for r in np.arange(row_lo, row_hi + step, step):
+        _, y = transform * (col + 0.5, float(r) + 0.5)
+        pts.append((x, y))
+    line_utm = LineString(pts)
+    return gpd.GeoSeries([line_utm], crs=UTM_CRS).to_crs("EPSG:4326").iloc[0]
+
+
 def _polygon_wgs84_covering_raster(transform, rows=ROWS, cols=COLS):
     x0, y0 = transform * (0, 0)
     x1, y1 = transform * (cols, rows)
@@ -1011,3 +1028,157 @@ class TestAllZeroAxisRasterDoesNotPhantomSuppress:
 
         assert len(result) == 1
         assert result[0].equals(piece)
+
+
+class TestSkeletonCarveReconnect:
+    """SPEC-GRAPH-DENSITY.md §6.3 Phase B: a skeleton dead end created BY axis-dedup's
+    own carve -- adjacent to a suppressed pixel -- gets wired back to the SPECIFIC
+    inland_waterways line responsible, via the same `_connect_waterway_crossing`
+    Phase A (TestNavmeshCarveReconnect) already reuses. A genuine dead end (no nearby
+    suppression) is untouched, left to the existing stitching passes exactly as before.
+
+    Channel geometry note: severing a straight channel with a perpendicular line does
+    NOT reliably leave a clean single degree-1 node at the cut -- medial_axis's own
+    end-cap construction routinely produces a small degree-2/3 junction knot there
+    instead (confirmed directly across several channel heights), which this Phase's
+    occurrences==1 test (the SAME signal navmesh_seam_node_ids already relies on,
+    unchanged) correctly leaves untouched, same as a genuine dead end -- reconnecting
+    a knot would need different, junction-aware logic, out of this Phase's scope. The
+    7-row band below is one configuration confirmed (by direct inspection) to produce
+    a real, clean degree-1 dead end at the severed boundary, so it's used to exercise
+    the mechanism; it is not claimed that every carve produces one.
+    """
+
+    def _run_for_real(self, monkeypatch, pipeline, mask, transform, px):
+        """Monkeypatches ONLY _rasterize_water_polygon to a fixed synthetic
+        (mask, transform, px) -- everything downstream (real medial-axis extraction,
+        graph building, and the new reconnect pass) runs for real, unlike
+        TestDisabledByDefaultReproducesUnchangedSkeletonOutput's own _rig, which
+        short-circuits _extract_medial_axis_skeleton itself. First test coverage of
+        build_skeleton_network's reconnect logic (and _connect_waterway_crossing on
+        the skeleton path) end to end."""
+        polygon = _polygon_wgs84_covering_raster(transform)
+        monkeypatch.setattr(pipeline, "_rasterize_water_polygon",
+                             lambda *a, **kw: (mask, transform, px))
+        pipeline.build_skeleton_network(polygon)
+        return pipeline
+
+    @staticmethod
+    def _inland_node_coords(pipeline):
+        return {(d["lon"], d["lat"]) for _, d in pipeline.graph.nodes(data=True)
+                if d.get("node_type") == "inland"}
+
+    @staticmethod
+    def _severing_line(transform):
+        return _axis_line_ns_wgs84(transform, 100, row_lo=40, row_hi=60)
+
+    def test_disabled_by_default_no_reconnect(self, monkeypatch):
+        transform = _transform()
+        mask = _channel_mask(47, 53)  # 6-row (30m) band -- narrow enough for the skeleton path
+        pipeline = _pipeline(axis_dedup_cap_m=0.0)
+        pipeline.gdfs["inland_waterways"] = _inland_gdf(self._severing_line(transform))
+
+        self._run_for_real(monkeypatch, pipeline, mask, transform, PX_M)
+
+        assert pipeline.axis_dedup_reconnect_stats["skeleton_candidates"] == 0
+        assert pipeline.axis_dedup_reconnect_stats["skeleton_edges"] == 0
+        assert not self._inland_node_coords(pipeline)
+
+    def test_severed_channel_dead_end_reconnects_to_the_severing_line(self, monkeypatch):
+        # A north-south line through the middle of an east-west channel carves a gap
+        # around col=100 -- confirmed (see class docstring) to leave a clean
+        # carve-induced degree-1 dead end on the east fragment specifically, plus the
+        # channel's own two genuine far-edge (col=0 / col=199) dead ends untouched.
+        transform = _transform()
+        mask = _channel_mask(47, 53)
+        pipeline = _pipeline(axis_dedup_cap_m=50.0, axis_dedup_fraction=0.5, axis_dedup_floor_m=5.0)
+        line_wgs84 = self._severing_line(transform)
+        pipeline.gdfs["inland_waterways"] = _inland_gdf(line_wgs84)
+
+        self._run_for_real(monkeypatch, pipeline, mask, transform, PX_M)
+
+        assert pipeline.axis_dedup_reconnect_stats["skeleton_candidates"] > 0
+        assert pipeline.axis_dedup_reconnect_stats["skeleton_edges"] > 0
+
+        inland_coords = self._inland_node_coords(pipeline)
+        assert inland_coords, "expected at least one inland-type node from a reconnect"
+        line_vertex_coords = {(round(lon, 5), round(lat, 5)) for lon, lat in line_wgs84.coords}
+        assert inland_coords <= line_vertex_coords
+
+        # The channel's own genuine far-edge dead ends (lon extremes among "coastal"
+        # nodes) must NOT have picked up an inland neighbor -- the discrimination this
+        # Phase exists to make.
+        coastal = [(n, d) for n, d in pipeline.graph.nodes(data=True) if d.get("node_type") == "coastal"]
+        lons = sorted(d["lon"] for _, d in coastal)
+        for node_id, d in coastal:
+            if d["lon"] in (lons[0], lons[-1]):
+                neighbor_types = {pipeline.graph.nodes[m].get("node_type")
+                                   for m in list(pipeline.graph.successors(node_id))
+                                   + list(pipeline.graph.predecessors(node_id))}
+                assert "inland" not in neighbor_types
+
+    def test_no_inland_waterways_layer_leaves_dead_ends_untouched(self, monkeypatch):
+        # No axis line anywhere near this piece -- both of the channel's own ends are
+        # genuine dead ends; the reconnect pass (gated on real suppression having
+        # happened at all) must find nothing to do.
+        transform = _transform()
+        mask = _channel_mask(47, 53)
+        pipeline = _pipeline(axis_dedup_cap_m=50.0, axis_dedup_fraction=0.5, axis_dedup_floor_m=5.0)
+
+        self._run_for_real(monkeypatch, pipeline, mask, transform, PX_M)
+
+        assert pipeline.axis_dedup_reconnect_stats["skeleton_candidates"] == 0
+        assert pipeline.axis_dedup_reconnect_stats["skeleton_edges"] == 0
+        assert not self._inland_node_coords(pipeline)
+
+    def test_land_crossing_connector_is_rejected(self, monkeypatch):
+        transform = _transform()
+        mask = _channel_mask(47, 53)
+        pipeline = _pipeline(axis_dedup_cap_m=50.0, axis_dedup_fraction=0.5, axis_dedup_floor_m=5.0)
+        line_wgs84 = self._severing_line(transform)
+        pipeline.gdfs["inland_waterways"] = _inland_gdf(line_wgs84)
+        # A land polygon spanning the carve gap around col=100, across the channel's
+        # own row range -- intersects any straight connector from the severed dead end
+        # up to the line's own nearest vertex, without touching the channel elsewhere.
+        land_x0, land_y0 = transform * (90, 60)
+        land_x1, land_y1 = transform * (115, 40)
+        land_utm = box(min(land_x0, land_x1), min(land_y0, land_y1),
+                        max(land_x0, land_x1), max(land_y0, land_y1))
+        pipeline.gdfs["land"] = gpd.GeoDataFrame(
+            geometry=[gpd.GeoSeries([land_utm], crs=UTM_CRS).to_crs("EPSG:4326").iloc[0]], crs="EPSG:4326")
+
+        self._run_for_real(monkeypatch, pipeline, mask, transform, PX_M)
+
+        assert pipeline.axis_dedup_reconnect_stats["skeleton_candidates"] > 0
+        assert pipeline.axis_dedup_reconnect_stats["skeleton_edges"] == 0
+        # _connect_waterway_crossing creates the candidate inland node BEFORE its own
+        # _crosses_land check (matching Phase A's identical, unchanged behaviour) --
+        # rejection means no EDGE to it, not that the node never exists.
+        inland_nodes = [n for n, d in pipeline.graph.nodes(data=True) if d.get("node_type") == "inland"]
+        assert inland_nodes
+        for node_id in inland_nodes:
+            assert pipeline.graph.degree(node_id) == 0
+
+    def test_reconnect_targets_the_responsible_line_even_when_not_first_in_index_order(self, monkeypatch):
+        # A far-away decoy line placed FIRST (inland_waterways index 0) -- survives
+        # the coarse bbox+margin prefilter (its own row/col range overlaps this
+        # piece's extent) but never actually causes any suppression here. The REAL
+        # severing line is index 1. A naive re-enumeration of the (already
+        # bbox-subset) candidates, instead of using their true inland_waterways
+        # positional index, would silently misattribute this carve to index 0.
+        transform = _transform()
+        mask = _channel_mask(47, 53)
+        pipeline = _pipeline(axis_dedup_cap_m=50.0, axis_dedup_fraction=0.5, axis_dedup_floor_m=5.0)
+        decoy = _axis_line_wgs84(transform, 5, col_lo=0, col_hi=20)
+        line_wgs84 = self._severing_line(transform)
+        pipeline.gdfs["inland_waterways"] = _inland_gdf(decoy, line_wgs84)
+
+        self._run_for_real(monkeypatch, pipeline, mask, transform, PX_M)
+
+        assert pipeline.axis_dedup_reconnect_stats["skeleton_edges"] > 0
+        inland_coords = self._inland_node_coords(pipeline)
+        assert inland_coords
+        line_vertex_coords = {(round(lon, 5), round(lat, 5)) for lon, lat in line_wgs84.coords}
+        decoy_vertex_coords = {(round(lon, 5), round(lat, 5)) for lon, lat in decoy.coords}
+        assert inland_coords <= line_vertex_coords
+        assert not (inland_coords & decoy_vertex_coords)
