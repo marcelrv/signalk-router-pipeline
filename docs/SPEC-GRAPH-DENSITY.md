@@ -892,6 +892,27 @@ component count going into the coastal-connectivity stitching pass was identical
 builds (626), and gap-resolve success was essentially unchanged (238 → 243) — no
 connectivity lost, matching gate (c).
 
+#### 6.4.3 Follow-up (CodeRabbit, PR #17): bound the cap before it reaches `shapely.segmentize` — FIXED
+
+The original guard was `if cap_m <= 0.0: return inland_gdf`, matching `--sagitta-cap`/
+`--axis-dedup-cap`'s own (equally unguarded) disabled-check convention. CodeRabbit
+correctly flagged that this is not enough for this specific flag: `NaN` compares `False`
+against everything in Python, including `<= 0.0`, so it silently reaches
+`shapely.segmentize` and violates that function's own positive-finite contract; and
+unlike the suppression-tolerance/resampling caps elsewhere in this spec, a valid-but-tiny
+positive cap (a stray extra zero, or metres/km confusion) has no ceiling of its own --
+`shapely.segmentize` generates roughly `segment_length_m / cap_m` vertices per source
+segment, which on a real multi-kilometre `inland_waterways` line risks unbounded memory
+rather than a clear, fast error.
+
+Fixed by rejecting (not silently clamping or silently disabling, either of which would
+mask the mistake) any cap that is non-finite or below `INLAND_DENSIFY_MIN_SEGMENT_M`
+(1.0m) once the plain `<= 0.0`/empty-layer disabled-check has passed. Regression-tested
+in `tests/test_inland_densify.py` (`TestDensifyRejectsUnsafeCaps`): NaN, `+inf`, and a
+`1e-9` cap all raise `ValueError` instead of reaching `shapely.segmentize`; the floor
+value itself (1.0m) is still accepted; a negative cap keeps taking the pre-existing
+"disabled" path unchanged, since it never reaches the new check.
+
 ## 7. Risks
 
 - Long edges on straight reaches increase the chance a single edge spans a chart feature
