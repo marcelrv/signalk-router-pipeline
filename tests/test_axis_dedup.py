@@ -22,6 +22,7 @@ from nautical_routing_pipeline import (
     _candidates_by_bounds_static,
     _lonlat_margin_deg,
     WATERWAY_CONNECTOR_MAX_M,
+    WATERWAY_CROSSING_CAP_PER_LINE,
 )
 
 # A UTM zone-31N patch near Zeeland (3.7-3.75E, 51.44-51.45N) -- estimate_utm_crs()
@@ -1182,3 +1183,50 @@ class TestSkeletonCarveReconnect:
         decoy_vertex_coords = {(round(lon, 5), round(lat, 5)) for lon, lat in decoy.coords}
         assert inland_coords <= line_vertex_coords
         assert not (inland_coords & decoy_vertex_coords)
+
+
+class TestReconnectCandidatesAreCappedPerLine:
+    """SPEC-GRAPH-DENSITY.md §6.3 code-review follow-up: `_cap_reconnect_candidates_
+    per_line` is the single choke point both the navmesh (`build_navmesh_region`) and
+    skeleton (`build_skeleton_network`) carve-reconnect call sites route through --
+    mirrors the sanity cap `_inject_waterway_crossings` already enforces
+    (`WATERWAY_CROSSING_CAP_PER_LINE`) for the pre-existing crossing-injection
+    mechanism, so a carve boundary hugging one axis line for a whole channel's width
+    can't register an unbounded number of connectors against that one line.
+    """
+
+    def test_below_cap_is_unchanged(self):
+        candidates = [(i, 0, (float(i), 0.0)) for i in range(WATERWAY_CROSSING_CAP_PER_LINE)]
+        result = NauticalRoutingPipeline._cap_reconnect_candidates_per_line(candidates, "test piece")
+        assert result == candidates
+
+    def test_above_cap_truncates_to_exactly_the_cap_preserving_order(self):
+        n = WATERWAY_CROSSING_CAP_PER_LINE + 5
+        candidates = [(i, 0, (float(i), 0.0)) for i in range(n)]
+        result = NauticalRoutingPipeline._cap_reconnect_candidates_per_line(candidates, "test piece")
+        assert len(result) == WATERWAY_CROSSING_CAP_PER_LINE
+        assert result == candidates[:WATERWAY_CROSSING_CAP_PER_LINE]
+
+    def test_each_line_is_capped_independently(self):
+        # Two lines, each individually over the cap -- neither should starve the
+        # other; both should come out at exactly the cap, not share one global budget.
+        over = WATERWAY_CROSSING_CAP_PER_LINE + 3
+        candidates = ([(("a", i), 0, (float(i), 0.0)) for i in range(over)]
+                      + [(("b", i), 1, (float(i), 100.0)) for i in range(over)])
+        result = NauticalRoutingPipeline._cap_reconnect_candidates_per_line(candidates, "test piece")
+        line0 = [c for c in result if c[1] == 0]
+        line1 = [c for c in result if c[1] == 1]
+        assert len(line0) == WATERWAY_CROSSING_CAP_PER_LINE
+        assert len(line1) == WATERWAY_CROSSING_CAP_PER_LINE
+
+    def test_a_line_under_the_cap_is_untouched_by_a_neighbor_over_it(self):
+        over = WATERWAY_CROSSING_CAP_PER_LINE + 3
+        under = WATERWAY_CROSSING_CAP_PER_LINE - 1
+        candidates = ([(("a", i), 0, (float(i), 0.0)) for i in range(over)]
+                      + [(("b", i), 1, (float(i), 100.0)) for i in range(under)])
+        result = NauticalRoutingPipeline._cap_reconnect_candidates_per_line(candidates, "test piece")
+        line1 = [c for c in result if c[1] == 1]
+        assert len(line1) == under  # unaffected by line 0's own overflow
+
+    def test_empty_input_returns_empty(self):
+        assert NauticalRoutingPipeline._cap_reconnect_candidates_per_line([], "test piece") == []
