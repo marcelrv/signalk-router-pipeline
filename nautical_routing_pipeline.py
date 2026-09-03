@@ -19,6 +19,7 @@ import networkx as nx
 import shapely
 from shapely.geometry import Point, LineString, Polygon, MultiPoint, MultiLineString, MultiPolygon, mapping, box
 from shapely.ops import triangulate, unary_union, polygonize
+from shapely.validation import make_valid
 from pyproj import Geod
 
 # Phase 0 navmesh-hybrid skeleton extraction (Step C). Hard deps per requirements.txt.
@@ -1596,8 +1597,41 @@ class NauticalRoutingPipeline:
         return [g for g in getattr(geom, "geoms", []) if isinstance(g, Polygon) and not g.is_empty]
 
     def _connected_water_polygons(self, coastal_gdf) -> List[Polygon]:
-        """unary_union the water areas and explode into connected single polygons."""
-        geoms = [g for g in coastal_gdf.geometry if g is not None and not g.is_empty]
+        """unary_union the water areas and explode into connected single polygons.
+
+        Self-intersecting input is repaired first. GEOS raises
+        `TopologyException: side location conflict` from unary_union when a ring
+        touches itself, and the whole build dies at the very first topology step
+        with no output. Measured on the real RWS source: 213 of 56,309
+        coastal_water polygons are invalid, and the union succeeds once they are
+        repaired. Only the offending geometries are rewritten -- make_valid is a
+        no-op on a valid polygon, and calling it unconditionally on all 56k would
+        both cost time and risk perturbing good geometry.
+
+        make_valid can return a line or a collection where the input was a
+        degenerate sliver, so the result is filtered back to polygonal parts;
+        _explode_polygonal does the same downstream for the union's own output.
+        """
+        geoms = []
+        repaired = 0
+        for g in coastal_gdf.geometry:
+            if g is None or g.is_empty:
+                continue
+            if not g.is_valid:
+                g = make_valid(g)
+                repaired += 1
+                if g is None or g.is_empty:
+                    continue
+                if not isinstance(g, (Polygon, MultiPolygon)):
+                    parts = [p for p in getattr(g, "geoms", [])
+                             if isinstance(p, (Polygon, MultiPolygon)) and not p.is_empty]
+                    if not parts:
+                        continue
+                    geoms.extend(parts)
+                    continue
+            geoms.append(g)
+        if repaired:
+            logger.info(f"  Repaired {repaired} invalid coastal_water polygons before union.")
         if not geoms:
             return []
         return self._explode_polygonal(unary_union(geoms))
