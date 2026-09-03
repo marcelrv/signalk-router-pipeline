@@ -487,6 +487,254 @@ connectivity (86.49% → 87.60%)**. So this weakness is costing connectivity in 
 database currently shipped, not only under resampling. Ungating it is a candidate
 follow-up, deliberately not taken here because it changes shipping output.
 
+### 6.3 Axis-dedup deletes topology instead of replacing it — reconnect to the axis line
+
+§4.3 shipped (PR #14, three CodeRabbit review rounds, merged) and is deployed. But two
+things it left unresolved both trace to the same root cause, discovered while trying to
+close the first:
+
+**The symptom.** Two nodes from the original motivating screenshot — one at a seam near
+marks KR11–14A, one on the Krammersluis approach (not inside the lock polygon; 117 m
+away) — remain unsuppressed after everything shipped in §4.3/§7. Both sit at an *exact*
+tie: `axis_dist_m == tol_m` (10.00 m and 12.25 m respectively), because both quantities
+are computed from the same pixel-quantized `distance_transform_edt` grid, so exact
+equality is systematic at these positions, not a rare coincidence. The comparison is
+strict `<`, so a tie means "not suppressed."
+
+**Why the obvious fix (`<=`) was rejected.** Measured on a real rebuild, not assumed:
+switching to `<=` did flip both tie nodes to suppressed, but it also raised suppression
+5.2%→5.7% dataset-wide and disconnected an unrelated 5-node stub near Hansweert — 178 m
+from *any* axis line, previously held onto the main component by a 3 m link — costing
+**138 POI-pairs**. Confirmed the causality by reverting and rebuilding again. A narrow
+cosmetic fix that costs 138 real pairs is the wrong trade, so `<=` was backed out and the
+tie left as a documented, accepted limitation (`tests/test_axis_dedup.py`).
+
+**The actual cause, and why it generalizes.** Axis-dedup carves the raster mask (or,
+after §7's navmesh extension, the piece polygon) *before* any topology is generated in
+that footprint. Nothing else happens — the pipeline just hopes the generic stitching
+passes (Pass 0–2, gap-resolve) rediscover a replacement connector for whatever got cut.
+Those passes search for the nearest *other graph node* within a radius, subject to a
+straight-line land-crossing check; they have no idea an authoritative axis line is
+sitting right there — the one thing that justified the carve in the first place. The
+Krammersluizen lock-crossing regression (§7's original finding, fixed by
+`_lock_protection_mask`) and the Hansweert regression above are the same failure mode
+twice: carving deletes a connector and nothing deliberately replaces it. `_lock_
+protection_mask` is a narrow, lock-specific patch for one instance of this; it does not
+generalize to Hansweert, or to the next case that hasn't been found yet.
+
+**The fix: connect carve-induced dead ends to the axis line, instead of leaving them to
+chance.** This is not a new mechanism to invent. `_connect_waterway_crossing` (used
+today only from `build_navmesh_region`'s waterway-crossing injection, `_inject_waterway_
+crossings` → `_connect_waterway_crossing`) already does almost exactly this: given a
+graph node, a candidate `inland_waterways` line (`line_iloc`), and a position, it finds
+the *nearest existing vertex* on that line — no edge-splitting, no new mid-line node —
+checks two already-tuned radii (`WATERWAY_CONNECTOR_MAX_M = 250.0`, fallback
+`WATERWAY_CONNECTOR_FALLBACK_MAX_M = 500.0`, both comfortably larger than `axis_dedup_
+cap_m`'s 50 m, so reuse can never be too restrictive), verifies `_crosses_land`, and
+wires a real edge. What's missing is a caller: nothing currently invokes it for a carve-
+induced dead end on either the skeleton or the navmesh path.
+
+#### 6.3.1 Design
+
+**Implemented** (Phases A–C, per §6.3.5's sequencing; D and E remain open). Two points
+below were corrected during implementation against what this section originally assumed
+— left visible rather than quietly fixed, since both were real gaps in the design as
+written, not just wording:
+
+1. **Identify carve-induced dead ends.** After skeleton extraction / navmesh
+   triangulation completes for a piece where axis-dedup fired, find degree-1 nodes whose
+   position sits close to the suppression mask's own boundary. **Correction**: "roughly
+   one pixel width" was wrong — measured directly, `medial_axis`'s own end-cap
+   construction routinely sets a fragment's centerline terminus back from the true carved
+   edge by several pixels (confirmed: 3px in one synthetic case), not one, so the shipped
+   search radius (`AXIS_DEDUP_DEADEND_SEARCH_RADIUS_PX = 4`) is wider than originally
+   assumed. Also confirmed empirically: severing a channel does not reliably leave a
+   *clean* degree-1 node at the cut at all — `medial_axis` often produces a small
+   degree-2/3 junction knot there instead. This design's `occurrences == 1` test (reusing
+   the exact signal `navmesh_seam_node_ids` already relies on, unchanged) correctly
+   leaves a knot untouched, the same as it leaves a genuine dead end untouched —
+   reconnecting a knot would need different, junction-aware logic, out of scope here. So
+   coverage is real but partial: not every carve-induced dead end resolves to a shape
+   this mechanism reconnects, only the ones that surface as an actual degree-1 node.
+2. **Identify the responsible line.** **Correction**: the carve step did *not* already
+   know this — every candidate line was burned into one undifferentiated raster value,
+   destroying per-line identity before the distance transform ran. Implemented the
+   "cheaper option" anyway, since it turned out cheap to add properly: burn each
+   candidate with its own `inland_waterways` positional index instead of a shared
+   constant, and add `return_indices=True` to the distance transform `_axis_dedup_
+   suppression_mask` already runs — the same computation scipy already performs, no
+   second pass — to get each suppressed pixel's nearest-line lookup for free.
+3. **Call `_connect_waterway_crossing`** with the dead end's node id, the responsible
+   `line_iloc`, and its metric-CRS position. No new connector logic — reused verbatim.
+4. **Wired into both carve sites**: the skeleton path (`build_skeleton_network`, after
+   `_axis_dedup_suppression_mask` carves) and the navmesh path (`_axis_dedup_carve_
+   navmesh_pieces`, §7), sharing one `line_m_cache` per piece with the navmesh path's
+   existing `_inject_waterway_crossings` connector where both fire on the same piece.
+
+#### 6.3.2 Bundled: the raster-padding gap (CodeRabbit, PR #14 round 4)
+
+Deferred out of PR #14 to land here, since it's the same suppression/carving mechanism
+and the two are easiest to verify together. `_rasterize_water_polygon`'s transform is
+built strictly from `poly_m.bounds` — no padding — so a candidate axis line lying outside
+a piece's own bounding box cannot be rasterized onto that piece's grid at all, *regardless
+of true distance*. The all-zero guard added while fixing the phantom-corner artifact
+(§4.3, round 3) correctly silences the genuinely-far-away case but also silently silences
+a second, different one: a real, nearby line that should suppress water right at a
+piece's boundary, just because it falls outside that piece's small raster footprint.
+Confirmed by CodeRabbit's own reproduction: a candidate 40 m north of a piece's edge, ~42.5 m
+from the nearest water cell, well inside the 50 m cap — silently skipped.
+
+Fix: pad the raster grid outward by `axis_dedup_cap_m` before rasterizing candidates and
+computing `axis_dist_m`, crop back to the piece's own `mask` shape before returning. Keep
+the all-zero guard only for the case where nothing survives even in the padded grid.
+
+This is a coverage gap, not a safety one — under-suppression can never disconnect
+anything, it only means some legitimate duplicate nodes near piece edges don't get
+removed. Bundling it here rather than blocking PR #14 on it was the right call; fixing it
+alongside reconnect means both raster-boundary questions (grid-edge and tie-boundary) get
+verified in the same rebuild pass instead of two separate ones.
+
+#### 6.3.3 Once reconnect is verified, two follow-on questions become answerable
+
+- **Revisit `<=`.** Reconnect is what makes flipping the tie-break safe: the reason `<=`
+  was rejected was that carving without replacement could strand a fragment, and Hansweert
+  is exactly that. With reconnect in place, re-run the identical `<=` experiment that
+  produced the 138-pair regression. If it now closes the tie with zero loss, take it; if
+  some residual loss remains, that means reconnect itself has a gap worth chasing before
+  touching the comparison operator again — do not re-flip `<=` until reconnect's own
+  gates are clean on `<` first.
+- **Test whether `_lock_protection_mask` is still needed.** Its entire reason to exist is
+  "carving deletes something and nothing reconnects it" — exactly the general problem
+  reconnect fixes. Once reconnect exists, remove the lock-specific carve-out and re-run
+  the exact reachability check that caught the original Krammersluizen regression
+  (§7 / PR #14). If it passes, `_lock_protection_mask` is redundant and should come out —
+  one less special case, and the general mechanism gets to be the only mechanism. If it
+  doesn't pass, keep the protection mask; `_add_lock_crossing_edges`'s quadrant search may
+  have geometric requirements (precise entry/exit points at the lock polygon boundary)
+  that a generic nearest-vertex reconnect doesn't automatically satisfy. Test, don't
+  assume either way.
+
+#### 6.3.4 Verification plan
+
+Same five-gate discipline as §4.3.3, plus checks specific to this change:
+
+- Gates 1–4 unchanged (inert at `axis_dedup_cap_m = 0`, `crosses_land = 0`, connectivity
+  by edge length non-regressing, POI-pair reachability zero-loss — id-keyed, see §6.1's
+  method note on duplicate POI names).
+- **The Hansweert stub must remain connected** under both `<` (already true today) and,
+  if §6.3.3's `<=` re-test is taken, under `<=` too — this is the specific case reconnect
+  exists to fix; verify it directly by node/coordinate, not only via the aggregate
+  reachability count.
+- **Both original tie-boundary nodes** (KR11–14A seam, Krammersluis approach) checked by
+  coordinate proximity post-rebuild, same as every prior round — confirm whichever of
+  §6.3.3's two paths is taken (reconnect alone under `<`, or reconnect + `<=`) actually
+  resolves them, not just that nothing else broke.
+- **Connector edges are geometrically sane**: spot-check a sample of newly-created
+  reconnect edges for length (should cluster well under `axis_dedup_cap_m` + local vertex
+  spacing, not at the 500 m fallback radius routinely) and confirm none cross land
+  (already enforced by reusing `_connect_waterway_crossing`, but verify the reuse didn't
+  bypass that check).
+- **The padding fix (§6.3.2)** closes CodeRabbit's specific reproduction case directly —
+  rebuild the exact fixture geometry (candidate 40 m outside a piece's north edge, 50 m
+  cap) and confirm suppression now fires there.
+- If §6.3.3's `_lock_protection_mask` removal is attempted: the removal is a
+  **conditional** change — ship it only if the Krammersluizen reachability check passes
+  with it removed; otherwise keep the mask and document why the general mechanism wasn't
+  sufficient there.
+
+#### 6.3.5 Phased implementation
+
+- **Phase A** ✅ — wire `_connect_waterway_crossing` into the navmesh carve path (§7),
+  since that path is where the connector mechanism already lives; smallest reuse
+  distance. Shipped: `_axis_dedup_suppression_mask` returns per-suppressed-pixel line
+  identity, `_axis_dedup_carve_navmesh_pieces` returns carve-boundary seam coords +
+  responsible line, `build_navmesh_region` reconnects them in a second pass sharing
+  `line_m_cache` with the existing waterway-crossing connector. 3 new tests
+  (`TestNavmeshCarveReconnect`).
+- **Phase B** ✅ — wire the same mechanism into the skeleton carve path
+  (`_axis_dedup_suppression_mask`'s caller in `build_skeleton_network`), which today has
+  no connection to this machinery at all. Shipped: reuses the existing `occurrences==1`
+  degree-1 tracking (unchanged), a new pixel-radius adjacency check
+  (`AXIS_DEDUP_DEADEND_SEARCH_RADIUS_PX = 4`, corrected up from an assumed ~1px — see
+  §6.3.1's correction). 5 new tests (`TestSkeletonCarveReconnect`), including one
+  documenting the degree-2/3 junction-knot limitation found during implementation.
+- **Phase C** ✅ — the raster-padding fix (§6.3.2), independent of A/B, landed first
+  (smallest, fully isolated change, verified alone before A/B built on top of it).
+- **Phase D** — re-test `<=` (§6.3.3, first bullet), only once A–C are verified clean on
+  `<` against a real rebuild (unit tests alone can't exercise this — see §6.3.4). Not
+  started.
+- **Phase E** — test removing `_lock_protection_mask` (§6.3.3, second bullet), only once
+  D is settled (removing a safety net while also changing the tie-break at the same time
+  would make a regression, if one appeared, ambiguous to attribute). Not started.
+
+#### 6.3.6 Follow-up (independent code review): per-line reconnect cap — FIXED
+
+An independent review of Phases A–C, run specifically to check whether this section's
+own reconnect mechanism could be contributing to §6.4's connector fan-out ("hub node")
+problem, found that neither carve-reconnect call site had an equivalent to
+`_inject_waterway_crossings`'s own `WATERWAY_CROSSING_CAP_PER_LINE = 8` sanity cap: a
+carve boundary running the length of one axis line (exactly the geometry axis-dedup
+produces) could attribute an unbounded number of perimeter/dead-end nodes to that same
+`line_iloc` within one piece, each getting its own connector edge. §6.4's own measured
+A/B (226→218 hubs, same max out-degree of 222 — see that section) shows this section's
+21,832 added `_connect_waterway_crossing` calls did not, in practice, worsen fan-out on
+the Zeeland pilot dataset, but the missing cap was a real, unbounded structural gap
+independent of that specific measurement, and the exact mechanism §6.4 root-causes the
+existing fan-out to.
+
+Fix: extracted the capping logic both `_inject_waterway_crossings` (pre-existing) and
+this section's two call sites need into one shared method,
+`_cap_reconnect_candidates_per_line` (reused, not duplicated, at both the navmesh and
+skeleton call sites — also resolves the review's duplicated-aggregation-block
+observation), applying the same `WATERWAY_CROSSING_CAP_PER_LINE` cap per (piece, line)
+to carve-reconnect candidates before connecting. 5 new tests
+(`TestReconnectCandidatesAreCappedPerLine`), plus the skeleton call site's own
+candidate collection was restructured into the same two-phase
+(collect-then-cap-then-connect) shape the navmesh call site already used, so both
+sites are now structurally identical, not just cap-equivalent. Full suite (148 tests)
+verified green after the change.
+
+#### 6.3.7 Follow-up (CodeRabbit, PR #16): carve attribution attrition through boundary
+simplification — MEASURED, not yet fixed
+
+CodeRabbit's review of PR #16 flagged that `build_navmesh_region`'s pre-existing
+boundary-simplify pass (`NAVMESH_BOUNDARY_SIMPLIFY_M = 5.0`, §6.3.1's own docstring
+already notes it runs "after the caller already computed seam_coord_set... because
+simplify() only ever removes vertices") runs on `poly_m` BEFORE the per-vertex match
+against `carve_line_iloc_by_coord` — so any carve-attributed vertex Douglas-Peucker
+removes is silently unavailable for reconnect at that node.
+
+**Measured, not assumed**, against two synthetic fixtures (a 2km piece carved by a
+through-line, and a stub-scale ~200m piece matching the real Hansweert stub's own
+magnitude): simplify removes **85–94% of carve-attributed vertices** (46→3 and 20→3
+survivors per fragment respectively). This is real, substantial attrition — CodeRabbit's
+concern is confirmed, not a false positive.
+
+**But not (in either tested case) total failure.** In both fixtures, exactly 3 vertices
+survive per fragment regardless of scale — structurally, these are the carve boundary's
+own genuine corners (where Douglas-Peucker's own guarantee — never drop a point whose
+removal would deviate the simplified line beyond tolerance — keeps it), which is also
+where a fragment's shape actually changes, i.e. where a dead end is most likely to sit
+in the first place. Neither test produced zero survivors.
+
+**Why this isn't a regression and isn't (yet) blocking**: the simplify-then-exact-match
+tradeoff is inherited from the PRE-EXISTING `seam_coord_set`/`boundary_node_ids`
+mechanism this section's own `carve_seam_coords` reuses verbatim (same docstring, same
+known limitation, unmodified by this PR — see §6.3.1). A carve vertex whose match is
+lost to simplify simply gets the SAME treatment every dead end got before this PR
+existed: left to the generic stitching passes. This is the same class of "coverage gap,
+not a safety gap" this spec section already accepts elsewhere (§6.3.1's degree-2/3 knot
+limitation, §6.3.2's original padding gap) — not proven to ever reach zero, but not
+proven never to, either, for a fragment shaped differently from the two tested here.
+
+**Proper fix (deferred, matches CodeRabbit's own "Heavy lift" tag)**: derive carve
+attribution from the FINALIZED (post-simplify) boundary instead of relying on exact
+pre-simplify vertex matches — e.g. nearest-line lookup per surviving vertex (mirroring
+the skeleton path's own `_axis_dedup_nearest_line_for_suppressed_pixel` radius search,
+rather than the navmesh path's current exact-coordinate dict lookup). Out of scope for
+this PR; track as a follow-on phase once a real rebuild's own reachability gates (§6.3.4)
+show whether the surviving-corner behavior measured here is sufficient in practice.
+
 ## 7. Risks
 
 - Long edges on straight reaches increase the chance a single edge spans a chart feature

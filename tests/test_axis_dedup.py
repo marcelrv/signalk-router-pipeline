@@ -14,13 +14,15 @@ until a build explicitly opts in via `--axis-dedup-cap`, exactly like `--sagitta
 import numpy as np
 import geopandas as gpd
 from rasterio.transform import from_origin
-from shapely.geometry import LineString, box
+from shapely.geometry import LineString, Point, box
 
 from nautical_routing_pipeline import (
     ClassificationConfig,
     NauticalRoutingPipeline,
     _candidates_by_bounds_static,
     _lonlat_margin_deg,
+    WATERWAY_CONNECTOR_MAX_M,
+    WATERWAY_CROSSING_CAP_PER_LINE,
 )
 
 # A UTM zone-31N patch near Zeeland (3.7-3.75E, 51.44-51.45N) -- estimate_utm_crs()
@@ -45,6 +47,10 @@ def _pipeline(axis_dedup_cap_m=50.0, axis_dedup_fraction=0.5, axis_dedup_floor_m
         axis_dedup_fraction=axis_dedup_fraction,
         axis_dedup_floor_m=axis_dedup_floor_m,
     )
+    # Normally set at the top of build_network(); tests that call node-creation
+    # methods (_get_or_create_node, build_navmesh_region, ...) directly, without
+    # going through build_network itself, need it initialized the same way.
+    p.coords_to_node = {}
     return p
 
 
@@ -60,6 +66,23 @@ def _axis_line_wgs84(transform, row, col_lo=0, col_hi=COLS):
     x0, y = transform * (col_lo + 0.5, row + 0.5)
     x1, _ = transform * (col_hi - 0.5, row + 0.5)
     line_utm = LineString([(x0, y), (x1, y)])
+    return gpd.GeoSeries([line_utm], crs=UTM_CRS).to_crs("EPSG:4326").iloc[0]
+
+
+def _axis_line_ns_wgs84(transform, col, row_lo=0, row_hi=ROWS, step=2):
+    """A straight north-south line at pixel column `col`, spanning [row_lo, row_hi),
+    with a vertex every `step` rows -- densely vertexed like a real inland_waterways
+    line, so _connect_waterway_crossing's own nearest-vertex search stays well within
+    WATERWAY_CONNECTOR_MAX_M for any carve-induced dead end along it. Perpendicular
+    sibling of _axis_line_wgs84, used to sever an east-west _channel_mask into two
+    disconnected fragments -- the natural way to produce a carve-induced skeleton
+    dead end."""
+    x, _ = transform * (col + 0.5, 0)
+    pts = []
+    for r in np.arange(row_lo, row_hi + step, step):
+        _, y = transform * (col + 0.5, float(r) + 0.5)
+        pts.append((x, y))
+    line_utm = LineString(pts)
     return gpd.GeoSeries([line_utm], crs=UTM_CRS).to_crs("EPSG:4326").iloc[0]
 
 
@@ -84,7 +107,7 @@ class TestCarvesWhenEnabled:
         pipeline.gdfs["inland_waterways"] = _inland_gdf(_axis_line_wgs84(transform, 49))
         polygon = _polygon_wgs84_covering_raster(transform)
 
-        suppress = pipeline._axis_dedup_suppression_mask(mask, transform, UTM_CRS, PX_M, polygon)
+        suppress, _ = pipeline._axis_dedup_suppression_mask(mask, transform, UTM_CRS, PX_M, polygon)
 
         assert suppress.shape == mask.shape
         assert suppress.dtype == bool
@@ -105,7 +128,7 @@ class TestCarvesWhenEnabled:
         pipeline.gdfs["inland_waterways"] = _inland_gdf(_axis_line_wgs84(transform, 49))
         polygon = _polygon_wgs84_covering_raster(transform)
 
-        suppress = pipeline._axis_dedup_suppression_mask(mask, transform, UTM_CRS, PX_M, polygon)
+        suppress, _ = pipeline._axis_dedup_suppression_mask(mask, transform, UTM_CRS, PX_M, polygon)
         carved = mask & ~suppress
 
         assert int(carved.sum()) < int(mask.sum())
@@ -122,7 +145,7 @@ class TestToleranceScalesWithLocalWidth:
         wide_pipeline = _pipeline(axis_dedup_cap_m=50.0, axis_dedup_fraction=0.5, axis_dedup_floor_m=5.0)
         wide_pipeline.gdfs["inland_waterways"] = _inland_gdf(_axis_line_wgs84(wide_transform, 49))
         wide_polygon = _polygon_wgs84_covering_raster(wide_transform)
-        wide_suppress = wide_pipeline._axis_dedup_suppression_mask(
+        wide_suppress, _ = wide_pipeline._axis_dedup_suppression_mask(
             wide_mask, wide_transform, UTM_CRS, PX_M, wide_polygon)
 
         # Narrow channel: 40m tall (rows 46:54) -> local width near the centre tops
@@ -133,7 +156,7 @@ class TestToleranceScalesWithLocalWidth:
         narrow_pipeline = _pipeline(axis_dedup_cap_m=50.0, axis_dedup_fraction=0.5, axis_dedup_floor_m=5.0)
         narrow_pipeline.gdfs["inland_waterways"] = _inland_gdf(_axis_line_wgs84(narrow_transform, 49))
         narrow_polygon = _polygon_wgs84_covering_raster(narrow_transform)
-        narrow_suppress = narrow_pipeline._axis_dedup_suppression_mask(
+        narrow_suppress, _ = narrow_pipeline._axis_dedup_suppression_mask(
             narrow_mask, narrow_transform, UTM_CRS, PX_M, narrow_polygon)
 
         # Right next to the axis, both are suppressed regardless of width.
@@ -165,7 +188,7 @@ class TestFloorIsRespected:
         pipeline.gdfs["inland_waterways"] = _inland_gdf(_axis_line_wgs84(transform, 49, col_hi=COLS))
         polygon = _polygon_wgs84_covering_raster(transform)
 
-        suppress = pipeline._axis_dedup_suppression_mask(mask, transform, UTM_CRS, px, polygon)
+        suppress, _ = pipeline._axis_dedup_suppression_mask(mask, transform, UTM_CRS, px, polygon)
 
         # Row 47 (band's top edge, on-mask): axis_dist=2m from the row-49 axis line.
         # Without the floor, tol there would be fraction*width=1m (2m > 1m -> NOT
@@ -190,7 +213,7 @@ class TestFloorIsRespected:
         pipeline.gdfs["inland_waterways"] = _inland_gdf(_axis_line_wgs84(transform, 49, col_hi=COLS))
         polygon = _polygon_wgs84_covering_raster(transform)
 
-        suppress = pipeline._axis_dedup_suppression_mask(mask, transform, UTM_CRS, px, polygon)
+        suppress, _ = pipeline._axis_dedup_suppression_mask(mask, transform, UTM_CRS, px, polygon)
 
         # Row 45 is off-mask (band is rows 47:53) but only 4m from the axis row --
         # well within the 5m floor's reach -- yet must not be suppressed.
@@ -210,7 +233,7 @@ class TestNoProximityLeavesMaskUntouched:
         pipeline.gdfs["inland_waterways"] = _inland_gdf(far_line)
         polygon = _polygon_wgs84_covering_raster(transform)
 
-        suppress = pipeline._axis_dedup_suppression_mask(mask, transform, UTM_CRS, PX_M, polygon)
+        suppress, _ = pipeline._axis_dedup_suppression_mask(mask, transform, UTM_CRS, PX_M, polygon)
 
         assert not suppress.any()
 
@@ -226,7 +249,7 @@ class TestNoProximityLeavesMaskUntouched:
         pipeline.gdfs["inland_waterways"] = _inland_gdf(_axis_line_wgs84(transform, 95))
         polygon = _polygon_wgs84_covering_raster(transform)
 
-        suppress = pipeline._axis_dedup_suppression_mask(mask, transform, UTM_CRS, PX_M, polygon)
+        suppress, _ = pipeline._axis_dedup_suppression_mask(mask, transform, UTM_CRS, PX_M, polygon)
 
         assert not (mask & suppress).any()
 
@@ -237,7 +260,7 @@ class TestNoProximityLeavesMaskUntouched:
         # pipeline.gdfs has no "inland_waterways" key at all (never loaded).
         polygon = _polygon_wgs84_covering_raster(transform)
 
-        suppress = pipeline._axis_dedup_suppression_mask(mask, transform, UTM_CRS, PX_M, polygon)
+        suppress, _ = pipeline._axis_dedup_suppression_mask(mask, transform, UTM_CRS, PX_M, polygon)
 
         assert not suppress.any()
 
@@ -248,7 +271,7 @@ class TestNoProximityLeavesMaskUntouched:
         pipeline.gdfs["inland_waterways"] = gpd.GeoDataFrame(geometry=[], crs="EPSG:4326")
         polygon = _polygon_wgs84_covering_raster(transform)
 
-        suppress = pipeline._axis_dedup_suppression_mask(mask, transform, UTM_CRS, PX_M, polygon)
+        suppress, _ = pipeline._axis_dedup_suppression_mask(mask, transform, UTM_CRS, PX_M, polygon)
 
         assert not suppress.any()
 
@@ -371,14 +394,14 @@ class TestLockPolygonsAreNeverSuppressed:
         pipeline.gdfs["locks"] = gpd.GeoDataFrame(
             geometry=[lock_poly_wgs84], data={"OBJNAM": ["Test Lock"]}, crs="EPSG:4326")
 
-        suppress_with_lock = pipeline._axis_dedup_suppression_mask(
+        suppress_with_lock, _ = pipeline._axis_dedup_suppression_mask(
             mask, transform, UTM_CRS, PX_M, polygon)
 
         # Without the lock layer, the same setup suppresses right on the axis (already
         # covered by TestCarvesWhenEnabled, re-asserted here as the control).
         pipeline_no_lock = _pipeline(axis_dedup_cap_m=50.0)
         pipeline_no_lock.gdfs["inland_waterways"] = _inland_gdf(_axis_line_wgs84(transform, 49))
-        suppress_without_lock = pipeline_no_lock._axis_dedup_suppression_mask(
+        suppress_without_lock, _ = pipeline_no_lock._axis_dedup_suppression_mask(
             mask, transform, UTM_CRS, PX_M, polygon)
 
         assert suppress_without_lock[49, 100]  # control: normally suppressed
@@ -410,7 +433,7 @@ class TestLockPolygonsAreNeverSuppressed:
         pipeline.gdfs["locks"] = gpd.GeoDataFrame(
             geometry=[lock_poly_wgs84], data={"OBJNAM": ["Test Lock"]}, crs="EPSG:4326")
 
-        suppress = pipeline._axis_dedup_suppression_mask(mask, transform, UTM_CRS, PX_M, polygon)
+        suppress, _ = pipeline._axis_dedup_suppression_mask(mask, transform, UTM_CRS, PX_M, polygon)
 
         # Column 100 sits inside the lock polygon's own column range (90:110): protected.
         assert not suppress[49, 100]
@@ -427,7 +450,7 @@ class TestLockPolygonsAreNeverSuppressed:
         polygon = _polygon_wgs84_covering_raster(transform)
         # pipeline.gdfs has no "locks" key at all.
 
-        suppress = pipeline._axis_dedup_suppression_mask(mask, transform, UTM_CRS, PX_M, polygon)
+        suppress, _ = pipeline._axis_dedup_suppression_mask(mask, transform, UTM_CRS, PX_M, polygon)
 
         assert suppress[49, 100]  # unaffected -- suppression proceeds normally
 
@@ -439,7 +462,7 @@ class TestLockPolygonsAreNeverSuppressed:
         pipeline.gdfs["locks"] = gpd.GeoDataFrame(geometry=[], crs="EPSG:4326")
         polygon = _polygon_wgs84_covering_raster(transform)
 
-        suppress = pipeline._axis_dedup_suppression_mask(mask, transform, UTM_CRS, PX_M, polygon)
+        suppress, _ = pipeline._axis_dedup_suppression_mask(mask, transform, UTM_CRS, PX_M, polygon)
 
         assert suppress[49, 100]
 
@@ -453,7 +476,7 @@ class TestLockPolygonsAreNeverSuppressed:
         pipeline.gdfs["locks"] = gpd.GeoDataFrame(
             geometry=[far_lock], data={"OBJNAM": ["Far Lock"]}, crs="EPSG:4326")
 
-        suppress = pipeline._axis_dedup_suppression_mask(mask, transform, UTM_CRS, PX_M, polygon)
+        suppress, _ = pipeline._axis_dedup_suppression_mask(mask, transform, UTM_CRS, PX_M, polygon)
 
         assert suppress[49, 100]  # unaffected by a lock nowhere near this piece
 
@@ -512,7 +535,7 @@ class TestBboxPrefilterMarginIsLatitudeAware:
             geometry=[lock_wgs84], data={"OBJNAM": ["Test Lock East"]}, crs="EPSG:4326")
         polygon = _polygon_wgs84_covering_raster(transform)
 
-        suppress = pipeline._axis_dedup_suppression_mask(mask, transform, UTM_CRS, PX_M, polygon)
+        suppress, _ = pipeline._axis_dedup_suppression_mask(mask, transform, UTM_CRS, PX_M, polygon)
 
         # The lock's 50m buffer reaches ~10m into the piece's east edge (last two
         # columns) -- protected, even though the axis line itself still runs the full
@@ -557,7 +580,7 @@ class TestNavmeshPieceCarving:
         line_wgs84 = self._wgs84(self._through_line_utm())
         pipeline.gdfs["inland_waterways"] = gpd.GeoDataFrame(geometry=[line_wgs84], crs="EPSG:4326")
 
-        result = pipeline._axis_dedup_carve_navmesh_pieces(piece, self.NAVMESH_UTM_CRS)
+        result, _, _ = pipeline._axis_dedup_carve_navmesh_pieces(piece, self.NAVMESH_UTM_CRS)
 
         assert len(result) == 1
         assert result[0].equals(piece)
@@ -571,7 +594,7 @@ class TestNavmeshPieceCarving:
             raise AssertionError("_rasterize_water_polygon must not be called with no candidates nearby")
         monkeypatch.setattr(pipeline, "_rasterize_water_polygon", _fail_if_called)
 
-        result = pipeline._axis_dedup_carve_navmesh_pieces(piece, self.NAVMESH_UTM_CRS)
+        result, _, _ = pipeline._axis_dedup_carve_navmesh_pieces(piece, self.NAVMESH_UTM_CRS)
 
         assert len(result) == 1
         assert result[0].equals(piece)
@@ -586,7 +609,7 @@ class TestNavmeshPieceCarving:
             raise AssertionError("_rasterize_water_polygon must not be called -- bbox prefilter should reject this")
         monkeypatch.setattr(pipeline, "_rasterize_water_polygon", _fail_if_called)
 
-        result = pipeline._axis_dedup_carve_navmesh_pieces(piece, self.NAVMESH_UTM_CRS)
+        result, _, _ = pipeline._axis_dedup_carve_navmesh_pieces(piece, self.NAVMESH_UTM_CRS)
 
         assert len(result) == 1
         assert result[0].equals(piece)
@@ -597,7 +620,7 @@ class TestNavmeshPieceCarving:
         line_wgs84 = self._wgs84(self._through_line_utm())
         pipeline.gdfs["inland_waterways"] = gpd.GeoDataFrame(geometry=[line_wgs84], crs="EPSG:4326")
 
-        result = pipeline._axis_dedup_carve_navmesh_pieces(piece, self.NAVMESH_UTM_CRS)
+        result, _, _ = pipeline._axis_dedup_carve_navmesh_pieces(piece, self.NAVMESH_UTM_CRS)
 
         # The ~100m-wide suppressed band down the middle splits the 1km-tall piece
         # into two fragments -- no water silently dropped, both halves preserved as
@@ -616,22 +639,27 @@ class TestNavmeshPieceCarving:
     def test_no_suppression_when_line_is_outside_true_tolerance_but_inside_bbox_margin(self):
         # A line whose bbox falls within the piece's own bbox+margin (so it survives
         # the cheap prefilter and rasterization does happen), but that never actually
-        # comes within any pixel's real per-pixel tolerance -- e.g. running just
-        # outside the piece entirely, offset far enough north that no water pixel is
-        # ever within the cap. Confirms the prefilter is only a cheap first pass, not
-        # the actual suppression decision.
+        # comes within any pixel's real per-pixel tolerance. Confirms the prefilter is
+        # only a cheap first pass, not the actual suppression decision.
         #
         # CodeRabbit PR #14 review round 3 finding 2: the original version of this test
         # placed the line 400m north of the piece's own north edge (y=5701000) against a
         # 50m cap -- outside even the bbox+margin prefilter, so it never actually
-        # exercised "candidates non-empty, real suppression still empty" at all; it was
-        # silently exercising the SAME prefilter-rejects-it path other tests already
-        # cover. Moved to 40m north (inside the 50m margin, survives the prefilter, but
-        # still nowhere near any real pixel's tolerance) -- and the candidates-non-empty
-        # claim is now verified directly below, not just asserted in a comment.
+        # exercised "candidates non-empty, real suppression still empty" at all.
+        #
+        # SPEC-GRAPH-DENSITY.md §6.3.2: a later version placed the line 40m due north of
+        # the piece's north edge -- but once the padding fix landed (rasterizing onto a
+        # grid padded by the cap, not just the piece's own unpadded grid), a line 40m
+        # north IS now correctly within the 50m cap of the piece's own edge pixels and
+        # gets carved -- see TestAllZeroAxisRasterDoesNotPhantomSuppress's sibling case
+        # for that scenario. This test now needs a placement the *rectangular*
+        # bbox+margin prefilter accepts (survives on x AND y margin independently) but
+        # whose true Euclidean distance from the piece's own nearest corner exceeds the
+        # cap -- i.e. diagonally past the NE corner by (45m, 45m), each axis within the
+        # ~50m margin/pad reach, but Euclidean distance sqrt(45^2+45^2)=~63.6m > 50m cap.
         pipeline = _pipeline(axis_dedup_cap_m=50.0)
         piece = self._wide_piece()
-        far_but_bbox_overlapping = LineString([(500500.0, 5701040.0), (501500.0, 5701040.0)])
+        far_but_bbox_overlapping = LineString([(502045.0, 5701045.0), (502545.0, 5701045.0)])
         line_wgs84 = self._wgs84(far_but_bbox_overlapping)
         pipeline.gdfs["inland_waterways"] = gpd.GeoDataFrame(geometry=[line_wgs84], crs="EPSG:4326")
 
@@ -643,7 +671,7 @@ class TestNavmeshPieceCarving:
                                                    margin=margin_lat_deg, margin_lon=margin_lon_deg)
         assert len(candidates) == 1, "test setup bug: the line must survive the bbox prefilter"
 
-        result = pipeline._axis_dedup_carve_navmesh_pieces(piece, self.NAVMESH_UTM_CRS)
+        result, _, _ = pipeline._axis_dedup_carve_navmesh_pieces(piece, self.NAVMESH_UTM_CRS)
 
         assert len(result) == 1
         assert result[0].equals(piece)
@@ -659,9 +687,149 @@ class TestNavmeshPieceCarving:
         line_wgs84 = self._wgs84(LineString([(499900.0, 5700004.0), (500160.0, 5700004.0)]))
         pipeline.gdfs["inland_waterways"] = gpd.GeoDataFrame(geometry=[line_wgs84], crs="EPSG:4326")
 
-        result = pipeline._axis_dedup_carve_navmesh_pieces(tiny_piece, self.NAVMESH_UTM_CRS)
+        result, _, _ = pipeline._axis_dedup_carve_navmesh_pieces(tiny_piece, self.NAVMESH_UTM_CRS)
 
         assert result == []
+
+
+class TestNavmeshCarveReconnect:
+    """SPEC-GRAPH-DENSITY.md §6.3 Phase A: a navmesh fragment's carve-boundary
+    perimeter node -- created because axis-dedup's carve cut the piece there -- gets
+    wired back to the SPECIFIC inland_waterways line responsible for that carve, via
+    the same `_connect_waterway_crossing` `_inject_waterway_crossings` already uses.
+    First-ever test coverage of `_connect_waterway_crossing`/`build_navmesh_region`
+    (per the code exploration behind this feature: neither had any test before).
+    """
+
+    NAVMESH_UTM_CRS = TestNavmeshPieceCarving.NAVMESH_UTM_CRS
+
+    @staticmethod
+    def _wgs84(geom_utm):
+        return TestNavmeshPieceCarving._wgs84(geom_utm, TestNavmeshCarveReconnect.NAVMESH_UTM_CRS)
+
+    @staticmethod
+    def _dense_through_line_utm(y=5700500.0, x_lo=499937.0, x_hi=502113.0, step=113.0):
+        # A vertex every ~113m along the same straight path TestNavmeshPieceCarving's
+        # own _through_line_utm uses (geometrically identical -- suppression only
+        # depends on distance to the line, unaffected by extra collinear vertices) --
+        # but _connect_waterway_crossing snaps to the line's NEAREST VERTEX, and the
+        # bare 2-vertex version (endpoints ~1100m from the piece's own centre) would
+        # exceed even WATERWAY_CONNECTOR_FALLBACK_MAX_M (500m) for most carve-boundary
+        # nodes. Real inland_waterways lines are densely vertexed; this matches that.
+        # Deliberately off-round (137/113, not 100) so no vertex lands exactly on
+        # _wide_piece's own edges (x=500000/502000) -- an exact coincidence there
+        # would make a genuine new "inland" node and an existing carve-boundary
+        # perimeter node collide at the same rounded coordinate (_get_or_create_node
+        # is a global coordinate cache regardless of node_type), merging the two and
+        # making a plain ring-boundary edge look like a spurious long "connector".
+        xs = np.arange(x_lo, x_hi + step, step)
+        return LineString([(float(x), y) for x in xs])
+
+    @staticmethod
+    def _inland_node_coords(pipeline):
+        return {(d["lon"], d["lat"]) for _, d in pipeline.graph.nodes(data=True)
+                if d.get("node_type") == "inland"}
+
+    def test_carved_dead_end_reconnects_to_a_vertex_on_the_responsible_line(self):
+        pipeline = _pipeline(axis_dedup_cap_m=50.0, axis_dedup_fraction=0.5, axis_dedup_floor_m=5.0)
+        piece = TestNavmeshPieceCarving()._wide_piece()
+        line_utm = self._dense_through_line_utm()
+        pipeline.gdfs["inland_waterways"] = gpd.GeoDataFrame(geometry=[self._wgs84(line_utm)], crs="EPSG:4326")
+
+        pieces, seam_coords, line_iloc_by_coord = pipeline._axis_dedup_carve_navmesh_pieces(
+            piece, self.NAVMESH_UTM_CRS)
+        assert len(pieces) == 2  # same fragmentation as the plain-carve test
+        assert line_iloc_by_coord  # the carve boundary really did attribute a line
+        assert set(line_iloc_by_coord.values()) == {0}  # only one candidate -> index 0
+
+        for p in pieces:
+            pipeline.build_navmesh_region(p, self.NAVMESH_UTM_CRS, set(),
+                                           carve_line_iloc_by_coord=line_iloc_by_coord)
+
+        assert pipeline.axis_dedup_reconnect_stats["navmesh_candidates"] > 0
+        assert pipeline.axis_dedup_reconnect_stats["navmesh_edges"] > 0
+
+        inland_coords = self._inland_node_coords(pipeline)
+        assert inland_coords, "expected at least one inland-type node from a reconnect"
+        line_vertex_coords = {(round(lon, 5), round(lat, 5)) for lon, lat in self._wgs84(line_utm).coords}
+        assert inland_coords <= line_vertex_coords
+
+        # Connector edge lengths stay well under WATERWAY_CONNECTOR_MAX_M for this
+        # fixture (the carve boundary sits ~50m -- the cap -- from the line, and the
+        # line has a vertex every 100m, so the nearest one is never far).
+        inland_nodes = {n: d for n, d in pipeline.graph.nodes(data=True) if d.get("node_type") == "inland"}
+        inland_pts_utm = gpd.GeoSeries(
+            [Point(d["lon"], d["lat"]) for d in inland_nodes.values()], crs="EPSG:4326"
+        ).to_crs(self.NAVMESH_UTM_CRS)
+        for (node_id, _), pt_utm in zip(inland_nodes.items(), inland_pts_utm):
+            for nbr in pipeline.graph.successors(node_id):
+                nbr_data = pipeline.graph.nodes[nbr]
+                nbr_pt_utm = gpd.GeoSeries([Point(nbr_data["lon"], nbr_data["lat"])],
+                                            crs="EPSG:4326").to_crs(self.NAVMESH_UTM_CRS).iloc[0]
+                assert pt_utm.distance(nbr_pt_utm) < WATERWAY_CONNECTOR_MAX_M
+
+    def test_reconnect_targets_the_responsible_line_even_when_not_first_in_index_order(self):
+        # Decoy candidate line placed FIRST (inland_waterways index 0): survives the
+        # coarse bbox+margin prefilter (same diagonal-past-the-NE-corner placement as
+        # TestNavmeshPieceCarving's own bbox-vs-true-tolerance test) but never actually
+        # causes any suppression, so it must never appear as a responsible line. The
+        # REAL through-line is index 1 -- the one that actually carves the piece. A
+        # naive re-enumeration of the (already bbox-subset) candidates, instead of
+        # using their true inland_waterways positional index, would silently
+        # misattribute this carve boundary to index 0 (the decoy) instead of index 1.
+        pipeline = _pipeline(axis_dedup_cap_m=50.0, axis_dedup_fraction=0.5, axis_dedup_floor_m=5.0)
+        piece = TestNavmeshPieceCarving()._wide_piece()
+        decoy_utm = LineString([(502045.0, 5701045.0), (502545.0, 5701045.0)])
+        line_utm = self._dense_through_line_utm()
+        pipeline.gdfs["inland_waterways"] = gpd.GeoDataFrame(
+            geometry=[self._wgs84(decoy_utm), self._wgs84(line_utm)], crs="EPSG:4326")
+
+        pieces, seam_coords, line_iloc_by_coord = pipeline._axis_dedup_carve_navmesh_pieces(
+            piece, self.NAVMESH_UTM_CRS)
+        assert line_iloc_by_coord
+        assert set(line_iloc_by_coord.values()) == {1}  # never the decoy (index 0)
+
+        for p in pieces:
+            pipeline.build_navmesh_region(p, self.NAVMESH_UTM_CRS, set(),
+                                           carve_line_iloc_by_coord=line_iloc_by_coord)
+
+        inland_coords = self._inland_node_coords(pipeline)
+        assert inland_coords
+        line_vertex_coords = {(round(lon, 5), round(lat, 5)) for lon, lat in self._wgs84(line_utm).coords}
+        decoy_vertex_coords = {(round(lon, 5), round(lat, 5)) for lon, lat in self._wgs84(decoy_utm).coords}
+        assert inland_coords <= line_vertex_coords
+        assert not (inland_coords & decoy_vertex_coords)
+
+    def test_land_crossing_connector_is_rejected(self):
+        # Bypasses _axis_dedup_carve_navmesh_pieces' own rasterize-with-land step
+        # (which would also subtract `land` from the carve's own water mask, muddying
+        # what this test targets) and instead exercises build_navmesh_region /
+        # _connect_waterway_crossing directly, the way the real caller would after a
+        # real carve: a hand-built south fragment whose north edge sits exactly on a
+        # carve boundary, with carve_line_iloc_by_coord naming its two corner nodes.
+        pipeline = _pipeline(axis_dedup_cap_m=50.0)
+        fragment = box(500000.0, 5700000.0, 502000.0, 5700450.0)
+        line_utm = self._dense_through_line_utm()  # vertices at y=5700500
+        pipeline.gdfs["inland_waterways"] = gpd.GeoDataFrame(geometry=[self._wgs84(line_utm)], crs="EPSG:4326")
+        # Spans the gap between the fragment's own north edge (y=5700450) and the axis
+        # line (y=5700500) -- intersects any straight connector from a north-edge node
+        # up to the line, without touching the fragment's own interior.
+        pipeline.gdfs["land"] = gpd.GeoDataFrame(
+            geometry=[self._wgs84(box(499900.0, 5700450.0, 502100.0, 5700500.0))], crs="EPSG:4326")
+        carve_line_iloc_by_coord = {(500000.0, 5700450.0): 0, (502000.0, 5700450.0): 0}
+
+        pipeline.build_navmesh_region(fragment, self.NAVMESH_UTM_CRS, set(),
+                                       carve_line_iloc_by_coord=carve_line_iloc_by_coord)
+
+        assert pipeline.axis_dedup_reconnect_stats["navmesh_candidates"] > 0
+        assert pipeline.axis_dedup_reconnect_stats["navmesh_edges"] == 0
+        # _connect_waterway_crossing creates the candidate inland node BEFORE its own
+        # _crosses_land check (matching _inject_waterway_crossings' existing, unchanged
+        # behaviour) -- rejection means no EDGE to it, not that the node never exists.
+        inland_nodes = [n for n, d in pipeline.graph.nodes(data=True) if d.get("node_type") == "inland"]
+        assert inland_nodes
+        for node_id in inland_nodes:
+            assert pipeline.graph.degree(node_id) == 0
 
 
 class TestToleranceBoundaryIsKnownButAcceptedNearMiss:
@@ -696,7 +864,7 @@ class TestToleranceBoundaryIsKnownButAcceptedNearMiss:
         pipeline.gdfs["inland_waterways"] = _inland_gdf(_axis_line_wgs84(transform, 41, col_hi=COLS))
         polygon = _polygon_wgs84_covering_raster(transform)
 
-        suppress = pipeline._axis_dedup_suppression_mask(mask, transform, UTM_CRS, px, polygon)
+        suppress, _ = pipeline._axis_dedup_suppression_mask(mask, transform, UTM_CRS, px, polygon)
 
         assert not suppress[40, 100]
 
@@ -711,7 +879,7 @@ class TestToleranceBoundaryIsKnownButAcceptedNearMiss:
         pipeline.gdfs["inland_waterways"] = _inland_gdf(_axis_line_wgs84(transform, 41, col_hi=COLS))
         polygon = _polygon_wgs84_covering_raster(transform)
 
-        suppress = pipeline._axis_dedup_suppression_mask(mask, transform, UTM_CRS, px, polygon)
+        suppress, _ = pipeline._axis_dedup_suppression_mask(mask, transform, UTM_CRS, px, polygon)
 
         assert suppress[41, 100]
 
@@ -727,7 +895,7 @@ class TestToleranceBoundaryIsKnownButAcceptedNearMiss:
         pipeline.gdfs["inland_waterways"] = _inland_gdf(_axis_line_wgs84(transform, 41, col_hi=COLS))
         polygon = _polygon_wgs84_covering_raster(transform)
 
-        suppress = pipeline._axis_dedup_suppression_mask(mask, transform, UTM_CRS, px, polygon)
+        suppress, _ = pipeline._axis_dedup_suppression_mask(mask, transform, UTM_CRS, px, polygon)
 
         assert not suppress[49, 100]
 
@@ -759,7 +927,7 @@ class TestMultiLineStringCandidatesAreExcluded:
         polygon = _polygon_wgs84_covering_raster(transform)
 
         with caplog.at_level(logging.WARNING, logger="nautical_routing_pipeline"):
-            suppress = pipeline._axis_dedup_suppression_mask(mask, transform, UTM_CRS, PX_M, polygon)
+            suppress, _ = pipeline._axis_dedup_suppression_mask(mask, transform, UTM_CRS, PX_M, polygon)
 
         assert not suppress.any()
         assert any("not LineString geometry" in r.message for r in caplog.records)
@@ -775,7 +943,7 @@ class TestMultiLineStringCandidatesAreExcluded:
         pipeline.gdfs["inland_waterways"] = gpd.GeoDataFrame(geometry=[mls_wgs84], crs="EPSG:4326")
 
         with caplog.at_level(logging.WARNING, logger="nautical_routing_pipeline"):
-            result = pipeline._axis_dedup_carve_navmesh_pieces(piece, TestNavmeshPieceCarving.NAVMESH_UTM_CRS)
+            result, _, _ = pipeline._axis_dedup_carve_navmesh_pieces(piece, TestNavmeshPieceCarving.NAVMESH_UTM_CRS)
 
         assert len(result) == 1
         assert result[0].equals(piece)
@@ -793,7 +961,7 @@ class TestMultiLineStringCandidatesAreExcluded:
         pipeline.gdfs["inland_waterways"] = gpd.GeoDataFrame(geometry=[good_line, bad_mls], crs="EPSG:4326")
         polygon = _polygon_wgs84_covering_raster(transform)
 
-        suppress = pipeline._axis_dedup_suppression_mask(mask, transform, UTM_CRS, PX_M, polygon)
+        suppress, _ = pipeline._axis_dedup_suppression_mask(mask, transform, UTM_CRS, PX_M, polygon)
 
         assert suppress[49, 100]
 
@@ -811,19 +979,254 @@ class TestAllZeroAxisRasterDoesNotPhantomSuppress:
     distances near that corner. Confirmed directly before this guard: a line 40m
     outside a piece's own raster footprint still wrongly carved a ~1900 sq m sliver at
     the piece's origin corner. Guarded with `if not axis_raster.any(): return zeros`.
+
+    SPEC-GRAPH-DENSITY.md §6.3.2: the guard above caught the phantom-corner artifact
+    but not the underlying miss it was papering over -- a candidate within the cap
+    margin of the piece's own bbox can have real geometry that never touches the
+    piece's OWN (unpadded) raster grid at all, even though it's genuinely within
+    tolerance of water pixels near the piece's edge. `_axis_dedup_suppression_mask`
+    now rasterizes onto a grid padded by `axis_dedup_cap_m` before this guard runs, so
+    a line 40m outside the piece's edge (within the 50m cap) is no longer silently
+    dropped -- it's the case exercised below.
     """
 
-    def test_line_entirely_outside_the_piece_grid_does_not_carve_a_corner_sliver(self):
+    def test_line_just_outside_the_piece_grid_but_within_the_cap_now_carves(self):
         piece = TestNavmeshPieceCarving()._wide_piece()  # box(500000,5700000,502000,5701000)
         # 40m north of the piece's own north edge (5701000) -- inside the 50m cap
-        # margin (survives the bbox prefilter) but never rasterizes onto this piece's
-        # own grid (entirely outside its real-world extent).
+        # margin (survives the bbox prefilter) and, since §6.3.2's padding fix, now
+        # also within the padded raster grid the carve rasterizes onto.
         line_utm = LineString([(500500.0, 5701040.0), (501500.0, 5701040.0)])
         line_wgs84 = gpd.GeoSeries([line_utm], crs=TestNavmeshPieceCarving.NAVMESH_UTM_CRS).to_crs("EPSG:4326").iloc[0]
         pipeline = _pipeline(axis_dedup_cap_m=50.0)
         pipeline.gdfs["inland_waterways"] = gpd.GeoDataFrame(geometry=[line_wgs84], crs="EPSG:4326")
 
-        result = pipeline._axis_dedup_carve_navmesh_pieces(piece, TestNavmeshPieceCarving.NAVMESH_UTM_CRS)
+        result, _, _ = pipeline._axis_dedup_carve_navmesh_pieces(piece, TestNavmeshPieceCarving.NAVMESH_UTM_CRS)
+
+        # The line is 40m from the piece's north edge -- within the 50m cap, so a strip
+        # along that edge is now carved away: real suppression, not a no-op, and not a
+        # spurious corner sliver (the whole north edge is affected, not just a corner).
+        assert len(result) == 1
+        assert result[0].area < piece.area
+        # Confirm this isn't the old phantom-corner artifact (~1900 sq m at one corner)
+        # but a real edge-wide carve along most of the piece's own north edge (~1000m
+        # long, ~10m deep -- 50m cap minus the 40m gap to the line -- ~10,000 sq m; a
+        # single-corner sliver could never reach this).
+        assert piece.area - result[0].area > 8000.0
+
+    def test_line_beyond_even_the_padded_cap_margin_does_not_carve_a_corner_sliver(self):
+        piece = TestNavmeshPieceCarving()._wide_piece()  # box(500000,5700000,502000,5701000)
+        # 40m north of the piece's own north edge is now reachable (padded grid, see
+        # above); push the line's bbox just far enough to still survive the +/-50m
+        # bbox+margin prefilter (a diagonal/L-shaped feature's bbox can reach in) while
+        # its actual geometry stays outside even the padded raster grid -- this must
+        # still return the original piece untouched, no phantom sliver anywhere.
+        line_utm = LineString([(500500.0, 5701049.0), (501500.0, 5701200.0)])
+        line_wgs84 = gpd.GeoSeries([line_utm], crs=TestNavmeshPieceCarving.NAVMESH_UTM_CRS).to_crs("EPSG:4326").iloc[0]
+        pipeline = _pipeline(axis_dedup_cap_m=50.0)
+        pipeline.gdfs["inland_waterways"] = gpd.GeoDataFrame(geometry=[line_wgs84], crs="EPSG:4326")
+
+        result, _, _ = pipeline._axis_dedup_carve_navmesh_pieces(piece, TestNavmeshPieceCarving.NAVMESH_UTM_CRS)
 
         assert len(result) == 1
         assert result[0].equals(piece)
+
+
+class TestSkeletonCarveReconnect:
+    """SPEC-GRAPH-DENSITY.md §6.3 Phase B: a skeleton dead end created BY axis-dedup's
+    own carve -- adjacent to a suppressed pixel -- gets wired back to the SPECIFIC
+    inland_waterways line responsible, via the same `_connect_waterway_crossing`
+    Phase A (TestNavmeshCarveReconnect) already reuses. A genuine dead end (no nearby
+    suppression) is untouched, left to the existing stitching passes exactly as before.
+
+    Channel geometry note: severing a straight channel with a perpendicular line does
+    NOT reliably leave a clean single degree-1 node at the cut -- medial_axis's own
+    end-cap construction routinely produces a small degree-2/3 junction knot there
+    instead (confirmed directly across several channel heights), which this Phase's
+    occurrences==1 test (the SAME signal navmesh_seam_node_ids already relies on,
+    unchanged) correctly leaves untouched, same as a genuine dead end -- reconnecting
+    a knot would need different, junction-aware logic, out of this Phase's scope. The
+    7-row band below is one configuration confirmed (by direct inspection) to produce
+    a real, clean degree-1 dead end at the severed boundary, so it's used to exercise
+    the mechanism; it is not claimed that every carve produces one.
+    """
+
+    def _run_for_real(self, monkeypatch, pipeline, mask, transform, px):
+        """Monkeypatches ONLY _rasterize_water_polygon to a fixed synthetic
+        (mask, transform, px) -- everything downstream (real medial-axis extraction,
+        graph building, and the new reconnect pass) runs for real, unlike
+        TestDisabledByDefaultReproducesUnchangedSkeletonOutput's own _rig, which
+        short-circuits _extract_medial_axis_skeleton itself. First test coverage of
+        build_skeleton_network's reconnect logic (and _connect_waterway_crossing on
+        the skeleton path) end to end."""
+        polygon = _polygon_wgs84_covering_raster(transform)
+        monkeypatch.setattr(pipeline, "_rasterize_water_polygon",
+                             lambda *a, **kw: (mask, transform, px))
+        pipeline.build_skeleton_network(polygon)
+        return pipeline
+
+    @staticmethod
+    def _inland_node_coords(pipeline):
+        return {(d["lon"], d["lat"]) for _, d in pipeline.graph.nodes(data=True)
+                if d.get("node_type") == "inland"}
+
+    @staticmethod
+    def _severing_line(transform):
+        return _axis_line_ns_wgs84(transform, 100, row_lo=40, row_hi=60)
+
+    def test_disabled_by_default_no_reconnect(self, monkeypatch):
+        transform = _transform()
+        mask = _channel_mask(47, 53)  # 6-row (30m) band -- narrow enough for the skeleton path
+        pipeline = _pipeline(axis_dedup_cap_m=0.0)
+        pipeline.gdfs["inland_waterways"] = _inland_gdf(self._severing_line(transform))
+
+        self._run_for_real(monkeypatch, pipeline, mask, transform, PX_M)
+
+        assert pipeline.axis_dedup_reconnect_stats["skeleton_candidates"] == 0
+        assert pipeline.axis_dedup_reconnect_stats["skeleton_edges"] == 0
+        assert not self._inland_node_coords(pipeline)
+
+    def test_severed_channel_dead_end_reconnects_to_the_severing_line(self, monkeypatch):
+        # A north-south line through the middle of an east-west channel carves a gap
+        # around col=100 -- confirmed (see class docstring) to leave a clean
+        # carve-induced degree-1 dead end on the east fragment specifically, plus the
+        # channel's own two genuine far-edge (col=0 / col=199) dead ends untouched.
+        transform = _transform()
+        mask = _channel_mask(47, 53)
+        pipeline = _pipeline(axis_dedup_cap_m=50.0, axis_dedup_fraction=0.5, axis_dedup_floor_m=5.0)
+        line_wgs84 = self._severing_line(transform)
+        pipeline.gdfs["inland_waterways"] = _inland_gdf(line_wgs84)
+
+        self._run_for_real(monkeypatch, pipeline, mask, transform, PX_M)
+
+        assert pipeline.axis_dedup_reconnect_stats["skeleton_candidates"] > 0
+        assert pipeline.axis_dedup_reconnect_stats["skeleton_edges"] > 0
+
+        inland_coords = self._inland_node_coords(pipeline)
+        assert inland_coords, "expected at least one inland-type node from a reconnect"
+        line_vertex_coords = {(round(lon, 5), round(lat, 5)) for lon, lat in line_wgs84.coords}
+        assert inland_coords <= line_vertex_coords
+
+        # The channel's own genuine far-edge dead ends (lon extremes among "coastal"
+        # nodes) must NOT have picked up an inland neighbor -- the discrimination this
+        # Phase exists to make.
+        coastal = [(n, d) for n, d in pipeline.graph.nodes(data=True) if d.get("node_type") == "coastal"]
+        lons = sorted(d["lon"] for _, d in coastal)
+        for node_id, d in coastal:
+            if d["lon"] in (lons[0], lons[-1]):
+                neighbor_types = {pipeline.graph.nodes[m].get("node_type")
+                                   for m in list(pipeline.graph.successors(node_id))
+                                   + list(pipeline.graph.predecessors(node_id))}
+                assert "inland" not in neighbor_types
+
+    def test_no_inland_waterways_layer_leaves_dead_ends_untouched(self, monkeypatch):
+        # No axis line anywhere near this piece -- both of the channel's own ends are
+        # genuine dead ends; the reconnect pass (gated on real suppression having
+        # happened at all) must find nothing to do.
+        transform = _transform()
+        mask = _channel_mask(47, 53)
+        pipeline = _pipeline(axis_dedup_cap_m=50.0, axis_dedup_fraction=0.5, axis_dedup_floor_m=5.0)
+
+        self._run_for_real(monkeypatch, pipeline, mask, transform, PX_M)
+
+        assert pipeline.axis_dedup_reconnect_stats["skeleton_candidates"] == 0
+        assert pipeline.axis_dedup_reconnect_stats["skeleton_edges"] == 0
+        assert not self._inland_node_coords(pipeline)
+
+    def test_land_crossing_connector_is_rejected(self, monkeypatch):
+        transform = _transform()
+        mask = _channel_mask(47, 53)
+        pipeline = _pipeline(axis_dedup_cap_m=50.0, axis_dedup_fraction=0.5, axis_dedup_floor_m=5.0)
+        line_wgs84 = self._severing_line(transform)
+        pipeline.gdfs["inland_waterways"] = _inland_gdf(line_wgs84)
+        # A land polygon spanning the carve gap around col=100, across the channel's
+        # own row range -- intersects any straight connector from the severed dead end
+        # up to the line's own nearest vertex, without touching the channel elsewhere.
+        land_x0, land_y0 = transform * (90, 60)
+        land_x1, land_y1 = transform * (115, 40)
+        land_utm = box(min(land_x0, land_x1), min(land_y0, land_y1),
+                        max(land_x0, land_x1), max(land_y0, land_y1))
+        pipeline.gdfs["land"] = gpd.GeoDataFrame(
+            geometry=[gpd.GeoSeries([land_utm], crs=UTM_CRS).to_crs("EPSG:4326").iloc[0]], crs="EPSG:4326")
+
+        self._run_for_real(monkeypatch, pipeline, mask, transform, PX_M)
+
+        assert pipeline.axis_dedup_reconnect_stats["skeleton_candidates"] > 0
+        assert pipeline.axis_dedup_reconnect_stats["skeleton_edges"] == 0
+        # _connect_waterway_crossing creates the candidate inland node BEFORE its own
+        # _crosses_land check (matching Phase A's identical, unchanged behaviour) --
+        # rejection means no EDGE to it, not that the node never exists.
+        inland_nodes = [n for n, d in pipeline.graph.nodes(data=True) if d.get("node_type") == "inland"]
+        assert inland_nodes
+        for node_id in inland_nodes:
+            assert pipeline.graph.degree(node_id) == 0
+
+    def test_reconnect_targets_the_responsible_line_even_when_not_first_in_index_order(self, monkeypatch):
+        # A far-away decoy line placed FIRST (inland_waterways index 0) -- survives
+        # the coarse bbox+margin prefilter (its own row/col range overlaps this
+        # piece's extent) but never actually causes any suppression here. The REAL
+        # severing line is index 1. A naive re-enumeration of the (already
+        # bbox-subset) candidates, instead of using their true inland_waterways
+        # positional index, would silently misattribute this carve to index 0.
+        transform = _transform()
+        mask = _channel_mask(47, 53)
+        pipeline = _pipeline(axis_dedup_cap_m=50.0, axis_dedup_fraction=0.5, axis_dedup_floor_m=5.0)
+        decoy = _axis_line_wgs84(transform, 5, col_lo=0, col_hi=20)
+        line_wgs84 = self._severing_line(transform)
+        pipeline.gdfs["inland_waterways"] = _inland_gdf(decoy, line_wgs84)
+
+        self._run_for_real(monkeypatch, pipeline, mask, transform, PX_M)
+
+        assert pipeline.axis_dedup_reconnect_stats["skeleton_edges"] > 0
+        inland_coords = self._inland_node_coords(pipeline)
+        assert inland_coords
+        line_vertex_coords = {(round(lon, 5), round(lat, 5)) for lon, lat in line_wgs84.coords}
+        decoy_vertex_coords = {(round(lon, 5), round(lat, 5)) for lon, lat in decoy.coords}
+        assert inland_coords <= line_vertex_coords
+        assert not (inland_coords & decoy_vertex_coords)
+
+
+class TestReconnectCandidatesAreCappedPerLine:
+    """SPEC-GRAPH-DENSITY.md §6.3 code-review follow-up: `_cap_reconnect_candidates_
+    per_line` is the single choke point both the navmesh (`build_navmesh_region`) and
+    skeleton (`build_skeleton_network`) carve-reconnect call sites route through --
+    mirrors the sanity cap `_inject_waterway_crossings` already enforces
+    (`WATERWAY_CROSSING_CAP_PER_LINE`) for the pre-existing crossing-injection
+    mechanism, so a carve boundary hugging one axis line for a whole channel's width
+    can't register an unbounded number of connectors against that one line.
+    """
+
+    def test_below_cap_is_unchanged(self):
+        candidates = [(i, 0, (float(i), 0.0)) for i in range(WATERWAY_CROSSING_CAP_PER_LINE)]
+        result = NauticalRoutingPipeline._cap_reconnect_candidates_per_line(candidates, "test piece")
+        assert result == candidates
+
+    def test_above_cap_truncates_to_exactly_the_cap_preserving_order(self):
+        n = WATERWAY_CROSSING_CAP_PER_LINE + 5
+        candidates = [(i, 0, (float(i), 0.0)) for i in range(n)]
+        result = NauticalRoutingPipeline._cap_reconnect_candidates_per_line(candidates, "test piece")
+        assert len(result) == WATERWAY_CROSSING_CAP_PER_LINE
+        assert result == candidates[:WATERWAY_CROSSING_CAP_PER_LINE]
+
+    def test_each_line_is_capped_independently(self):
+        # Two lines, each individually over the cap -- neither should starve the
+        # other; both should come out at exactly the cap, not share one global budget.
+        over = WATERWAY_CROSSING_CAP_PER_LINE + 3
+        candidates = ([(("a", i), 0, (float(i), 0.0)) for i in range(over)]
+                      + [(("b", i), 1, (float(i), 100.0)) for i in range(over)])
+        result = NauticalRoutingPipeline._cap_reconnect_candidates_per_line(candidates, "test piece")
+        line0 = [c for c in result if c[1] == 0]
+        line1 = [c for c in result if c[1] == 1]
+        assert len(line0) == WATERWAY_CROSSING_CAP_PER_LINE
+        assert len(line1) == WATERWAY_CROSSING_CAP_PER_LINE
+
+    def test_a_line_under_the_cap_is_untouched_by_a_neighbor_over_it(self):
+        over = WATERWAY_CROSSING_CAP_PER_LINE + 3
+        under = WATERWAY_CROSSING_CAP_PER_LINE - 1
+        candidates = ([(("a", i), 0, (float(i), 0.0)) for i in range(over)]
+                      + [(("b", i), 1, (float(i), 100.0)) for i in range(under)])
+        result = NauticalRoutingPipeline._cap_reconnect_candidates_per_line(candidates, "test piece")
+        line1 = [c for c in result if c[1] == 1]
+        assert len(line1) == under  # unaffected by line 0's own overflow
+
+    def test_empty_input_returns_empty(self):
+        assert NauticalRoutingPipeline._cap_reconnect_candidates_per_line([], "test piece") == []
