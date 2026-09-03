@@ -735,6 +735,163 @@ rather than the navmesh path's current exact-coordinate dict lookup). Out of sco
 this PR; track as a follow-on phase once a real rebuild's own reachability gates (§6.3.4)
 show whether the surviving-corner behavior measured here is sufficient in practice.
 
+### 6.4 Sparse `inland_waterways` digitization causes connector fan-out ("hub" nodes) — IMPLEMENTED
+
+**The symptom.** Rendered over OSM, the Zeeland graph shows large fan/star-shaped bursts
+of edges converging on single points, scattered across the whole province — not a local
+artifact. Found while sanity-checking §6.3's rebuild: the user's own words, correcting an
+initial (wrong) assumption that it was localized to one harbor entrance: *"I actually
+don't believe your explanation wrt this being an artifact of just the harbour entrance as
+I see it all over the map."* That correction was right — measured, not assumed, below.
+
+**Measurements.** A node's out-degree in a well-formed skeleton/navmesh graph should be
+2-4 (chain, or a real junction); anything much higher is a fan converging on one point.
+Counted directly against `zeeland.sqlite` snapshots taken at different points in this
+project's history:
+
+| snapshot | hub nodes (out-degree > 30) | max out-degree |
+|---|---|---|
+| `zeeland_pre_round23.sqlite.bak` (older baseline) | 0 | — |
+| `zeeland_pre_sagitta.sqlite.disabled` | 6 | 36 |
+| `zeeland_pre_rawenc.sqlite.disabled` (before a later raw-ENC source-data switch) | 32 | 63 |
+| `zeeland_pre_navmesh_dedup.sqlite.disabled` (axis-dedup skeleton-only, before the §7 navmesh extension) | 7 | 47 |
+| live `zeeland.sqlite` (current, post-raw-ENC-switch, pre-§6.3) | 226 | 222 |
+
+The 226 hubs are not clustered — grouping by 0.1°×0.1° cell, they span 23 distinct cells
+covering essentially the full extent (lon 3.3-4.4°E, lat 51.4-51.8°N), confirming the
+user's "all over the map" directly. For those 226 hub nodes' own edges: 16,598 are
+`edge_kind_id=1` (`navmesh_boundary` — i.e. waterway-connector edges) against only 101
+ordinary skeleton centerline edges. The single worst hub (`51.4335N, 3.4740E`,
+out-degree 222) has `source_id=14` (`inland_waterways`) and every one of its 220
+`coastal`-typed edges lands on a distinct neighbor within 500m — a textbook many-to-one
+connector collapse, not a real 222-way junction.
+
+**Root cause, traced to a specific source feature.** `_connect_waterway_crossing`
+(reused by both the pre-existing Round-14 `_inject_waterway_crossings` mechanism and by
+§6.3's reconnect) finds the *nearest existing vertex* on the target `inland_waterways`
+line and connects to that — deliberately, per its own design (no edge-splitting, no new
+mid-line node; see §6.3's own reuse of it). `_build_inland_network` is the same story on
+the ingestion side: it walks `coords[i] -> coords[i+1]` for each line with no length cap,
+so the line's own graph edges are exactly as sparse as its source vertices, however far
+apart. Both are fine assumptions for a densely-digitized line (a vertex every few
+metres); both break down for a sparsely-digitized one, where many genuinely different
+crossing/reconnect points within `WATERWAY_CONNECTOR_MAX_M`/`_FALLBACK_MAX_M` (250m/500m)
+of each other all resolve to the *same* one nearest vertex.
+
+Confirmed directly against the worst hub's own source feature: `inland_waterways_lines
+.geojson` index 2008, `OBJNAM="Geul van de Walvischstaart"` — an S-57/ENC-style feature
+(`RCID`, `OBJL=17051`, `SCAMIN=50000`, i.e. digitized for legibility starting at 1:50,000
+chart scale, not survey-grade density) — has **7 vertices over 8.8km**, with individual
+segments up to **1,870m** long. Every crossing or carve-boundary point within roughly a
+kilometre of that segment's midpoint has no better choice than that one distant vertex.
+
+**This predates axis-dedup/§6.3 and is not meaningfully changed by it.** The snapshot
+table above already shows the hub count climbing well before §6.3 existed (0 → 6 → 32),
+tracking a raw-ENC source-data switch, not axis-dedup. Confirmed directly with a clean
+A/B pair (identical input, identical flags, only `git` state differs): a control build at
+axis-dedup's own merge point (no §6.3) shows 226 hubs/max 222; a build from §6.3's own
+tip shows 218 hubs/max 222 — slightly *fewer*, not more, despite §6.3 adding 21,832 of
+its own `_connect_waterway_crossing` calls. (That's explained in §6.3's own verification:
+§6.3's reconnects mostly substitute for what the generic stitching passes used to do less
+precisely, rather than adding fan-out on top of it — see §6.3.4/PR discussion.) So this is
+a real, independent, pre-existing gap, not a regression introduced by §6.3, and not
+something §6.3's own scope can fix — its call site controls *when* to call
+`_connect_waterway_crossing`, not the sparse-vertex data the function snaps onto.
+
+**Design options considered**
+
+1. **Cap connectors per inland vertex.** Track a global (not per-piece, unlike the
+   existing `WATERWAY_CROSSING_CAP_PER_LINE = 8`, which only caps crossings within one
+   *(navmesh piece, line)* pair) counter and reject once a vertex is saturated.
+   Rejected: doesn't fix the underlying imprecision (a vessel would still logically route
+   to a point up to ~1km from where it actually needs to cross), and a hard reject where
+   today's fan-out at least connects *something* would be a **new**, silent connectivity
+   loss for whichever crossings lose the cap race — trading one problem for a worse one.
+2. **True edge-splitting at connect time** — insert a genuinely new vertex into the
+   `inland_waterways` line/graph at the point nearest each crossing, splitting the
+   existing edge, mirroring what `_inject_waterway_crossings` already does on the
+   *navmesh* side of the same connection. Most geometrically accurate. Rejected for now:
+   real added complexity (order-dependent splits as multiple crossings target the same
+   original edge, bookkeeping to keep `line_m_cache`/`inland_gdf` positional indices
+   consistent afterward) for a fix option (3) gets far more simply.
+3. **Densify sparse `inland_waterways` lines once, before anything reads them —
+   CHOSEN.** Insert interpolated vertices along any segment exceeding a threshold
+   (`shapely.segmentize(geom, max_segment_length)`, available since Shapely 2.0,
+   confirmed present in this project's venv at 2.1.2) so no segment exceeds it.
+   `_connect_waterway_crossing`'s own contract (snap to nearest *existing* vertex) stays
+   exactly as simple as it is today — densifying just makes that nearest-existing-vertex
+   assumption true again. Also directly fixes `_build_inland_network`'s own sparse-edge
+   problem (previously, "Geul van de Walvischstaart" was 6 graph edges up to 1,870m each
+   with zero intermediate routing nodes — a real routing-fidelity gap on its own,
+   independent of the connector fan-out).
+
+#### 6.4.1 Implementation
+
+`_densify_inland_waterways` runs once in `parse_shapefiles`, immediately after
+`inland_waterways` loads and before `_build_fairways_unified()`/`gdfs_metric` are built,
+so every downstream consumer (`_build_inland_network`, `_connect_waterway_crossing`,
+`_axis_dedup_suppression_mask`'s own candidate rasterization) sees the same
+already-dense geometry with zero changes to any of them:
+
+1. Reproject `inland_waterways` to `CRS_METRIC` (EPSG:3857, this project's existing
+   metric-CRS convention for `gdfs_metric`).
+2. `shapely.segmentize(geoms, inland_densify_max_segment_m)` — vectorized over the whole
+   layer.
+3. Reproject back to WGS84 and replace `self.gdfs["inland_waterways"]`.
+
+Gated behind `--inland-densify-max-segment-m`, default `0.0` = off, matching
+`--sagitta-cap`/`--axis-dedup-cap`'s convention — gate 1 (`--inland-densify-max-segment-m
+0` reproduces today's build byte-for-byte) holds by construction: the method returns its
+input GeoDataFrame unchanged (same object) whenever the cap is `<= 0.0` or the layer is
+empty. `ClassificationConfig.inland_densify_max_segment_m` carries the value through, the
+same pattern `max_chord_sagitta_m`/`axis_dedup_cap_m` already use.
+
+Unit-tested in `tests/test_inland_densify.py`: disabled is a no-op (same object
+identity); enabled inserts intermediate vertices and no output segment exceeds the cap
+(within CRS round-trip slack); endpoints and total length are preserved (`segmentize`
+only inserts vertices along existing segments — it never moves an original vertex,
+including the two endpoints); an empty layer and a stray non-`LineString` geometry don't
+raise; and an end-to-end check that `_build_inland_network` gains intermediate routing
+nodes on a synthetic sparse line once densified, versus zero when disabled.
+
+**Verify enabled, against a real build**: (a) the hub-node scan above drops toward 0 (not
+just "fewer"), (b) `_build_inland_network`'s own edge-length distribution loses its long
+tail, (c) the usual connectivity-by-edge-length and POI-pair reachability gates
+(§6.1/§6.3.4) show zero loss. A reasonable threshold is comfortably under
+`WATERWAY_CONNECTOR_MAX_M` (250m) — e.g. 100-150m, bounding worst-case nearest-vertex
+error to half that — but should be tuned against the measured segment-length
+distribution across the full `inland_waterways` layer, not just the one motivating
+feature, before picking a value for a shipped build.
+
+#### 6.4.2 Verified with a real A/B rebuild — the historical 226-hub number no longer
+reproduces, but the mechanism and fix are both confirmed independently
+
+**The live `zeeland.sqlite`'s 226 hubs (max degree 222) predate this session's fix for
+invalid source geometry** (`docs/`'s own PR #15, merged the day *after* that database was
+built — `_connected_water_polygons` now repairs invalid `coastal_water` polygons before
+the union instead of letting GEOS's `TopologyException` corrupt/skip them). Rebuilding the
+same Rijkswaterstaat source data at the same coverage bbox (`3.13334,51.21038,4.65,51.95`)
+against current `main` (which already includes that fix, plus §6.3's reconnect) reproduces
+the exact same worst-hub node id at (3.474, 51.434) — but at out-degree **2**, not 222: the
+geometry repair alone appears to have already resolved most of the historical hub count as
+a side effect, independent of this section's own fix.
+
+**So today's real baseline has far fewer hubs (5, all out-degree ≤ 33) than the historical
+measurement — and controlled experiment confirms those 5 are a *different* phenomenon**,
+not this section's: their inland-side crossing targets are already densely spaced (a
+same-line vertex ~35m away), so `--inland-densify-max-segment-m` correctly leaves them
+untouched (identical edge counts, both directions, with the flag on vs off). Right call by
+construction (nothing to densify there), just not the same bug.
+
+**The mechanism this section targets is still real and still measurably fixed**, at a
+smaller scale that matches today's already-partially-repaired baseline: of the 34
+inland-vertex nodes with ≥5 `navmesh_boundary` (edge_kind_id=1) out-edges in the control
+build, **31 dropped and only 1 rose** once `--inland-densify-max-segment-m 120` was
+enabled, summed degree across those 34 nodes falling **206 → 95** (54%). The starting
+component count going into the coastal-connectivity stitching pass was identical in both
+builds (626), and gap-resolve success was essentially unchanged (238 → 243) — no
+connectivity lost, matching gate (c).
+
 ## 7. Risks
 
 - Long edges on straight reaches increase the chance a single edge spans a chart feature
@@ -747,3 +904,10 @@ show whether the surviving-corner behavior measured here is sufficient in practi
 - Node ids are coordinate-derived (`_coord_to_id`), so any resampling change moves ids
   wholesale. Cross-database seam stitching matches on coordinates, so registry-backed
   builds must be rebuilt together, not mixed across the change.
+- §6.4's densified `inland_waterways` vertices also feed §4.3's axis-dedup carve
+  rasterization and §6.3's carve-reconnect (both read `self.gdfs["inland_waterways"]`
+  after `parse_shapefiles`), so enabling `--inland-densify-max-segment-m` alongside
+  `--axis-dedup-cap` changes the candidate-line rasterization at finer resolution than
+  before. Not expected to change carve *decisions* (segmentize doesn't move the line,
+  only adds vertices along it), but re-run §6.3.4's gates when enabling both together
+  rather than assuming independence.

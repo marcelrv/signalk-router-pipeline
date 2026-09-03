@@ -969,6 +969,16 @@ class ClassificationConfig:
     axis_dedup_cap_m: float = 0.0       # cap (m) on suppression distance from the axis; 0.0 = disabled
     axis_dedup_fraction: float = 0.5    # tolerance = clip(this * local channel width, floor, cap)
     axis_dedup_floor_m: float = 5.0     # never suppress below this -- sits under pixel_min_m's 2.0m raster floor
+    # SPEC-GRAPH-DENSITY.md §6.4: sparse inland_waterways digitization causes connector
+    # fan-out. A chart-scale ENC line (e.g. SCAMIN=50000) can have vertices 1000m+ apart;
+    # every crossing/carve-reconnect point within a ~1km radius of a sparse segment then
+    # snaps to that same one distant vertex (both _connect_waterway_crossing's nearest-
+    # existing-vertex search and _build_inland_network's raw vertex-to-vertex ingestion
+    # assume denser digitization than that). 0.0 (default) disables this entirely --
+    # parse_shapefiles leaves inland_waterways geometry byte-identical to today's,
+    # matching --sagitta-cap/--axis-dedup-cap's convention. Densifying makes the
+    # nearest-existing-vertex assumption true again instead of changing either consumer.
+    inland_densify_max_segment_m: float = 0.0  # max vertex spacing (m) after densifying; 0.0 = disabled
 
     def pixel_size_for(self, min_dimension_m: float) -> float:
         return float(np.clip(min_dimension_m / self.pixel_dim_divisor,
@@ -1204,7 +1214,8 @@ class NauticalRoutingPipeline:
                  navmesh_edge_m: float = NAVMESH_TARGET_EDGE_M,
                  sagitta_cap: float = 0.0,
                  max_segment_m: Optional[float] = None,
-                 axis_dedup_cap: float = 0.0):
+                 axis_dedup_cap: float = 0.0,
+                 inland_densify_max_segment_m: float = 0.0):
         self.data_paths = data_paths
         self.db_path = db_path
         self.country = country
@@ -1219,7 +1230,8 @@ class NauticalRoutingPipeline:
         self.dataset_version = dataset_version
         self.classification_config = ClassificationConfig(depth_ceiling_m=depth_ceiling,
                                                            max_chord_sagitta_m=sagitta_cap,
-                                                           axis_dedup_cap_m=axis_dedup_cap)
+                                                           axis_dedup_cap_m=axis_dedup_cap,
+                                                           inland_densify_max_segment_m=inland_densify_max_segment_m)
         if max_segment_m is not None:
             self.classification_config.max_segment_m = float(max_segment_m)
         self.geod = Geod(ellps="WGS84")
@@ -1341,6 +1353,8 @@ class NauticalRoutingPipeline:
             else:
                 logger.warning(f"File not found for '{layer_name}': {path}. Using empty fallback.")
                 self.gdfs[layer_name] = gpd.GeoDataFrame(geometry=[], crs=self.CRS_WGS84)
+        if "inland_waterways" in self.gdfs:
+            self.gdfs["inland_waterways"] = self._densify_inland_waterways(self.gdfs["inland_waterways"])
         self._build_fairways_unified()
         self.gdfs_metric = {
             name: gdf.to_crs(self.CRS_METRIC) for name, gdf in self.gdfs.items()
@@ -1370,6 +1384,31 @@ class NauticalRoutingPipeline:
             gpd.GeoDataFrame(pd.concat(parts, ignore_index=True), crs=self.CRS_WGS84)
             if parts else gpd.GeoDataFrame(geometry=[], crs=self.CRS_WGS84)
         )
+
+    def _densify_inland_waterways(self, inland_gdf):
+        """SPEC-GRAPH-DENSITY.md §6.4: insert interpolated vertices along any
+        `inland_waterways` segment longer than `inland_densify_max_segment_m`, so no
+        segment exceeds it. Gated on the cap being > 0.0 -- disabled (default) leaves
+        `inland_gdf` untouched, byte-identical to today's build.
+
+        Runs once, here, before anything else reads the layer: `_build_inland_network`
+        (raw vertex-to-vertex ingestion) and `_connect_waterway_crossing`/axis-dedup's
+        own candidate rasterization (nearest-existing-vertex search) all then see the
+        same already-dense geometry with zero changes to any of them.
+
+        `shapely.segmentize` only inserts vertices along existing segments -- it never
+        moves an original vertex (including the two endpoints) and never changes the
+        line's shape, so this is length- and endpoint-preserving by construction.
+        """
+        cap_m = self.classification_config.inland_densify_max_segment_m
+        if cap_m <= 0.0 or inland_gdf.empty:
+            return inland_gdf
+        metric = inland_gdf.to_crs(self.CRS_METRIC)
+        densified_m = shapely.segmentize(metric.geometry.values, cap_m)
+        densified = gpd.GeoSeries(densified_m, index=inland_gdf.index, crs=self.CRS_METRIC).to_crs(self.CRS_WGS84)
+        out = inland_gdf.copy()
+        out["geometry"] = densified
+        return out
 
     def _build_obstacle_layer(self):
         logger.info("Building obstacle layer from restricted areas, hulks, obstructions...")
@@ -6334,6 +6373,17 @@ if __name__ == "__main__":
                              "byte -- build_skeleton_network never generates a redundant medial-axis "
                              "twin next to a channel the pipeline already ingested from the "
                              "inland_waterways source.")
+    parser.add_argument("--inland-densify-max-segment-m", type=float, default=0.0,
+                        help="Insert interpolated vertices into inland_waterways lines so no "
+                             "segment exceeds this length in metres (SPEC-GRAPH-DENSITY.md "
+                             "§6.4). A sparsely-digitized chart-scale line (vertices 1000m+ "
+                             "apart) makes _connect_waterway_crossing's nearest-existing-vertex "
+                             "search and _build_inland_network's raw ingestion collapse many "
+                             "distinct crossing points onto one distant vertex, producing "
+                             "fan/star-shaped 'hub' nodes. Default 0.0 DISABLES this entirely "
+                             "and leaves inland_waterways geometry byte-identical to today's. "
+                             "Recommended once enabled: 100-150m, comfortably under "
+                             "WATERWAY_CONNECTOR_MAX_M (250m).")
     parser.add_argument("--stitch-registry", nargs="?", const="data/seam_registry.sqlite", default="",
                         help="Enable Round 25 cross-database seam stitching (STITCHING_DESIGN.md "
                              "Section 3) against the shared global-node registry at this SQLite "
@@ -6396,5 +6446,6 @@ if __name__ == "__main__":
                                        navmesh_edge_m=args.navmesh_edge_m,
                                        sagitta_cap=args.sagitta_cap,
                                        max_segment_m=args.max_segment_m,
-                                       axis_dedup_cap=args.axis_dedup_cap)
+                                       axis_dedup_cap=args.axis_dedup_cap,
+                                       inland_densify_max_segment_m=args.inland_densify_max_segment_m)
     pipeline.run_pipeline()
