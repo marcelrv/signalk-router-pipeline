@@ -667,6 +667,33 @@ Same five-gate discipline as §4.3.3, plus checks specific to this change:
   D is settled (removing a safety net while also changing the tie-break at the same time
   would make a regression, if one appeared, ambiguous to attribute). Not started.
 
+#### 6.3.6 Follow-up (independent code review): per-line reconnect cap — FIXED
+
+An independent review of Phases A–C, run specifically to check whether this section's
+own reconnect mechanism could be contributing to §6.4's connector fan-out ("hub node")
+problem, found that neither carve-reconnect call site had an equivalent to
+`_inject_waterway_crossings`'s own `WATERWAY_CROSSING_CAP_PER_LINE = 8` sanity cap: a
+carve boundary running the length of one axis line (exactly the geometry axis-dedup
+produces) could attribute an unbounded number of perimeter/dead-end nodes to that same
+`line_iloc` within one piece, each getting its own connector edge. §6.4's own measured
+A/B (226→218 hubs, same max out-degree of 222 — see that section) shows this section's
+21,832 added `_connect_waterway_crossing` calls did not, in practice, worsen fan-out on
+the Zeeland pilot dataset, but the missing cap was a real, unbounded structural gap
+independent of that specific measurement, and the exact mechanism §6.4 root-causes the
+existing fan-out to.
+
+Fix: extracted the capping logic both `_inject_waterway_crossings` (pre-existing) and
+this section's two call sites need into one shared method,
+`_cap_reconnect_candidates_per_line` (reused, not duplicated, at both the navmesh and
+skeleton call sites — also resolves the review's duplicated-aggregation-block
+observation), applying the same `WATERWAY_CROSSING_CAP_PER_LINE` cap per (piece, line)
+to carve-reconnect candidates before connecting. 5 new tests
+(`TestReconnectCandidatesAreCappedPerLine`), plus the skeleton call site's own
+candidate collection was restructured into the same two-phase
+(collect-then-cap-then-connect) shape the navmesh call site already used, so both
+sites are now structurally identical, not just cap-equivalent. Full suite (148 tests)
+verified green after the change.
+
 ## 7. Risks
 
 - Long edges on straight reaches increase the chance a single edge spans a chart feature

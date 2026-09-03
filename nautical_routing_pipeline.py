@@ -2521,6 +2521,34 @@ class NauticalRoutingPipeline:
         self.graph.add_edge(inland_node_id, node_id, **attrs)
         return 2
 
+    @staticmethod
+    def _cap_reconnect_candidates_per_line(candidates, piece_label):
+        """SPEC-GRAPH-DENSITY.md §6.3: apply the same sanity cap
+        `_inject_waterway_crossings` enforces per (piece, line) (`WATERWAY_CROSSING_
+        CAP_PER_LINE`) to axis-dedup's own carve-reconnect candidates -- shared by
+        both the navmesh (`build_navmesh_region`) and skeleton (`build_skeleton_
+        network`) carve-reconnect call sites. A carve boundary can hug one axis line
+        for the width of a whole channel, attributing many perimeter/dead-end nodes
+        to the same `line_iloc` within one piece; without this cap, that geometry --
+        not real crossing multiplicity -- decides the connector count.
+
+        `candidates`: iterable of `(node_id, line_iloc, xy_m)`, in the order found.
+        Returns the same tuples, order preserved, truncated to at most
+        `WATERWAY_CROSSING_CAP_PER_LINE` per distinct `line_iloc`.
+        """
+        by_line: Dict[int, list] = defaultdict(list)
+        for candidate in candidates:
+            by_line[candidate[1]].append(candidate)
+        capped = []
+        for line_iloc, group in by_line.items():
+            if len(group) > WATERWAY_CROSSING_CAP_PER_LINE:
+                logger.info(f"  Axis-dedup reconnect cap: inland_waterways row {line_iloc} has "
+                            f"{len(group)} carve-induced dead ends on one {piece_label}; capping to "
+                            f"{WATERWAY_CROSSING_CAP_PER_LINE}.")
+                group = group[:WATERWAY_CROSSING_CAP_PER_LINE]
+            capped.extend(group)
+        return capped
+
     def build_navmesh_region(self, poly_m, utm_crs, seam_coord_set,
                              source_tier=DEFAULT_SOURCE_TIER, source_id=None,
                              carve_line_iloc_by_coord=None):
@@ -2691,7 +2719,8 @@ class NauticalRoutingPipeline:
         if carve_connect_candidates:
             connected_node_ids = set()
             edges_added = 0
-            for node_id, line_iloc, xy_m in carve_connect_candidates:
+            capped = self._cap_reconnect_candidates_per_line(carve_connect_candidates, "navmesh piece")
+            for node_id, line_iloc, xy_m in capped:
                 connected_node_ids.add(node_id)
                 edges_added += self._connect_waterway_crossing(node_id, line_iloc, utm_crs, xy_m, line_m_cache)
             if connected_node_ids:
@@ -4660,6 +4689,7 @@ class NauticalRoutingPipeline:
         # existing passes exactly as before.
         if line_iloc_by_suppressed_px:
             line_m_cache: Dict[int, Tuple[list, np.ndarray]] = {}
+            dead_end_candidates = []
             for node_id, occurrences in node_occurrences.items():
                 if occurrences != 1:
                     continue
@@ -4674,9 +4704,13 @@ class NauticalRoutingPipeline:
                 if line_iloc is None:
                     continue
                 x_m, y_m = transform * (col + 0.5, row + 0.5)
+                dead_end_candidates.append((node_id, line_iloc, (x_m, y_m)))
+
+            capped = self._cap_reconnect_candidates_per_line(dead_end_candidates, "skeleton piece")
+            for node_id, line_iloc, xy_m in capped:
                 self.axis_dedup_reconnect_stats["skeleton_candidates"] += 1
                 self.axis_dedup_reconnect_stats["skeleton_edges"] += self._connect_waterway_crossing(
-                    node_id, line_iloc, utm, (x_m, y_m), line_m_cache)
+                    node_id, line_iloc, utm, xy_m, line_m_cache)
 
         logger.debug(f"  skeleton polygon -> {added} centerline edges (px={px:.1f}m)")
 
