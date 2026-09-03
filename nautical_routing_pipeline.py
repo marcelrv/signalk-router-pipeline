@@ -752,6 +752,14 @@ WATERWAY_CROSSING_CAP_PER_LINE = 8     # sanity cap per (navmesh piece, line) --
 WATERWAY_CONNECTOR_MAX_M = 250.0       # normal connector search radius to the nearest inland vertex
 WATERWAY_CONNECTOR_FALLBACK_MAX_M = 500.0  # widened radius for sparsely-digitized lines (logged)
 
+# SPEC-GRAPH-DENSITY.md §6.4: floor for --inland-densify-max-segment-m. shapely.segmentize
+# generates roughly (segment_length / cap) vertices per source segment with no cap of its
+# own -- a mistyped sub-metre value (or NaN/inf slipping past a bare `<= 0.0` check) on an
+# 8km+ real inland_waterways line risks unbounded memory rather than a clear error
+# (CodeRabbit PR #17 review). 1.0m is comfortably below the recommended 100-150m operating
+# range while still bounding worst case to a sane vertex count.
+INLAND_DENSIFY_MIN_SEGMENT_M = 1.0
+
 # SPEC-GRAPH-DENSITY.md §6.3.1 Phase B: how far (in RASTER PIXELS, not metres --
 # distinct in kind from the metric-CRS WATERWAY_CONNECTOR_* radii above, which
 # instead govern _connect_waterway_crossing's own nearest-inland-vertex search)
@@ -1399,10 +1407,24 @@ class NauticalRoutingPipeline:
         `shapely.segmentize` only inserts vertices along existing segments -- it never
         moves an original vertex (including the two endpoints) and never changes the
         line's shape, so this is length- and endpoint-preserving by construction.
+
+        Rejects a cap that is non-finite or below `INLAND_DENSIFY_MIN_SEGMENT_M`: `NaN`
+        slips past a bare `cap_m <= 0.0` check (NaN comparisons are always False in
+        Python), and both NaN/inf violate `shapely.segmentize`'s own positive-finite
+        contract; a valid but tiny positive cap (e.g. a stray extra zero) generates
+        roughly `segment_length_m / cap_m` vertices per source segment with no ceiling
+        of its own, risking unbounded memory on a real multi-kilometre line instead of a
+        clear error.
         """
         cap_m = self.classification_config.inland_densify_max_segment_m
         if cap_m <= 0.0 or inland_gdf.empty:
             return inland_gdf
+        if not math.isfinite(cap_m) or cap_m < INLAND_DENSIFY_MIN_SEGMENT_M:
+            raise ValueError(
+                f"--inland-densify-max-segment-m must be finite and >= "
+                f"{INLAND_DENSIFY_MIN_SEGMENT_M}m (got {cap_m!r}); a smaller/non-finite "
+                f"cap risks generating an unbounded number of vertices via "
+                f"shapely.segmentize.")
         metric = inland_gdf.to_crs(self.CRS_METRIC)
         densified_m = shapely.segmentize(metric.geometry.values, cap_m)
         densified = gpd.GeoSeries(densified_m, index=inland_gdf.index, crs=self.CRS_METRIC).to_crs(self.CRS_WGS84)
@@ -6383,7 +6405,9 @@ if __name__ == "__main__":
                              "fan/star-shaped 'hub' nodes. Default 0.0 DISABLES this entirely "
                              "and leaves inland_waterways geometry byte-identical to today's. "
                              "Recommended once enabled: 100-150m, comfortably under "
-                             "WATERWAY_CONNECTOR_MAX_M (250m).")
+                             "WATERWAY_CONNECTOR_MAX_M (250m). Must be finite and >= "
+                             f"{INLAND_DENSIFY_MIN_SEGMENT_M}m if enabled (raises otherwise) "
+                             "-- shapely.segmentize has no vertex-count ceiling of its own.")
     parser.add_argument("--stitch-registry", nargs="?", const="data/seam_registry.sqlite", default="",
                         help="Enable Round 25 cross-database seam stitching (STITCHING_DESIGN.md "
                              "Section 3) against the shared global-node registry at this SQLite "

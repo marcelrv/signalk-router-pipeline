@@ -15,6 +15,8 @@ already-dense geometry with zero changes to itself.
 build output until a build explicitly opts in via `--inland-densify-max-segment-m`,
 matching `--sagitta-cap`/`--axis-dedup-cap`'s convention.
 """
+import math
+
 import geopandas as gpd
 import networkx as nx
 import pytest
@@ -55,6 +57,48 @@ class TestDensifyDisabledByDefault:
     def test_empty_gdf_is_a_noop(self):
         p = _pipeline(inland_densify_max_segment_m=100.0)
         gdf = _gdf([])
+        out = p._densify_inland_waterways(gdf)
+        assert out is gdf
+
+
+class TestDensifyRejectsUnsafeCaps:
+    """CodeRabbit PR #17 review: a bare `cap_m <= 0.0` guard lets NaN through (NaN
+    comparisons are always False in Python) and doesn't stop a valid-but-tiny positive
+    cap from asking shapely.segmentize to generate an effectively unbounded number of
+    vertices for a real multi-kilometre line.
+    """
+
+    def test_nan_raises(self):
+        p = _pipeline(inland_densify_max_segment_m=float("nan"))
+        with pytest.raises(ValueError):
+            p._densify_inland_waterways(_gdf([SPARSE_LINE]))
+
+    def test_positive_infinity_raises(self):
+        p = _pipeline(inland_densify_max_segment_m=math.inf)
+        with pytest.raises(ValueError):
+            p._densify_inland_waterways(_gdf([SPARSE_LINE]))
+
+    def test_tiny_positive_cap_raises_instead_of_exploding(self):
+        p = _pipeline(inland_densify_max_segment_m=1e-9)
+        with pytest.raises(ValueError):
+            p._densify_inland_waterways(_gdf([SPARSE_LINE]))
+
+    def test_cap_below_floor_raises(self):
+        p = _pipeline(inland_densify_max_segment_m=0.5)
+        with pytest.raises(ValueError):
+            p._densify_inland_waterways(_gdf([SPARSE_LINE]))
+
+    def test_cap_at_floor_is_accepted(self):
+        p = _pipeline(inland_densify_max_segment_m=1.0)
+        out = p._densify_inland_waterways(_gdf([SPARSE_LINE]))
+        assert len(list(out.geometry.iloc[0].coords)) > 2
+
+    def test_negative_cap_is_still_a_plain_disable_not_an_error(self):
+        # Unchanged pre-existing behavior: a negative cap takes the same "disabled"
+        # path as 0.0, not the new finite/floor validation (which only applies once
+        # something would actually reach shapely.segmentize).
+        p = _pipeline(inland_densify_max_segment_m=-5.0)
+        gdf = _gdf([SPARSE_LINE])
         out = p._densify_inland_waterways(gdf)
         assert out is gdf
 
