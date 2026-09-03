@@ -30,6 +30,8 @@ class TestInvalidGeometryIsRepaired:
     def test_bowtie_alone_does_not_raise(self):
         assert _bowtie().is_valid is False
         out = P._connected_water_polygons(P.__new__(P), _gdf([_bowtie()]))
+        assert out
+        assert sum(g.area for g in out) == pytest.approx(2.0)
         assert all(g.is_valid for g in out)
 
     def test_one_bad_polygon_does_not_lose_the_good_ones(self):
@@ -37,7 +39,7 @@ class TestInvalidGeometryIsRepaired:
         # every valid polygon was lost with it.
         good = [_square(10, 10), _square(20, 20)]
         out = P._connected_water_polygons(P.__new__(P), _gdf(good + [_bowtie()]))
-        assert len(out) >= len(good)
+        assert all(any(g.equals(expected) for g in out) for expected in good)
         assert all(g.is_valid for g in out)
 
     def test_all_valid_input_is_untouched(self):
@@ -53,7 +55,9 @@ class TestInvalidGeometryIsRepaired:
         assert out[0].area == pytest.approx(2.0)
 
     def test_empty_and_none_are_skipped(self):
-        out = P._connected_water_polygons(P.__new__(P), _gdf([_square(0, 0), Polygon()]))
+        out = P._connected_water_polygons(
+            P.__new__(P), _gdf([_square(0, 0), Polygon(), None])
+        )
         assert len(out) == 1
 
     def test_no_geometry_at_all_returns_empty(self):
