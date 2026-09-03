@@ -752,6 +752,19 @@ WATERWAY_CROSSING_CAP_PER_LINE = 8     # sanity cap per (navmesh piece, line) --
 WATERWAY_CONNECTOR_MAX_M = 250.0       # normal connector search radius to the nearest inland vertex
 WATERWAY_CONNECTOR_FALLBACK_MAX_M = 500.0  # widened radius for sparsely-digitized lines (logged)
 
+# SPEC-GRAPH-DENSITY.md §6.3.1 Phase B: how far (in RASTER PIXELS, not metres --
+# distinct in kind from the metric-CRS WATERWAY_CONNECTOR_* radii above, which
+# instead govern _connect_waterway_crossing's own nearest-inland-vertex search)
+# a skeleton degree-1 dead end may look for an adjacent axis-dedup-suppressed
+# pixel before treating it as carve-induced (reconnect-eligible) rather than a
+# genuine dead end left to existing stitching passes. 4, not a tighter 1-2:
+# medial_axis's own end-cap construction sets a fragment's centerline terminus
+# back from the true carved edge by a few pixels (confirmed directly -- a
+# synthetic severed channel's dead end sat 3px from the nearest suppressed
+# pixel, not 1), so a narrower radius would systematically miss real
+# carve-induced dead ends, not just tighten a false-positive margin.
+AXIS_DEDUP_DEADEND_SEARCH_RADIUS_PX = 4
+
 # --- Local gap-resolve pass (_stitch_component_pieces' last resort) ---
 # Fix for a confirmed bug: build_skeleton_network rasterizes an entire narrow
 # water-body piece at ONE shared pixel size derived from that whole piece's
@@ -1241,6 +1254,15 @@ class NauticalRoutingPipeline:
         self.axis_dedup_navmesh_stats = {"pieces_checked": 0, "pieces_rasterized": 0,
                                           "pieces_carved": 0, "pieces_fragmented": 0,
                                           "pieces_fully_consumed": 0, "rasterize_seconds": 0.0}
+        # SPEC-GRAPH-DENSITY.md §6.3: reconnect counters for carve-induced dead ends --
+        # a degree-1 skeleton node or navmesh-fragment perimeter node created BY an
+        # axis-dedup carve, wired back to the specific axis line responsible for it via
+        # _connect_waterway_crossing. "_candidates" counts dead ends found adjacent to a
+        # suppressed pixel; "_edges" counts edges _connect_waterway_crossing actually
+        # added (a candidate can still be rejected by that function's own land-crossing/
+        # distance guards).
+        self.axis_dedup_reconnect_stats = {"skeleton_candidates": 0, "skeleton_edges": 0,
+                                            "navmesh_candidates": 0, "navmesh_edges": 0}
         # DIAGNOSTIC (connectivity-regression investigation, not shipped as a
         # feature): per-pass attempt/outcome counters for _stitch_component_pieces
         # and _resolve_local_skeleton_gaps, plus aggregate union-find group counts
@@ -1542,14 +1564,21 @@ class NauticalRoutingPipeline:
                 for piece_m, piece_utm, piece_seam_coords in navmesh_pieces:
                     # SPEC-OVERRIDE-ZONES.md §7: give navmesh pieces the same axis-dedup
                     # suppression build_skeleton_network already applies -- inert (single-
-                    # element list, `poly_m` unchanged) unless axis_dedup_cap_m > 0.0 AND
-                    # an inland_waterways line is actually within reach. May return more
-                    # than one polygon if carving fragments the piece; each fragment is
-                    # triangulated separately so no water is silently dropped (see that
-                    # method's docstring).
-                    for carved_piece_m in self._axis_dedup_carve_navmesh_pieces(piece_m, piece_utm):
-                        self.build_navmesh_region(carved_piece_m, piece_utm, piece_seam_coords,
-                                                   DEFAULT_SOURCE_TIER, src_id)
+                    # element list, `poly_m` unchanged, empty seam/line-iloc info) unless
+                    # axis_dedup_cap_m > 0.0 AND an inland_waterways line is actually
+                    # within reach. May return more than one polygon if carving fragments
+                    # the piece; each fragment is triangulated separately so no water is
+                    # silently dropped (see that method's docstring). SPEC-GRAPH-DENSITY.md
+                    # §6.3.1: carve_seam_coords/carve_line_iloc_by_coord let
+                    # build_navmesh_region reconnect a carve-induced perimeter dead end to
+                    # the specific axis line that caused its own creation.
+                    carved_pieces, carve_seam_coords, carve_line_iloc_by_coord = \
+                        self._axis_dedup_carve_navmesh_pieces(piece_m, piece_utm)
+                    merged_seam_coords = piece_seam_coords | carve_seam_coords
+                    for carved_piece_m in carved_pieces:
+                        self.build_navmesh_region(carved_piece_m, piece_utm, merged_seam_coords,
+                                                   DEFAULT_SOURCE_TIER, src_id,
+                                                   carve_line_iloc_by_coord=carve_line_iloc_by_coord)
 
             logger.info(f"Coastal water: {len(polygons)} connected components split into "
                         f"skeleton={counts['skeleton']}, laned={counts['laned']}, "
@@ -1574,6 +1603,12 @@ class NauticalRoutingPipeline:
                         f"({ans['pieces_fragmented']} fragmented into >1 piece, {ans['pieces_fully_consumed']} "
                         f"fully consumed); {ans['rasterize_seconds']:.2f}s total in rasterize+suppression-mask "
                         f"across all navmesh pieces.")
+        ars = self.axis_dedup_reconnect_stats
+        if ars["skeleton_candidates"] or ars["navmesh_candidates"]:
+            logger.info(f"Axis-dedup reconnect (SPEC-GRAPH-DENSITY.md §6.3): skeleton "
+                        f"{ars['skeleton_edges']}/{ars['skeleton_candidates']} carve-induced dead ends "
+                        f"reconnected, navmesh {ars['navmesh_edges']}/{ars['navmesh_candidates']} -- wired "
+                        f"back to the specific inland_waterways line responsible for their own carving.")
         logger.info(f"Network built with {self.graph.number_of_nodes()} nodes and {self.graph.number_of_edges()} edges.")
 
     # ------------------------------------------------------------------
@@ -2520,8 +2555,37 @@ class NauticalRoutingPipeline:
         self.graph.add_edge(inland_node_id, node_id, **attrs)
         return 2
 
+    @staticmethod
+    def _cap_reconnect_candidates_per_line(candidates, piece_label):
+        """SPEC-GRAPH-DENSITY.md §6.3: apply the same sanity cap
+        `_inject_waterway_crossings` enforces per (piece, line) (`WATERWAY_CROSSING_
+        CAP_PER_LINE`) to axis-dedup's own carve-reconnect candidates -- shared by
+        both the navmesh (`build_navmesh_region`) and skeleton (`build_skeleton_
+        network`) carve-reconnect call sites. A carve boundary can hug one axis line
+        for the width of a whole channel, attributing many perimeter/dead-end nodes
+        to the same `line_iloc` within one piece; without this cap, that geometry --
+        not real crossing multiplicity -- decides the connector count.
+
+        `candidates`: iterable of `(node_id, line_iloc, xy_m)`, in the order found.
+        Returns the same tuples, order preserved, truncated to at most
+        `WATERWAY_CROSSING_CAP_PER_LINE` per distinct `line_iloc`.
+        """
+        by_line: Dict[int, list] = defaultdict(list)
+        for candidate in candidates:
+            by_line[candidate[1]].append(candidate)
+        capped = []
+        for line_iloc, group in by_line.items():
+            if len(group) > WATERWAY_CROSSING_CAP_PER_LINE:
+                logger.info(f"  Axis-dedup reconnect cap: inland_waterways row {line_iloc} has "
+                            f"{len(group)} carve-induced dead ends on one {piece_label}; capping to "
+                            f"{WATERWAY_CROSSING_CAP_PER_LINE}.")
+                group = group[:WATERWAY_CROSSING_CAP_PER_LINE]
+            capped.extend(group)
+        return capped
+
     def build_navmesh_region(self, poly_m, utm_crs, seam_coord_set,
-                             source_tier=DEFAULT_SOURCE_TIER, source_id=None):
+                             source_tier=DEFAULT_SOURCE_TIER, source_id=None,
+                             carve_line_iloc_by_coord=None):
         """Triangulate one wide, navmesh-eligible water sub-polygon (already in
         metric CRS) and stage a `navmesh_regions` row for export. Registers EVERY
         vertex of the region's own perimeter (exterior + interior/island rings) as
@@ -2540,6 +2604,14 @@ class NauticalRoutingPipeline:
         skeleton piece is tracked separately as `boundary_node_ids`, used by
         `build_network`'s cross-piece `_stitch_component_pieces` call to connect
         this region into the rest of its original connected water body.
+
+        `carve_line_iloc_by_coord` (SPEC-GRAPH-DENSITY.md §6.3.1, optional --
+        `_axis_dedup_carve_navmesh_pieces`'s own return value, `None` for every other
+        caller/test): `{(x, y): line_iloc}` for perimeter coordinates that sit on an
+        axis-dedup carve boundary. Any registered perimeter node at one of those exact
+        coordinates gets reconnected, via `_connect_waterway_crossing`, to the specific
+        inland_waterways line responsible for carving that boundary -- otherwise a
+        carve-induced dead end has no deliberate path back into the graph.
         """
         # DIAGNOSTIC (connectivity-regression investigation): tag every node this
         # call creates/touches with a unique per-region context so
@@ -2627,6 +2699,12 @@ class NauticalRoutingPipeline:
 
         perimeter_node_ids = [None] * n_input
         boundary_node_ids = []
+        # SPEC-GRAPH-DENSITY.md §6.3.1: (node_id, line_iloc, (x, y)) for perimeter
+        # nodes that sit on a carve boundary -- collected here (same x, y already in
+        # hand, zero extra cost) but connected in a SECOND pass below, after every
+        # perimeter node id exists (mirrors why the existing crossing_records connector
+        # pass below already runs after this loop, not inside it).
+        carve_connect_candidates = []
         for start, count in ring_ranges:
             for k in range(count):
                 i = start + k
@@ -2637,6 +2715,10 @@ class NauticalRoutingPipeline:
                 if (round(x, 3), round(y, 3)) in seam_coord_set:
                     boundary_node_ids.append(node_id)
                     self.navmesh_seam_node_ids.add(node_id)
+                if carve_line_iloc_by_coord:
+                    line_iloc = carve_line_iloc_by_coord.get((round(x, 3), round(y, 3)))
+                    if line_iloc is not None:
+                        carve_connect_candidates.append((node_id, line_iloc, (x, y)))
             attrs = dict(edge_type="coastal", edge_kind_id=EDGE_KIND_NAVMESH_BOUNDARY,
                          source_tier=source_tier, source_id=source_id)
             for k in range(count):
@@ -2646,8 +2728,13 @@ class NauticalRoutingPipeline:
                     self.graph.add_edge(u, v, **attrs)
                     self.graph.add_edge(v, u, **attrs)
 
+        # Shared across both connector mechanisms below: a line that both crosses this
+        # piece's boundary (_inject_waterway_crossings) AND caused a carve on this same
+        # piece then only pays reprojection cost once. Declared unconditionally (was
+        # only inside `if crossing_records:`) since carve reconnect can fire on its own.
+        line_m_cache: Dict[int, Tuple[list, np.ndarray]] = {}
+
         if crossing_records:
-            line_m_cache: Dict[int, Tuple[list, np.ndarray]] = {}
             crossing_node_ids = set()
             edges_added = 0
             for ring_idx, pos_in_ring, line_iloc, xy_m in crossing_records:
@@ -2662,6 +2749,17 @@ class NauticalRoutingPipeline:
                 self.waterway_crossing_stats["regions"] += 1
                 self.waterway_crossing_stats["nodes"] += len(crossing_node_ids)
                 self.waterway_crossing_stats["edges"] += edges_added
+
+        if carve_connect_candidates:
+            connected_node_ids = set()
+            edges_added = 0
+            capped = self._cap_reconnect_candidates_per_line(carve_connect_candidates, "navmesh piece")
+            for node_id, line_iloc, xy_m in capped:
+                connected_node_ids.add(node_id)
+                edges_added += self._connect_waterway_crossing(node_id, line_iloc, utm_crs, xy_m, line_m_cache)
+            if connected_node_ids:
+                self.axis_dedup_reconnect_stats["navmesh_candidates"] += len(connected_node_ids)
+                self.axis_dedup_reconnect_stats["navmesh_edges"] += edges_added
 
         boundary_geom_wgs84 = gpd.GeoSeries([poly_m], crs=utm_crs).to_crs(self.CRS_WGS84).iloc[0]
         self.navmesh_region_rows.append({
@@ -3926,19 +4024,36 @@ class NauticalRoutingPipeline:
         graph nodes there to hook its own chamber-transit edges onto, and that need does
         not go away just because the water also happens to be near a WTWAXS line.
 
-        Returns a boolean array shaped like `mask` -- all-False (cheaply, no rasterize
-        call) when no inland_waterways line falls near this piece. Caller (only
-        build_skeleton_network) is responsible for gating this on
-        `axis_dedup_cap_m > 0.0`; this method does not re-check that itself, so it must
-        never be called from the `axis_dedup_cap_m == 0.0` path (gate 1: that path's
-        mask must be byte-identical to before this feature existed).
+        Returns `(suppress, line_iloc_by_suppressed_px)`:
+          - `suppress`: boolean array shaped like `mask` -- all-False (cheaply, no
+            rasterize call) when no inland_waterways line falls near this piece.
+          - `line_iloc_by_suppressed_px`: `{(row, col): line_iloc}` for every pixel
+            where `suppress` is True -- the positional index into
+            `self.gdfs["inland_waterways"]` of the candidate line nearest that pixel
+            (i.e. directly usable as `_connect_waterway_crossing`'s `line_iloc`
+            argument via `.geometry.iloc[line_iloc]`). Empty on every no-op path.
+            SPEC-GRAPH-DENSITY.md §6.3.1: this is what lets a caller reconnect a
+            carve-induced dead end to the SPECIFIC line responsible for carving it,
+            rather than just any nearby line. Known, accepted imprecision: where two
+            candidates' suppression footprints truly overlap, `cand_utm.index`
+            iteration order (below) decides which wins at those pixels --
+            deterministic but arbitrary; acceptable since the goal is reconnecting to
+            *an* authoritative line at that spot, not resolving which of two
+            disagreeing lines is "more correct."
+
+        Caller (only build_skeleton_network and _axis_dedup_carve_navmesh_pieces) is
+        responsible for gating this on `axis_dedup_cap_m > 0.0`; this method does not
+        re-check that itself, so it must never be called from the
+        `axis_dedup_cap_m == 0.0` path (gate 1: that path's mask must be byte-identical
+        to before this feature existed).
         """
         cfg = self.classification_config
         from scipy.ndimage import distance_transform_edt
+        from rasterio import Affine
 
         inland_gdf = self.gdfs.get("inland_waterways")
         if inland_gdf is None or inland_gdf.empty:
-            return np.zeros(mask.shape, dtype=bool)
+            return np.zeros(mask.shape, dtype=bool), {}
 
         # Bounding-box prefilter against this piece's extent, same pattern
         # _candidates_by_bounds_static's other callers use, so a piece never pays to
@@ -3954,7 +4069,7 @@ class NauticalRoutingPipeline:
         candidates = _candidates_by_bounds_static(inland_gdf, polygon_wgs84,
                                                     margin=margin_lat_deg, margin_lon=margin_lon_deg)
         if candidates.empty:
-            return np.zeros(mask.shape, dtype=bool)
+            return np.zeros(mask.shape, dtype=bool), {}
 
         cand_utm = candidates.to_crs(utm_crs)
         # CodeRabbit PR #14 review round 3 finding 1: _build_inland_network (its own
@@ -3974,10 +4089,23 @@ class NauticalRoutingPipeline:
                             f"this piece are not LineString geometry (e.g. MultiLineString) -- "
                             f"_build_inland_network wouldn't ingest them either, so they are excluded "
                             f"from suppression rather than claiming coverage the graph doesn't have.")
-        line_shapes = [(geom, 1) for geom in cand_utm.geometry
+        # Burn each candidate with its own inland_waterways positional index (+1, to
+        # avoid colliding with rasterize's fill=0 sentinel -- a real line can be
+        # positional index 0) instead of a shared constant, so the raster doubles as a
+        # line-id lookup below. `cand_utm.index` IS already the correct positional
+        # index into self.gdfs["inland_waterways"]: parse_shapefiles loads that layer
+        # via plain gpd.read_file with no reset_index/filtering, so its index is a
+        # bare RangeIndex(0..n-1); _candidates_by_bounds_static's `gdf.iloc[candidates]`
+        # and `.to_crs()` both preserve those original index labels. Never re-derive a
+        # line_iloc by enumerating this (already-subset) cand_utm from scratch (e.g.
+        # `for i, geom in enumerate(...)`) -- that index would NOT match
+        # inland_waterways' own positional order, silently wiring a reconnect to the
+        # wrong line. _inject_waterway_crossings avoids this same trap by using
+        # `inland_gdf.sindex.query(...)` results directly as line_iloc; this mirrors it.
+        line_shapes = [(geom, int(idx) + 1) for idx, geom in zip(cand_utm.index, cand_utm.geometry)
                        if geom is not None and not geom.is_empty and isinstance(geom, LineString)]
         if not line_shapes:
-            return np.zeros(mask.shape, dtype=bool)
+            return np.zeros(mask.shape, dtype=bool), {}
 
         # Step 1: local channel width per water pixel, from the ORIGINAL (uncarved)
         # mask -- exactly the quantity width_m() in _skeleton_raster_to_graph turns into
@@ -3985,28 +4113,64 @@ class NauticalRoutingPipeline:
         # skeleton pixels (§4.3.2).
         width_est_m = distance_transform_edt(mask) * pixel_size_m * 2.0
 
-        # Step 2: rasterize the candidate axis lines onto the SAME grid as mask, then
-        # distance-transform the inverse to get each pixel's distance to the nearest
-        # axis line.
-        axis_raster = _rio_rasterize(line_shapes, out_shape=mask.shape, transform=transform,
-                                      fill=0, dtype="uint8", all_touched=True)
-        if not axis_raster.any():
+        # Step 2: rasterize the candidate axis lines onto a grid padded by
+        # axis_dedup_cap_m in every direction (crop back to mask's own shape below),
+        # then distance-transform the inverse to get each pixel's distance to the
+        # nearest axis line.
+        #
+        # Padded, not rasterized directly onto mask's own unpadded grid: a candidate
+        # survives the bbox+margin prefilter above (its bbox overlaps this piece's
+        # extent plus a cap-sized margin) precisely because its true geometry CAN sit
+        # up to a cap's distance outside this piece's own raster footprint while still
+        # being within tolerance of a water pixel near the piece's edge -- rasterizing
+        # only onto the unpadded grid silently dropped exactly that case (the line
+        # never touches a single pixel of the piece's own grid, so it contributes
+        # nothing to axis_dist_m at all, regardless of how close it truly is to the
+        # piece's edge pixels). Reuses axis_dedup_cap_m as the pad margin for the same
+        # reason `_lock_protection_mask` reuses it as a buffer distance: suppression
+        # can never reach farther than the cap, so padding by exactly the cap is
+        # provably sufficient and never over-generous.
+        #
+        # The padded transform is a pure integer-pixel extension of the original (same
+        # pixel_size_m on both grids, origin shifted by whole pixels), so cropping the
+        # padded distance transform back to mask's own shape below is exact index
+        # slicing, not resampling -- no fractional-pixel misalignment is possible.
+        # dtype int32, not uint8: values now carry line_iloc+1, which can run past 255
+        # at country scale (a plain "is there a line here" bit no longer suffices).
+        pad_px = int(np.ceil(cfg.axis_dedup_cap_m / pixel_size_m))
+        padded_shape = (mask.shape[0] + 2 * pad_px, mask.shape[1] + 2 * pad_px)
+        padded_transform = transform * Affine.translation(-pad_px, -pad_px)
+        axis_raster_padded = _rio_rasterize(line_shapes, out_shape=padded_shape, transform=padded_transform,
+                                             fill=0, dtype="int32", all_touched=True)
+        if not axis_raster_padded.any():
             # Every candidate survived the coarse bbox+margin prefilter (their overall
             # bounding boxes overlap this piece's extent) but NONE actually rasterizes
-            # onto this piece's grid -- a real, if narrow, case: a line's own bbox is a
-            # rectangle, so a diagonal or L-shaped feature can have its bbox reach into
-            # the margin while the line itself passes nowhere near the piece. Found
-            # while hardening tests/test_axis_dedup.py's own prefilter-vs-real-tolerance
-            # test (CodeRabbit PR #14 review round 3 finding 2's fix): feeding an
-            # all-zero axis_raster into distance_transform_edt does NOT yield "far away
-            # everywhere" -- with no background pixel anywhere in the array, scipy falls
-            # back to measuring from an implicit point outside the array's own (0,0)
-            # corner, producing small, spurious distances near that one corner
-            # regardless of where the real (unrasterized) line actually is. Confirmed
-            # directly: a line 40m outside a piece's own grid still wrongly carved a
-            # ~1900 m^2 sliver at the piece's raster-origin corner before this guard.
-            return np.zeros(mask.shape, dtype=bool)
-        axis_dist_m = distance_transform_edt(axis_raster == 0) * pixel_size_m
+            # onto even the padded grid -- a real, if narrow, case: a line's own bbox is
+            # a rectangle, so a diagonal or L-shaped feature can have its bbox reach into
+            # the margin while the line itself passes nowhere near the piece, cap-padded
+            # margin included. Found while hardening tests/test_axis_dedup.py's own
+            # prefilter-vs-real-tolerance test (CodeRabbit PR #14 review round 3 finding
+            # 2's fix): feeding an all-zero axis raster into distance_transform_edt does
+            # NOT yield "far away everywhere" -- with no background pixel anywhere in the
+            # array, scipy falls back to measuring from an implicit point outside the
+            # array's own (0,0) corner, producing small, spurious distances near that one
+            # corner regardless of where the real (unrasterized) line actually is.
+            # Confirmed directly: a line 40m outside a piece's own (unpadded) grid still
+            # wrongly carved a ~1900 m^2 sliver at the piece's raster-origin corner
+            # before this guard existed; the padded grid now genuinely rasterizes that
+            # case, and this guard is left in place for the residual case of a line
+            # beyond even the padded margin.
+            return np.zeros(mask.shape, dtype=bool), {}
+        # return_indices=True: same distance-transform computation scipy already
+        # performs, no second pass. indices_padded[0]/[1] give each pixel's nearest
+        # foreground (axis) pixel's own (row, col) -- looking that up in
+        # axis_raster_padded (which doubles as the line-id raster) gives the
+        # responsible line per pixel, extracted below only for pixels that end up
+        # actually suppressed.
+        distances_padded, indices_padded = distance_transform_edt(
+            axis_raster_padded == 0, return_distances=True, return_indices=True)
+        axis_dist_padded_m = distances_padded * pixel_size_m
+        axis_dist_m = axis_dist_padded_m[pad_px:pad_px + mask.shape[0], pad_px:pad_px + mask.shape[1]]
 
         # Step 3: tol = clip(fraction * width_est, floor, cap); suppress = axis_dist < tol.
         #
@@ -4041,7 +4205,46 @@ class NauticalRoutingPipeline:
         # an axis line. The carve (mask & ~suppress) was already unaffected either way,
         # but callers computing a suppression RATE against mask.sum() need this to not
         # overcount the numerator.
-        return mask & suppress
+        suppress = mask & suppress
+
+        # SPEC-GRAPH-DENSITY.md §6.3.1: record, per suppressed pixel, which candidate
+        # line is responsible -- indices_padded/axis_raster_padded are in the PADDED
+        # coordinate frame, so a suppressed pixel at (r, c) here looks up
+        # (r+pad_px, c+pad_px) in them.
+        sup_rows, sup_cols = np.nonzero(suppress)
+        line_iloc_by_suppressed_px: Dict[Tuple[int, int], int] = {}
+        if sup_rows.size:
+            nearest_row = indices_padded[0][sup_rows + pad_px, sup_cols + pad_px]
+            nearest_col = indices_padded[1][sup_rows + pad_px, sup_cols + pad_px]
+            nearest_line_id = axis_raster_padded[nearest_row, nearest_col]
+            line_iloc_by_suppressed_px = {
+                (int(r), int(c)): int(lid) - 1
+                for r, c, lid in zip(sup_rows, sup_cols, nearest_line_id)
+            }
+        return suppress, line_iloc_by_suppressed_px
+
+    @staticmethod
+    def _axis_dedup_nearest_line_for_suppressed_pixel(row, col, line_iloc_by_px,
+                                                        max_radius=AXIS_DEDUP_DEADEND_SEARCH_RADIUS_PX):
+        """SPEC-GRAPH-DENSITY.md §6.3.1 Phase B: is a skeleton degree-1 dead end at
+        raster pixel (row, col) carve-induced -- adjacent to a pixel axis-dedup
+        actually suppressed -- or genuine? Returns the nearest such neighbor's
+        line_iloc (its responsible inland_waterways line), or None if (row, col) has
+        no suppressed neighbor within max_radius pixels (a genuine dead end, left to
+        the existing stitching passes, not this reconnect mechanism).
+        """
+        best, best_d2 = None, None
+        for r in range(row - max_radius, row + max_radius + 1):
+            for c in range(col - max_radius, col + max_radius + 1):
+                if (r, c) == (row, col):
+                    continue
+                line_iloc = line_iloc_by_px.get((r, c))
+                if line_iloc is None:
+                    continue
+                d2 = (r - row) ** 2 + (c - col) ** 2
+                if best_d2 is None or d2 < best_d2:
+                    best_d2, best = d2, line_iloc
+        return best
 
     def _axis_dedup_carve_navmesh_pieces(self, poly_m, utm_crs):
         """SPEC-OVERRIDE-ZONES.md §7 / follow-up to SPEC-GRAPH-DENSITY.md §4.3: apply
@@ -4085,14 +4288,30 @@ class NauticalRoutingPipeline:
         does. Reconnecting the resulting pieces is exactly the existing stitching
         passes' job, same as any other multi-piece water body.
 
-        Returns a list of Polygons (metric CRS, same `utm_crs` as `poly_m`) -- `[poly_m]`
-        unchanged when disabled, no candidates, or nothing suppressed; `[]` if carving
-        consumes the entire piece (its water is already covered by the authoritative
-        axis line via `_build_inland_network`, same as a fully-consumed skeleton mask).
+        Returns `(pieces, carve_seam_coords, carve_line_iloc_by_coord)`:
+          - `pieces`: list of Polygons (metric CRS, same `utm_crs` as `poly_m`) --
+            `[poly_m]` unchanged when disabled, no candidates, or nothing suppressed;
+            `[]` if carving consumes the entire piece (its water is already covered by
+            the authoritative axis line via `_build_inland_network`, same as a
+            fully-consumed skeleton mask).
+          - `carve_seam_coords`: `set()` of `(x, y)` metric-CRS coordinates on the
+            carve boundary -- vertices already present on a returned piece's own
+            perimeter (from `poly_m.difference(...)`), NOT new inserted vertices, so
+            this reuses `_seam_coord_set`'s exact-coordinate matching (the same
+            mechanism `build_network`'s own width/depth seam computation already uses),
+            not `_inject_waterway_crossings`'s position-in-ring bookkeeping (that
+            mechanism exists because it inserts brand-new mid-segment vertices that
+            must survive verbatim -- carve-boundary vertices are already there).
+          - `carve_line_iloc_by_coord`: `{(x, y): line_iloc}` for each carve_seam_coords
+            member -- SPEC-GRAPH-DENSITY.md §6.3.1: the responsible axis line for that
+            boundary, letting `build_navmesh_region` reconnect a carve-induced dead end
+            to the SPECIFIC line that caused its own creation via
+            `_connect_waterway_crossing`, mirroring `_inject_waterway_crossings`'s own
+            connector mechanism.
         """
         cfg = self.classification_config
         if cfg.axis_dedup_cap_m <= 0.0:
-            return [poly_m]
+            return [poly_m], set(), {}
 
         stats = self.axis_dedup_navmesh_stats
         stats["pieces_checked"] += 1
@@ -4101,12 +4320,12 @@ class NauticalRoutingPipeline:
 
         inland_gdf = self.gdfs.get("inland_waterways")
         if inland_gdf is None or inland_gdf.empty:
-            return [poly_m]
+            return [poly_m], set(), {}
         margin_lon_deg, margin_lat_deg = _lonlat_margin_deg(polygon_wgs84, cfg.axis_dedup_cap_m)
         candidates = _candidates_by_bounds_static(inland_gdf, polygon_wgs84,
                                                     margin=margin_lat_deg, margin_lon=margin_lon_deg)
         if candidates.empty:
-            return [poly_m]
+            return [poly_m], set(), {}
 
         import time
         t0 = time.perf_counter()
@@ -4119,30 +4338,56 @@ class NauticalRoutingPipeline:
         mask, transform, px = self._rasterize_water_polygon(poly_m, land_m, px)
         if mask is None or int(mask.sum()) < 3:
             stats["rasterize_seconds"] += time.perf_counter() - t0
-            return [poly_m]
+            return [poly_m], set(), {}
 
-        suppress = self._axis_dedup_suppression_mask(mask, transform, utm_crs, px, polygon_wgs84)
+        suppress, line_iloc_by_suppressed_px = self._axis_dedup_suppression_mask(
+            mask, transform, utm_crs, px, polygon_wgs84)
         stats["rasterize_seconds"] += time.perf_counter() - t0
         if not suppress.any():
-            return [poly_m]
+            return [poly_m], set(), {}
 
+        # Group suppression polygons PER LINE (not one merged union) so each carve
+        # boundary can be attributed to the specific line responsible for it, by
+        # scattering line_iloc_by_suppressed_px back into a small id raster and
+        # vectorizing per distinct value -- mirrors the id-raster convention
+        # _axis_dedup_suppression_mask itself uses (line_iloc + 1, so 0 stays "no line").
         from rasterio.features import shapes as _rio_shapes
         from shapely.geometry import shape as _shapely_shape
-        suppress_polys = [_shapely_shape(geom) for geom, val in
-                           _rio_shapes(suppress.astype("uint8"), mask=suppress, transform=transform)]
-        if not suppress_polys:
-            return [poly_m]
-        suppression_poly_m = self._clean_polygonal(unary_union(suppress_polys))
+        line_id_arr = np.zeros(mask.shape, dtype=np.int32)
+        for (r, c), line_iloc in line_iloc_by_suppressed_px.items():
+            line_id_arr[r, c] = line_iloc + 1
+        suppress_polys_by_line: Dict[int, List[Polygon]] = defaultdict(list)
+        for geom, val in _rio_shapes(line_id_arr, mask=suppress, transform=transform):
+            if val:
+                suppress_polys_by_line[int(val) - 1].append(_shapely_shape(geom))
+        if not suppress_polys_by_line:
+            return [poly_m], set(), {}
+        suppression_poly_m = self._clean_polygonal(
+            unary_union([p for polys in suppress_polys_by_line.values() for p in polys]))
 
         carved = self._clean_polygonal(poly_m.difference(suppression_poly_m))
         stats["pieces_carved"] += 1
         if carved.is_empty:
             stats["pieces_fully_consumed"] += 1
-            return []
+            return [], set(), {}
+
+        carve_seam_coords: set = set()
+        carve_line_iloc_by_coord: Dict[Tuple[float, float], int] = {}
+        for line_iloc, polys in suppress_polys_by_line.items():
+            line_poly = self._clean_polygonal(unary_union(polys))
+            seam_geom = carved.boundary.intersection(line_poly.boundary)
+            coords = self._seam_coord_set(seam_geom)
+            carve_seam_coords |= coords
+            for xy in coords:
+                # Deterministic last-writer-wins on a true multi-line overlap at the
+                # exact same coordinate -- narrow, accepted (see
+                # _axis_dedup_suppression_mask's own docstring on this same tradeoff).
+                carve_line_iloc_by_coord[xy] = line_iloc
+
         pieces = self._explode_polygonal(carved)
         if len(pieces) > 1:
             stats["pieces_fragmented"] += 1
-        return pieces
+        return pieces, carve_seam_coords, carve_line_iloc_by_coord
 
     @staticmethod
     def _extract_medial_axis_skeleton(mask):
@@ -4389,9 +4634,11 @@ class NauticalRoutingPipeline:
         # axis_dedup_cap_m > 0.0 -- the default 0.0 skips this block entirely, so
         # gate 1 (byte-identical mask at cap 0) holds by construction, not by a
         # runtime check inside _axis_dedup_suppression_mask.
+        line_iloc_by_suppressed_px: Dict[Tuple[int, int], int] = {}
         if cfg.axis_dedup_cap_m > 0.0:
             total_px = int(mask.sum())
-            suppress = self._axis_dedup_suppression_mask(mask, transform, utm, px, polygon)
+            suppress, line_iloc_by_suppressed_px = self._axis_dedup_suppression_mask(
+                mask, transform, utm, px, polygon)
             n_suppressed = int(suppress.sum())
             self.axis_dedup_stats["pieces_processed"] += 1
             self.axis_dedup_stats["total_water_px"] += total_px
@@ -4401,12 +4648,26 @@ class NauticalRoutingPipeline:
                 self.axis_dedup_stats["suppressed_px"] += n_suppressed
                 if int(mask.sum()) < 3:
                     return
+            else:
+                line_iloc_by_suppressed_px = {}
 
         skel, dist = self._extract_medial_axis_skeleton(mask)
         if int(skel.sum()) < 2:
             return
         G = self._skeleton_raster_to_graph(skel, dist, transform, utm, px)
         self._prune_skeleton_spurs(G, cfg.min_spur_length_m)
+
+        # SPEC-GRAPH-DENSITY.md §6.3.1 Phase B: G's own nodes are raw raster pixel
+        # tuples (row, col) -- recover that pixel identity per rounded lon/lat (the
+        # same 5-decimal rounding _get_or_create_node itself applies) so a degree-1
+        # dead end created below can be tested for carve-adjacency below without a
+        # second geometric search. Built once here (not per dead end) and only when
+        # this piece actually had any suppression at all.
+        pixel_by_lonlat: Dict[Tuple[float, float], Tuple[int, int]] = {}
+        if line_iloc_by_suppressed_px:
+            for p, data in G.nodes(data=True):
+                lon, lat = data["lonlat"]
+                pixel_by_lonlat[(round(lon, 5), round(lat, 5))] = p
 
         added = 0
         node_occurrences: Dict[int, int] = {}
@@ -4451,6 +4712,40 @@ class NauticalRoutingPipeline:
         for node_id, occurrences in node_occurrences.items():
             if occurrences == 1:
                 self.navmesh_seam_node_ids.add(node_id)
+
+        # SPEC-GRAPH-DENSITY.md §6.3.1 Phase B: among those SAME degree-1 dead ends,
+        # reconnect the ones the carve above actually created -- adjacent to a
+        # suppressed pixel -- to the specific inland_waterways line responsible,
+        # rather than leaving them to generic stitching passes alone (the Hansweert
+        # regression this spec section is named for: a carve-induced stub 178m from
+        # any axis line went unrecovered because nothing looked for it specifically).
+        # A genuine dead end (no suppressed neighbor) is untouched, left to those same
+        # existing passes exactly as before.
+        if line_iloc_by_suppressed_px:
+            line_m_cache: Dict[int, Tuple[list, np.ndarray]] = {}
+            dead_end_candidates = []
+            for node_id, occurrences in node_occurrences.items():
+                if occurrences != 1:
+                    continue
+                lon = self.graph.nodes[node_id]["lon"]
+                lat = self.graph.nodes[node_id]["lat"]
+                p = pixel_by_lonlat.get((lon, lat))
+                if p is None:
+                    continue
+                row, col = p
+                line_iloc = self._axis_dedup_nearest_line_for_suppressed_pixel(
+                    row, col, line_iloc_by_suppressed_px)
+                if line_iloc is None:
+                    continue
+                x_m, y_m = transform * (col + 0.5, row + 0.5)
+                dead_end_candidates.append((node_id, line_iloc, (x_m, y_m)))
+
+            capped = self._cap_reconnect_candidates_per_line(dead_end_candidates, "skeleton piece")
+            for node_id, line_iloc, xy_m in capped:
+                self.axis_dedup_reconnect_stats["skeleton_candidates"] += 1
+                self.axis_dedup_reconnect_stats["skeleton_edges"] += self._connect_waterway_crossing(
+                    node_id, line_iloc, utm, xy_m, line_m_cache)
+
         logger.debug(f"  skeleton polygon -> {added} centerline edges (px={px:.1f}m)")
 
 
