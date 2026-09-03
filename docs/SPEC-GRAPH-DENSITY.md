@@ -694,6 +694,47 @@ candidate collection was restructured into the same two-phase
 sites are now structurally identical, not just cap-equivalent. Full suite (148 tests)
 verified green after the change.
 
+#### 6.3.7 Follow-up (CodeRabbit, PR #16): carve attribution attrition through boundary
+simplification — MEASURED, not yet fixed
+
+CodeRabbit's review of PR #16 flagged that `build_navmesh_region`'s pre-existing
+boundary-simplify pass (`NAVMESH_BOUNDARY_SIMPLIFY_M = 5.0`, §6.3.1's own docstring
+already notes it runs "after the caller already computed seam_coord_set... because
+simplify() only ever removes vertices") runs on `poly_m` BEFORE the per-vertex match
+against `carve_line_iloc_by_coord` — so any carve-attributed vertex Douglas-Peucker
+removes is silently unavailable for reconnect at that node.
+
+**Measured, not assumed**, against two synthetic fixtures (a 2km piece carved by a
+through-line, and a stub-scale ~200m piece matching the real Hansweert stub's own
+magnitude): simplify removes **85–94% of carve-attributed vertices** (46→3 and 20→3
+survivors per fragment respectively). This is real, substantial attrition — CodeRabbit's
+concern is confirmed, not a false positive.
+
+**But not (in either tested case) total failure.** In both fixtures, exactly 3 vertices
+survive per fragment regardless of scale — structurally, these are the carve boundary's
+own genuine corners (where Douglas-Peucker's own guarantee — never drop a point whose
+removal would deviate the simplified line beyond tolerance — keeps it), which is also
+where a fragment's shape actually changes, i.e. where a dead end is most likely to sit
+in the first place. Neither test produced zero survivors.
+
+**Why this isn't a regression and isn't (yet) blocking**: the simplify-then-exact-match
+tradeoff is inherited from the PRE-EXISTING `seam_coord_set`/`boundary_node_ids`
+mechanism this section's own `carve_seam_coords` reuses verbatim (same docstring, same
+known limitation, unmodified by this PR — see §6.3.1). A carve vertex whose match is
+lost to simplify simply gets the SAME treatment every dead end got before this PR
+existed: left to the generic stitching passes. This is the same class of "coverage gap,
+not a safety gap" this spec section already accepts elsewhere (§6.3.1's degree-2/3 knot
+limitation, §6.3.2's original padding gap) — not proven to ever reach zero, but not
+proven never to, either, for a fragment shaped differently from the two tested here.
+
+**Proper fix (deferred, matches CodeRabbit's own "Heavy lift" tag)**: derive carve
+attribution from the FINALIZED (post-simplify) boundary instead of relying on exact
+pre-simplify vertex matches — e.g. nearest-line lookup per surviving vertex (mirroring
+the skeleton path's own `_axis_dedup_nearest_line_for_suppressed_pixel` radius search,
+rather than the navmesh path's current exact-coordinate dict lookup). Out of scope for
+this PR; track as a follow-on phase once a real rebuild's own reachability gates (§6.3.4)
+show whether the surviving-corner behavior measured here is sufficient in practice.
+
 ## 7. Risks
 
 - Long edges on straight reaches increase the chance a single edge spans a chart feature
