@@ -32,6 +32,7 @@ Nodes/Edges delta.
 | 5 | 2026-09-04 | `38a09ed` | `data/zeeland_fresh_clip` | same as #3 but `--axis-dedup-cap 25.0` | Does a tighter axis-dedup cap reduce stitch-pass hubs? | 59,544 | 229,379 | 57 | 42 | 0 | no |
 | 6 | 2026-09-04 | `f560cbf` | `data/zeeland_fresh_clip` | same as #3 but `--pass2-max-fanin-per-node 6` | Does §6.6's Pass 2 fan-in cap fix the hub problem? | 58,215 | 224,553 | 56 | 42 | 0 | no |
 | 7 | 2026-09-04 | `6165615` | `data/zeeland_fresh_clip` | same as #6 but `--pass0-target-fanin-cap 4` | §6.7 fix — Pass 0c/0d Direction A target cap | 58,215 | **187,551** | **0** | **12** | 0 | **YES** |
+| 8 | 2026-09-04 | this commit (`FAIRWAY_MATCH_BUFFER_M` fix, on top of `d9eb3c5`) | `data/zeeland_fresh_clip` | same as #7 (unchanged flags — the fix is in `calculate_edge_attributes`, not a CLI flag) | Fix the fairway cost_factor coverage regression traced from the Krammersluis routing bug report | 58,215 | 187,551 | 0 | 12 | 0 | **YES** |
 
 **Row #1 is not a valid comparison baseline** — its input clip/flags are unknown, so
 its counts cannot be attributed to any specific configuration. It's recorded because
@@ -184,6 +185,65 @@ the only mutually-comparable set so far (identical `data/zeeland_fresh_clip` inp
     specifically, unlike the edge-length-% comparison above.)
 - **Installed live** 2026-09-04 (see deploy notes below).
 - **Log**: `data/zeeland_pass0targetcap_build.log`
+
+### #8 — `zeeland_fairwaybufferfix.sqlite` — FAIRWAY_MATCH_BUFFER_M fix, same graph shape as #7
+
+```bash
+... identical command to #7 (node/edge/hub/max-out-deg counts match exactly,
+confirming the fix changes edge attributes only, not topology):
+.venv/bin/python3 nautical_routing_pipeline.py \
+  --input-dir data/zeeland_fresh_clip \
+  --output data/zeeland_fairwaybufferfix.sqlite \
+  --country NL --name "Zeeland" \
+  --description "Zeeland province and approaches (Westerschelde, Oosterschelde, Veerse Meer, Grevelingen, Haringvliet, North Sea approach), based on Rijkswaterstaat IENC / ENC data" \
+  --tags '["ienc","rws","coastal","inland"]' \
+  --url "https://github.com/marcelrv/signalk-router-data" \
+  --license "Public Domain (Rijkswaterstaat)" --copyright "Rijkswaterstaat" \
+  --depth-ceiling 6.0 \
+  --sagitta-cap 75.0 --max-segment-m 2000 \
+  --axis-dedup-cap 50.0 \
+  --connector-merge-m 5.0 \
+  --inland-densify-max-segment-m 120.0 \
+  --pass2-max-fanin-per-node 6 \
+  --pass0-target-fanin-cap 4
+```
+
+- **Bug report**: routeiq's UI showed a route through the Aanloop Westelijke
+  Voorhaven Krammersluizen <-> Aanloop Krammersluis approach taking a
+  longer-looking path through the main commercial lock instead of what looked
+  like a shorter, fairway-marked route.
+- **Root cause traced**: NOT a connector-merge-split attribute-copy bug (that
+  code copies edge attrs before `cost_factor` is ever computed, so it's a
+  non-issue). The actual cause: `calculate_edge_attributes`'s fairway
+  cost_factor test is a bare `intersects()` between each final edge's straight
+  chord and the fairway/inland-waterways reference layer (a zero-width
+  centerline for inland_waterways entries). As PRs #14-#18 increased edge
+  density (this corridor: ~98k -> ~187k edges pipeline-wide), each chord got
+  shorter and more sensitive to a few metres of skeleton/medial-axis drift off
+  the reference line -- silently downgrading `cost_factor` from 0.8 to the 1.2
+  default on a growing share of a real fairway's length.
+- **Measured on this exact corridor** (same start/end anchors, Dijkstra
+  distance*cost_factor, no lock-wait modeled):
+
+  | build | real dist | fairway-tagged (cf=0.8) | weighted cost |
+  |---|---|---|---|
+  | pre-#18 (`zeeland_pre_main_merge.sqlite.bak`) | 3992 m | 3307 m (83%) | 3467 |
+  | live (#7, post #14-#18) | 4036 m | 2363 m (59%) | 3898 (+12%) |
+  | **#8 (this fix)** | **3891 m** | **3891 m (100%)** | **3113 (−10% vs pre-#18, −20% vs live)** |
+
+- **Fix**: `FAIRWAY_MATCH_BUFFER_M = 5.0` (nautical_routing_pipeline.py) —
+  `calculate_edge_attributes` now buffers the fairway/inland-waterways layer by
+  5m in metric CRS before handing it to `_edge_attr_worker`'s per-edge
+  `intersects()` test, absorbing routine splitting/skeleton drift without
+  needing every chord to land exactly on the reference line.
+- **Regression coverage**: `tests/test_fairway_match_buffer.py` (a chord 3m off
+  a synthetic inland-waterways line now tags cf=0.8; one 500m off still doesn't).
+  Full suite: 211/211 passing, node/edge/hub counts unchanged vs #7 (confirms
+  the fix only changes edge attributes, not topology).
+- **Installed live** 2026-09-04 (`signalk-routeiq/data/zeeland.sqlite`, previous
+  live db backed up to `zeeland_pre_fairwaybufferfix.sqlite.bak`; `signalk-server`
+  container restarted).
+- **Log**: `data/zeeland_fairwaybufferfix_build.log`
 
 ## Resolved: why the live db (#1) had only 5 hubs when #2-#6 had 56-231
 
