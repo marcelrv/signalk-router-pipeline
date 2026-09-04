@@ -33,6 +33,7 @@ Nodes/Edges delta.
 | 6 | 2026-09-04 | `f560cbf` | `data/zeeland_fresh_clip` | same as #3 but `--pass2-max-fanin-per-node 6` | Does §6.6's Pass 2 fan-in cap fix the hub problem? | 58,215 | 224,553 | 56 | 42 | 0 | no |
 | 7 | 2026-09-04 | `6165615` | `data/zeeland_fresh_clip` | same as #6 but `--pass0-target-fanin-cap 4` | §6.7 fix — Pass 0c/0d Direction A target cap | 58,215 | **187,551** | **0** | **12** | 0 | **YES** |
 | 8 | 2026-09-04 | this commit (`FAIRWAY_MATCH_BUFFER_M` fix, on top of `d9eb3c5`) | `data/zeeland_fresh_clip` | same as #7 (unchanged flags — the fix is in `calculate_edge_attributes`, not a CLI flag) | Fix the fairway cost_factor coverage regression traced from the Krammersluis routing bug report | 58,215 | 187,551 | 0 | 12 | 0 | **YES** |
+| 9 | 2026-09-04 | this commit (`--node-merge-m` fix, on top of `64c38f1`) | `data/zeeland_fresh_clip` | same as #8 plus `--node-merge-m 5.0` | §6.8 fix — generalize `connector_merge_m`'s tolerance-merge to `_get_or_create_node` itself | 57,264 | 185,155 | 0 | 11 | 0 | no |
 
 **Row #1 is not a valid comparison baseline** — its input clip/flags are unknown, so
 its counts cannot be attributed to any specific configuration. It's recorded because
@@ -244,6 +245,69 @@ confirming the fix changes edge attributes only, not topology):
   live db backed up to `zeeland_pre_fairwaybufferfix.sqlite.bak`; `signalk-server`
   container restarted).
 - **Log**: `data/zeeland_fairwaybufferfix_build.log`
+
+### #9 — `zeeland_nodemerge.sqlite` — `--node-merge-m` fix (SPEC-GRAPH-DENSITY.md §6.8)
+
+```bash
+... identical command to #8 plus one new flag:
+.venv/bin/python3 nautical_routing_pipeline.py \
+  --input-dir data/zeeland_fresh_clip \
+  --output data/zeeland_nodemerge.sqlite \
+  --country NL --name "Zeeland" \
+  --description "Zeeland province and approaches (Westerschelde, Oosterschelde, Veerse Meer, Grevelingen, Haringvliet, North Sea approach), based on Rijkswaterstaat IENC / ENC data" \
+  --tags '["ienc","rws","coastal","inland"]' \
+  --url "https://github.com/marcelrv/signalk-router-data" \
+  --license "Public Domain (Rijkswaterstaat)" --copyright "Rijkswaterstaat" \
+  --depth-ceiling 6.0 \
+  --sagitta-cap 75.0 --max-segment-m 2000 \
+  --axis-dedup-cap 50.0 \
+  --connector-merge-m 5.0 \
+  --inland-densify-max-segment-m 120.0 \
+  --pass2-max-fanin-per-node 6 \
+  --pass0-target-fanin-cap 4 \
+  --node-merge-m 5.0
+```
+
+- **Bug fixed**: SPEC-GRAPH-DENSITY.md §6.8 — `_get_or_create_node` dedupes purely by
+  `(round(lon, 5), round(lat, 5))`, a ~1.1m grid at this latitude. Independent
+  node-creation call sites computing "the same" real-world junction point via
+  different geometric paths routinely land a metre or two apart, producing
+  permanently distinct nodes joined by a near-zero-length stub edge — confirmed live
+  on #8 (this build's exact `--node-merge-m 0.0` control): 1,047 edges under 3m
+  network-wide, 12 of them at the Krammersluis Noord/Zuid junction alone.
+- **Fix**: `--node-merge-m` generalizes `connector_merge_m`'s (§6.5) tolerance-merge
+  pattern to `_get_or_create_node` itself via a grid-bucket spatial index
+  (`_node_merge_grid`/`_find_nearby_node`/`_register_node_in_merge_grid`) — every
+  call site now reuses an existing node within tolerance instead of relying purely on
+  exact-rounding coincidence. `0.0` (default) is unchanged/byte-identical; this build
+  uses `5.0m`, matching `connector_merge_m`'s own recommended value.
+- **Measured against #8** (same input clip, same flags otherwise):
+
+  | build | nodes | edges | edges <3m (network-wide) | edges <3m in Krammersluis junction bbox | hubs (od>30) | max out-deg |
+  |---|---|---|---|---|---|---|
+  | #8 (`--node-merge-m 0.0`) | 58,215 | 187,551 | 1,047 (0.56%) | 12 | 0 | 12 |
+  | **#9 (`--node-merge-m 5.0`)** | **57,264** | **185,155** | **221 (0.12%)** | **0** | **0** | **11** |
+
+  `_get_or_create_node` calls: 105,208 total, 49,451 (47%) reused an existing node
+  within 5m instead of minting a new one (most of these are ordinary exact-coincident
+  shared-vertex reuse the old rounding dict already handled fine, not all newly-
+  deduped duplicates — the meaningful signal is the topology delta above, not this
+  raw count). At the specific Krammersluis Noord/Zuid junction bbox (`lat
+  51.65942-51.66442, lon 4.15834-4.16634`) the sub-3m edge count that motivated §6.8
+  goes from 12 to **0** — every stub edge at the exact junction the bug report traced
+  to is gone. Network-wide sub-3m count drops 79% (1,047 -> 221); the 221 remaining
+  are all also under 1.5m, consistent with these being genuine short skeleton
+  segments rather than rounding-grain duplicates. Hub count and max out-degree are
+  unaffected (still 0 hubs; max out-degree improves slightly, 12 -> 11) and
+  `crosses_land` stays 0 in both builds — confirms the fix removes near-duplicate
+  topology without introducing new connectivity problems.
+- **Regression coverage**: `tests/test_node_merge.py` (14 tests: default-disabled
+  parity, tolerance merge/no-merge, diagonal-neighbor-cell lookup, stale-node
+  pruning, context tagging, `_validate_node_merge_m` bounds). Full suite: 226/226
+  passing.
+- **Installed live**: no — kept as a local test build pending explicit deploy
+  confirmation, per this repo's deploy convention.
+- **Log**: `data/zeeland_nodemerge_build.log`
 
 ## Resolved: why the live db (#1) had only 5 hubs when #2-#6 had 56-231
 
