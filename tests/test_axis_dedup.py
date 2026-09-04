@@ -38,7 +38,8 @@ def _transform(px=PX_M):
     return from_origin(EASTING0, NORTHING0_TOP, px, px)
 
 
-def _pipeline(axis_dedup_cap_m=50.0, axis_dedup_fraction=0.5, axis_dedup_floor_m=5.0):
+def _pipeline(axis_dedup_cap_m=50.0, axis_dedup_fraction=0.5, axis_dedup_floor_m=5.0,
+              connector_merge_m=0.0):
     # __init__ only assigns attributes (no file I/O) -- safe to build directly, same
     # pattern as tests/test_sagitta_resample.py's _pipeline().
     p = NauticalRoutingPipeline(data_paths={}, db_path=":memory:")
@@ -46,11 +47,16 @@ def _pipeline(axis_dedup_cap_m=50.0, axis_dedup_fraction=0.5, axis_dedup_floor_m
         axis_dedup_cap_m=axis_dedup_cap_m,
         axis_dedup_fraction=axis_dedup_fraction,
         axis_dedup_floor_m=axis_dedup_floor_m,
+        connector_merge_m=connector_merge_m,
     )
     # Normally set at the top of build_network(); tests that call node-creation
     # methods (_get_or_create_node, build_navmesh_region, ...) directly, without
     # going through build_network itself, need it initialized the same way.
     p.coords_to_node = {}
+    # SPEC-GRAPH-DENSITY.md §6.5: also normally set at the top of build_network() --
+    # same reason as coords_to_node above. Only ever touched when connector_merge_m
+    # > 0.0, but _get_or_split_inland_segment assumes it exists unconditionally.
+    p._inland_split_cuts = {}
     return p
 
 
@@ -768,6 +774,50 @@ class TestNavmeshCarveReconnect:
                                             crs="EPSG:4326").to_crs(self.NAVMESH_UTM_CRS).iloc[0]
                 assert pt_utm.distance(nbr_pt_utm) < WATERWAY_CONNECTOR_MAX_M
 
+    def test_carved_dead_end_splits_the_axis_line_at_true_contact_point_when_split_enabled(self):
+        # SPEC-GRAPH-DENSITY.md §6.5: same fixture as the nearest-vertex test above,
+        # but with connector_merge_m enabled -- the carve-reconnect must land at the
+        # TRUE point of contact (splitting the line's own graph edge there) rather
+        # than always snapping to whichever original vertex happens to be nearest,
+        # which was the root cause of §6.3's own reconnect passes adding back more
+        # nodes than axis-dedup carving removed.
+        pipeline = _pipeline(axis_dedup_cap_m=50.0, axis_dedup_fraction=0.5, axis_dedup_floor_m=5.0,
+                              connector_merge_m=5.0)
+        piece = TestNavmeshPieceCarving()._wide_piece()
+        line_utm = self._dense_through_line_utm()
+        line_wgs84 = self._wgs84(line_utm)
+        pipeline.gdfs["inland_waterways"] = gpd.GeoDataFrame(geometry=[line_wgs84], crs="EPSG:4326")
+        # Unlike the nearest-vertex test above, splitting needs the line's own graph
+        # edges to already exist (as they would after the real build_network()'s own
+        # _build_inland_network() call, which this fixture -- like the rest of the
+        # class -- otherwise bypasses by calling build_navmesh_region directly).
+        pipeline._build_inland_network()
+
+        pieces, seam_coords, line_iloc_by_coord = pipeline._axis_dedup_carve_navmesh_pieces(
+            piece, self.NAVMESH_UTM_CRS)
+        assert line_iloc_by_coord
+
+        for p in pieces:
+            pipeline.build_navmesh_region(p, self.NAVMESH_UTM_CRS, set(),
+                                           carve_line_iloc_by_coord=line_iloc_by_coord)
+
+        assert pipeline.waterway_connector_split_stats["candidates"] > 0
+        inland_coords = self._inland_node_coords(pipeline)
+        assert inland_coords, "expected at least one inland-type node from a reconnect"
+
+        # Every inland node must still sit essentially ON the line (the split point IS
+        # a point on the line, by construction), whether it came from a merge into an
+        # original vertex or a fresh split.
+        line_utm_geom = line_utm
+        for lon, lat in inland_coords:
+            pt_utm = gpd.GeoSeries([Point(lon, lat)], crs="EPSG:4326").to_crs(self.NAVMESH_UTM_CRS).iloc[0]
+            assert line_utm_geom.distance(pt_utm) < 1.0
+        # And at least one split-created node -- unlike the nearest-vertex test above,
+        # split mode is not required to land exactly on an original vertex.
+        line_vertex_coords = {(round(lon, 5), round(lat, 5)) for lon, lat in line_wgs84.coords}
+        assert pipeline.waterway_connector_split_stats["split"] > 0
+        assert not (inland_coords <= line_vertex_coords)
+
     def test_reconnect_targets_the_responsible_line_even_when_not_first_in_index_order(self):
         # Decoy candidate line placed FIRST (inland_waterways index 0): survives the
         # coarse bbox+margin prefilter (same diagonal-past-the-NE-corner placement as
@@ -1117,6 +1167,31 @@ class TestSkeletonCarveReconnect:
                                    for m in list(pipeline.graph.successors(node_id))
                                    + list(pipeline.graph.predecessors(node_id))}
                 assert "inland" not in neighbor_types
+
+    def test_severed_channel_dead_end_splits_at_true_contact_point_when_split_enabled(self, monkeypatch):
+        # SPEC-GRAPH-DENSITY.md §6.5: same fixture as the nearest-vertex test above,
+        # with connector_merge_m enabled -- the skeleton-path reconnect must also land
+        # at the true point of contact rather than always snapping to the nearest
+        # original vertex.
+        transform = _transform()
+        mask = _channel_mask(47, 53)
+        pipeline = _pipeline(axis_dedup_cap_m=50.0, axis_dedup_fraction=0.5, axis_dedup_floor_m=5.0,
+                              connector_merge_m=5.0)
+        line_wgs84 = self._severing_line(transform)
+        pipeline.gdfs["inland_waterways"] = _inland_gdf(line_wgs84)
+        # Splitting needs the line's own graph edges to already exist, as they would
+        # after the real build_network()'s _build_inland_network() call -- this
+        # fixture, like the rest of the class, otherwise bypasses it by calling
+        # build_skeleton_network directly.
+        pipeline._build_inland_network()
+
+        self._run_for_real(monkeypatch, pipeline, mask, transform, PX_M)
+
+        assert pipeline.waterway_connector_split_stats["candidates"] > 0
+        inland_coords = self._inland_node_coords(pipeline)
+        assert inland_coords, "expected at least one inland-type node from a reconnect"
+        for lon, lat in inland_coords:
+            assert line_wgs84.distance(Point(lon, lat)) < 1e-4  # essentially on the line (WGS84 degrees)
 
     def test_no_inland_waterways_layer_leaves_dead_ends_untouched(self, monkeypatch):
         # No axis line anywhere near this piece -- both of the channel's own ends are
