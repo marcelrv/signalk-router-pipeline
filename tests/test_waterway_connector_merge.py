@@ -210,6 +210,32 @@ class TestGetOrSplitInlandSegment:
             self.LINE_ILOC, 0, 0.60, self.COORDS_WGS84, coords_m, 5.0, _FakeTransformer())
         self._assert_three_way_split(p, a_id, b_id)
 
+    def test_endpoint_collision_below_the_coordinate_rounding_grain_merges_not_self_loops(self):
+        # CodeRabbit (PR #18): a merge_tol_m set BELOW _get_or_create_node's ~1.1m
+        # coordinate-rounding grain can leave a real gap between what the exact
+        # metric merge check (in t-space, against entry["len_m"]) accepts and what
+        # 5-decimal-rounding on the REPROJECTED point collapses onto an existing
+        # cut anyway. t=0.001 on this 100m segment is 0.1m from the left endpoint
+        # (u) -- comfortably outside a deliberately tiny 0.05m merge_tol_m, so the
+        # merge-check loop does NOT return early -- but _FakeTransformer's
+        # projection of that same point rounds to the exact same (0.0, 0.0) 5dp
+        # coordinate as u itself. Must reuse u, not remove the real u-v edge and
+        # replace it with a u<->u self-loop plus a re-aliased u-v duplicate.
+        p = self._pipeline_with_seeded_edges()
+        coords_m = self._coords_m()
+        u_id = p.coords_to_node[(0.0, 0.0)]
+        v_id = p.coords_to_node[(0.001, 0.0)]
+
+        node_id = p._get_or_split_inland_segment(
+            self.LINE_ILOC, 0, 0.001, self.COORDS_WGS84, coords_m, 0.05, _FakeTransformer())
+
+        assert node_id == u_id
+        assert p.waterway_connector_split_stats["merged"] == 1
+        assert p.waterway_connector_split_stats["split"] == 0
+        assert p.graph.number_of_nodes() == 2  # no new node minted
+        assert p.graph.has_edge(u_id, v_id) and p.graph.has_edge(v_id, u_id)
+        assert not p.graph.has_edge(u_id, u_id)  # no self-loop
+
 
 # ---------------------------------------------------------------------------
 # _validate_connector_merge_m

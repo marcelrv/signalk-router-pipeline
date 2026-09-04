@@ -2774,6 +2774,17 @@ class NauticalRoutingPipeline:
         proj_y = coords_m[seg_idx][1] + t * (coords_m[seg_idx + 1][1] - coords_m[seg_idx][1])
         proj_lon, proj_lat = transformer.transform(proj_x, proj_y)
         new_id = self._get_or_create_node(proj_lon, proj_lat, "inland", context="waterway_crossing_split")
+        if new_id in (left_id, right_id):
+            # CodeRabbit (PR #18): with connector_merge_m set below
+            # _get_or_create_node's ~1.1m coordinate-rounding grain, the metric
+            # merge check above (exact, in t-space) can correctly find no
+            # existing cut within tolerance, while the REPROJECTED point still
+            # rounds onto left_id's/right_id's own coordinate. Reuse it rather
+            # than removing the real edge and adding a left_id<->left_id
+            # self-loop (new_id==left_id) or re-adding the same edge through an
+            # alias (new_id==right_id).
+            self.waterway_connector_split_stats["merged"] += 1
+            return new_id
 
         eattr = dict(self.graph.get_edge_data(left_id, right_id))
         self.graph.remove_edge(left_id, right_id)

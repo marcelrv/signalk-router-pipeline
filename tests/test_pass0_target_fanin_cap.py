@@ -80,6 +80,30 @@ def _target_with_navmesh_ring(pipeline, n_sources=6, radius_deg=0.001):
     return target_id, source_ids
 
 
+def _target_with_inland_ring(pipeline, n_sources=6, radius_deg=0.001):
+    """Pass 0d's analogue of `_target_with_navmesh_ring` above: one "non-inland"
+    target node T, plus `n_sources` inland-typed nodes wired into a ring. Same
+    rationale -- the ring pre-merges the sources into one union-find group so
+    plain Pass 0/1 (union-find gated) only ever add a single T-to-ring connection,
+    leaving Pass 0d's own union-find-bypassing Direction A to contribute (and be
+    capped) for the rest.
+
+    Returns (target_id, [inland_source_ids...]).
+    """
+    target_id = pipeline._get_or_create_node(BASE_LON, BASE_LAT, "coastal", context="test")
+    source_ids = []
+    for i in range(n_sources):
+        theta = 2 * math.pi * i / n_sources
+        lon = BASE_LON + radius_deg * math.cos(theta)
+        lat = BASE_LAT + radius_deg * math.sin(theta)
+        node_id = pipeline._get_or_create_node(lon, lat, "inland", context="test")
+        source_ids.append(node_id)
+    for a, b in zip(source_ids, source_ids[1:] + source_ids[:1]):
+        pipeline.graph.add_edge(a, b, edge_type="coastal")
+        pipeline.graph.add_edge(b, a, edge_type="coastal")
+    return target_id, source_ids
+
+
 def _covering_component_polygon():
     return box(BASE_LON - 0.01, BASE_LAT - 0.01, BASE_LON + 0.01, BASE_LAT + 0.01)
 
@@ -126,6 +150,49 @@ class TestCapEnabledBoundsPass0cTargetFanIn:
         cap = 2
         p = _pipeline(pass0_target_fanin_cap=cap)
         target_id, source_ids = _target_with_navmesh_ring(p, n_sources=6)
+        ids = [target_id] + source_ids
+
+        p._stitch_component_pieces(ids, _covering_component_polygon(), snap_radius_m=SNAP_RADIUS_M)
+
+        parent = {n: n for n in ids}
+
+        def find(x):
+            while parent[x] != x:
+                x = parent[x]
+            return x
+
+        def union(a, b):
+            parent[find(a)] = find(b)
+
+        for n in ids:
+            for nbr in p.graph.neighbors(n):
+                if nbr in parent:
+                    union(n, nbr)
+        assert len({find(n) for n in ids}) == 1
+
+
+class TestCapEnabledBoundsPass0dTargetFanIn:
+    # CodeRabbit (PR #18): the navmesh-only fixture above can't detect a Pass 0d
+    # regression -- Pass 0d has the identical Direction-A target-side asymmetry as
+    # Pass 0c (see ClassificationConfig.pass0_target_fanin_cap's docstring), on
+    # inland-typed sources instead of navmesh-kind ones, so it needs its own
+    # coverage with its own fixture (_target_with_inland_ring).
+    def test_pass0d_success_onto_the_target_never_exceeds_the_cap(self):
+        cap = 2
+        p = _pipeline(pass0_target_fanin_cap=cap)
+        target_id, source_ids = _target_with_inland_ring(p, n_sources=6)
+        ids = [target_id] + source_ids
+
+        p._stitch_component_pieces(ids, _covering_component_polygon(), snap_radius_m=SNAP_RADIUS_M)
+
+        assert p._stitch_diag["pass0d"]["success"] <= cap
+        assert p._stitch_diag["pass0d"]["target_fanin_capped"] > 0
+        assert p.graph.out_degree(target_id) < len(source_ids)
+
+    def test_every_inland_source_still_ends_up_connected(self):
+        cap = 2
+        p = _pipeline(pass0_target_fanin_cap=cap)
+        target_id, source_ids = _target_with_inland_ring(p, n_sources=6)
         ids = [target_id] + source_ids
 
         p._stitch_component_pieces(ids, _covering_component_polygon(), snap_radius_m=SNAP_RADIUS_M)
