@@ -1,6 +1,8 @@
 # Spec: Graph Node Density — Over-Sampling and Fairway Duplication
 
-Status: §4.1 implemented and verified. §4.1.2, §4.1.3, §5.1 and §6.1 fixed. Not enabled by default.
+Status: §4.1 implemented and verified. §4.1.2, §4.1.3, §5.1 and §6.1 fixed. §6.3, §6.4,
+and §6.5 implemented. None enabled by default; §6.5 is the fix for the net density
+regression §6.3+§6.4 compounded (see §6.5) and should ship before either is defaulted on.
 Complements: `SPEC-RECOMMENDED-TRACK.md`, `SPEC-FAIRWAY-HARMONIZATION.md`
 Scope: `nautical_routing_pipeline.py` (`build_skeleton_network`, `_resample_long_skeleton_edges`, `_skeleton_raster_to_graph`, `ClassificationConfig`)
 Measured against: `data/zeeland_full.sqlite` (48,553 nodes / 137,718 directed edges), RWS source GeoJSON
@@ -912,6 +914,99 @@ in `tests/test_inland_densify.py` (`TestDensifyRejectsUnsafeCaps`): NaN, `+inf`,
 `1e-9` cap all raise `ValueError` instead of reaching `shapely.segmentize`; the floor
 value itself (1.0m) is still accepted; a negative cap keeps taking the pre-existing
 "disabled" path unchanged, since it never reaches the new check.
+
+### 6.5 The net effect: five rounds of locally-valid fixes compounded into a regression — connector merge/split — IMPLEMENTED
+
+**Symptom.** A rendered screenshot at a bridge crossing over a narrow canal (Postbrug,
+Yerseke) showed dense clusters of nodes still present after §4.1, §4.3, §6.3, and §6.4
+all shipped — including nodes less than 5m apart with no depth difference to explain
+it, and nodes right on the fairway line that should have been suppressed by axis-dedup.
+
+**Measurement.** Every prior round in this section verified itself only against its own
+immediate predecessor build, never against this spec's own original baseline. Traced
+via the `.bak`/`.disabled` snapshots each round leaves behind before shipping the next:
+
+| stage | nodes | edges |
+|---|---|---|
+| original baseline (§1) | 48,553 | 137,718 |
+| + §4.1 sagitta resampling | 32,918 | 98,091 |
+| + §4.3 axis-dedup + §6.3 carve-reconnect | 50,432 | 175,743 |
+| + §6.4 inland-waterways densify | **64,717** | **203,582** |
+
+§4.1 was a real win (48,553 → 32,918). Everything shipped after it added nodes back
+faster than it removed them: the deployed database ends 33% above the original node
+count and 48% above the original edge count — worse than doing nothing.
+
+**Root cause, traced to a specific shared mechanism.** Two independent call sites each
+always mint a brand-new node instead of first checking whether the pipeline already has
+something equivalent nearby:
+
+1. `_connect_waterway_crossing` always snaps to the *nearest existing vertex* of the
+   target `inland_waterways` line, never the true point of contact. §6.3's
+   carve-reconnect calls it for every carve-induced dead end — which, by construction,
+   sits within a few metres to tens of metres of the very axis line responsible for
+   carving it — and gets a permanent new node + stub edge instead of merging straight
+   into that axis. §6.4's fan-out fix (densify the entire ~3,700km network to
+   100-150m spacing so a nearby vertex always exists) is the same "pay the cost
+   everywhere" anti-pattern §4.1 already replaced once, one section later.
+2. `_add_opening_bridge_edges` runs *after* `build_network()` (all of axis-dedup
+   carving and §6.3's reconnect included) and is completely unaware of any of it: for
+   every movable bridge it unconditionally mints a new node at each
+   fairway/inland-waterways intersection with the bridge polygon, sited essentially on
+   the axis by construction, then always wires up to 4 more edges outward. A bridge
+   where both a fairway line and an inland-waterways line intersect produces two
+   near-coincident opening nodes, each independently fanning out its own edges — the
+   fairway-adjacent clusters the screenshot showed were never in axis-dedup's path at
+   all.
+
+**Design options considered.** Following §6.4.1's own precedent for choosing between
+raster-time carving and post-hoc pruning: fixing the *symptom* (mint fewer nodes near
+existing ones) by adding yet another compensating pass was rejected outright — that is
+exactly the pattern that produced this regression across five rounds. The fix has to
+replace the root mechanism (always-mint) at both call sites, not add a sixth
+compensating pass on top.
+
+**Chosen approach.** One flag, `connector_merge_m` (`--connector-merge-m`, default
+0.0/disabled, matching this spec's established convention), gating two changes:
+
+- `_connect_waterway_crossing`/new `_get_or_split_inland_segment`: project the
+  crossing/dead-end point onto the target line; reuse an existing vertex (or a
+  previously-inserted split point) within tolerance, or split that segment's current
+  graph edge to insert exactly one new vertex at the true point of contact. Live
+  per-segment split state is tracked pipeline-wide in `self._inland_split_cuts`
+  (reset once per `build_network()`, unlike the call-scoped `line_m_cache`), so a
+  second candidate landing on a segment a first candidate already split — from any of
+  the three call sites, across any piece, in any order — always sees the current
+  sub-segment structure rather than stale original geometry. This is the true
+  edge-splitting option §6.4.1 named and deferred for its own fan-out fix; doing it
+  here, driven by real contact points rather than a flat network-wide cap, is expected
+  to make §6.4's blanket densify unnecessary as a follow-up (not part of this change).
+- `_add_opening_bridge_edges`: dedupe near-coincident `opening_pts` before planting
+  any node, and search for an existing nearby node before minting a new one. A reused
+  node may already carry real data, so the merge never blindly re-stamps it:
+  `node_depth` only ever tightens (never relaxes a more restrictive existing
+  constraint with the bridge's permissive 99.0 sentinel), and `node_kind_id`/`source`
+  are left alone if the node is already typed.
+
+Recommended tolerance once enabled: 5.0m — comfortably above `_get_or_create_node`'s
+~1.1m coordinate-rounding grain, matching `axis_dedup_floor_m`'s own established 5m
+"effectively coincident" floor, and two orders of magnitude below
+`WATERWAY_CONNECTOR_MAX_M` (250m).
+
+**Verification.** Same five-gate discipline as §4.3.3/§6.3.4: `connector_merge_m ==
+0.0` reproduces prior output byte-for-byte (194/194 unit tests pass unchanged);
+`crosses_land == 0`; connectivity measured by edge length, not node count, against
+`data/zeeland_clip`; POI-pair reachability (zero pairs lost, Krammersluizen checked
+explicitly given its history in this area); and — the specific gate the prior five
+rounds skipped — node/edge counts measured against the *original* baseline
+(48,553/137,718), not just the immediately-prior build. Also: a connector-edge-length
+spot check, and a re-run of §6.4's own hub-node scan (`out-degree > 30`) with
+`--connector-merge-m 5.0` and `--inland-densify-max-segment-m 0.0` to confirm splitting
+alone fixes the original hub-fanout problem without needing §6.4's blanket densify —
+the evidence needed before recommending §6.4 be defaulted back off.
+
+Covered by `tests/test_waterway_connector_merge.py` and extensions to
+`tests/test_axis_dedup.py`'s `TestNavmeshCarveReconnect`/`TestSkeletonCarveReconnect`.
 
 ## 7. Risks
 
