@@ -1108,6 +1108,126 @@ ring member's connector; cap=N bounds Pass 0c's own contribution at N
 graph stays fully connected regardless. Real-build five-gate verification (does hub
 count actually drop against `data/BUILD_LOG.md`'s baseline) pending.
 
+### 6.8 `_get_or_create_node`'s ~1.1m rounding grain leaves near-duplicate nodes at multi-subsystem junctions
+
+**Symptom.** A rendered screenshot at the Krammersluis Noord/Zuid lock junction, with
+`--connector-merge-m 5.0` and every other §6.3-§6.7 fix already applied (live db,
+0 hubs by the `out-degree > 30` metric), still showed a dense crisscross/triangulated
+web of nodes and edges instead of a clean route through the junction. This is a
+*different* mechanism from anything §6.3-§6.7 measured: none of the offending nodes
+are hubs. Queried directly against the live build: 165 nodes packed into roughly a
+0.5km² area around the junction, but the highest out-degree among them is 6 — the
+`>30` hub metric every prior round in this section optimized for never fires here at
+all.
+
+**Root cause.** `_get_or_create_node` (nautical_routing_pipeline.py:2334) dedupes
+nodes purely by `(round(lon, 5), round(lat, 5))` — a grid roughly **1.1m** wide at
+Zeeland's latitude. Independent node-creation call sites — skeleton medial-axis
+extraction, navmesh boundary generation, `_add_lock_crossing_edges`,
+`_add_opening_bridge_edges`, gap-resolve, the coastal-connectivity stitch passes —
+each computing "the same" real-world junction point via a different geometric path
+(a different source layer, a different projection round-trip, a different sampling
+resolution) routinely land a metre or two apart: close enough to be the same point in
+every practical sense, but on opposite sides of that 1.1m rounding boundary, so they
+become two permanently distinct nodes joined by a near-zero-length stub edge. Each
+stub then fans out to its own real neighbors independently, which is exactly the
+crisscrossing/triangulated look the screenshot showed instead of one clean line
+through the shared junction. Confirmed directly against the live build:
+
+```
+source            target            dist_m   edge_kind
+1157982930416234  509982930416234   1.11     navmesh_boundary   (51.66192,4.16234) vs (51.66193,4.16234)
+509981058415791   509981058415793   1.38     centerline
+509981238415979   509981238415982   2.08     centerline
+```
+
+`connector_merge_m` (§6.5) already solved exactly this class of problem — project
+onto the target and reuse/split within tolerance instead of always minting a new
+node — but only at the two call sites §6.5 identified
+(`_connect_waterway_crossing`/`_get_or_split_inland_segment` and
+`_add_opening_bridge_edges`'s own dedupe). Every other node-creation call site still
+only has `_get_or_create_node`'s bare ~1.1m rounding grain, with no tolerance.
+
+**Scope, measured** (live build, post fairway-buffer fix, `data/BUILD_LOG.md` #8):
+1,047 edges under 3m and 369 under 1.5m out of 187,551 total (~0.5-0.6%) — small in
+aggregate, but concentrated exactly at multi-subsystem junctions (locks, bridges,
+piece-stitch boundaries), which is where a user is most likely to zoom in and notice
+it.
+
+**Design options**, following §6.5's own precedent (fix the mechanism, not add a
+sixth compensating pass on top of five prior ones):
+
+1. Generalize §6.5's spatial-tolerance-merge pattern to `_get_or_create_node` itself
+   — every node-creation call site reuses (or, where a real edge already spans the
+   gap, splits) an existing node within tolerance, the same principle §6.5 already
+   validated for its two call sites, applied universally.
+2. A dedicated post-pass late in `build_network()` (or immediately before
+   `calculate_edge_attributes`) that union-find merges any two nodes within a small
+   tolerance and collapses the resulting degenerate near-zero-length edges. Lower
+   risk / more localized than touching the universal node-creation path, but it is
+   exactly the "symptom fix via a compensating pass" pattern §6.5 rejected outright
+   after five rounds of it compounding into a regression — listed for completeness,
+   not as the recommended direction.
+
+**Recommended**: option 1, gated behind a new tolerance flag (e.g. `--node-merge-m`,
+default 0.0/disabled) matching this spec's established convention so a `0.0` build
+stays byte-identical to today.
+
+**Status: NOT YET IMPLEMENTED.** Deliberately kept out of the fairway
+`cost_factor`/`FAIRWAY_MATCH_BUFFER_M` fix (a different bug, in a different
+subsystem, verified independently) — this one touches core node identity/merging, a
+different risk class, and deserves its own A/B build verification the way
+`connector_merge_m` got in §6.5.
+
+### 6.9 Clarification: `axis_dedup_cap_m` is a ceiling on a width-scaled tolerance, and lock polygons are exempted entirely — not a bug
+
+Investigating the same Krammersluis screenshot also raised a real but different
+question: with `--axis-dedup-cap 50.0` in effect, why do so many nodes still sit
+well inside 50-75m of a genuine `inland_waterways` axis line running through that
+junction (`Krammersluis Zuid`/`Krammersluis Noord`/their `Aanloop` approaches, all
+present in the source data at exactly this location)? Measured directly against the
+live build: of 165 nodes in the junction's bounding box, 79.4% sit within 75m of a
+real axis line and 50.9% sit within the build's actual 50m cap.
+
+This is **working as designed**, not a regression, once both mechanisms
+`_axis_dedup_suppression_mask` implements are accounted for:
+
+1. **`axis_dedup_cap_m` is a ceiling, not a guaranteed corridor width.** The actual
+   per-pixel suppression tolerance is `tol = clip(axis_dedup_fraction * local_channel_
+   width, axis_dedup_floor_m, axis_dedup_cap_m)` (§4.3.2) — proportional to the LOCAL
+   channel width at that pixel, capped at `axis_dedup_cap_m` and floored at
+   `axis_dedup_floor_m` (5m). Confirmed directly: 17 of the 165 junction nodes sit
+   5-50m from the axis line (inside the nominal 50m cap) but all measure
+   `min_width == 22.0m` — `tol = clip(0.5 * 22, 5, 50) = 11m` there, so a node 15-50m
+   out is correctly left unsuppressed by the formula, not despite the 50m cap but
+   because the cap was never the binding term at that pixel.
+2. **Lock polygons are exempted from suppression entirely, regardless of distance**
+   (`_lock_protection_mask`, itself added for a previously-measured Krammersluizen
+   regression: axis-dedup once suppressed a node `_add_lock_crossing_edges` needed to
+   hook its chamber-transit edges onto, costing 278/10,878 POI-pairs, 100% through
+   Krammersluizen). The protection buffer reuses `axis_dedup_cap_m` itself (50m in
+   this build). Confirmed directly: 23.6% of the junction's 165 nodes fall inside
+   `lock_polygon ∪ 50m` for the two `Krammersluizen` chamber polygons present here.
+   A real lock complex commonly clusters 2+ chambers (here: Krammersluis Noord,
+   Krammersluis Zuid, plus the separate `Jachtensluis Krammersluizen` yacht lock,
+   only the first two of which are `locks_polygons.geojson` features) within a few
+   hundred metres of each other, so the union of their protection buffers can cover
+   most or all of a junction a user zooms into — not a flaw in the mechanism, but its
+   effective footprint is much larger at a multi-chamber junction than at an isolated
+   single lock.
+
+Between the two, essentially every node inside the build's actual 50m cap traces to a
+legitimate, already-documented reason (the axis line's own ingested vertices, the
+lock-protection carve-out, or a locally-narrower width-scaled tolerance); nodes in
+the 50-75m band are simply outside this build's configured cap (50m, not 75m — the
+75m figure is `--sagitta-cap`, a different flag governing chord-to-centerline
+resampling, not axis-dedup's suppression radius) and were never candidates for
+suppression in the first place. No follow-up is proposed here; recorded so the
+reasoning isn't re-derived from scratch next time this junction's node density comes
+up. Whether the lock-protection buffer should shrink when multiple chambers cluster
+this tightly is an open tuning question, not a bug, and is left for a future
+investigation if the compounded footprint proves to matter in practice.
+
 ## 7. Risks
 
 - Long edges on straight reaches increase the chance a single edge spans a chart feature
