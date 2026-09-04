@@ -168,13 +168,20 @@ the only mutually-comparable set so far (identical `data/zeeland_fresh_clip` inp
   (187,551 vs 203,582), zero hubs (vs 5), lower max out-degree (12 vs 33).
 - **Additional verification done** (not yet a scripted/repeatable check — ad hoc
   this session):
-  - Largest-component-by-edge-length: 85.62% (vs #4's 86.78% control on identical
-    data/flags-minus-caps) — a real but small (1.16pp) dip.
+  - Largest-component-by-edge-length: 85.62%. Isolating `--pass0-target-fanin-cap`'s
+    own effect requires comparing against **#6** (86.63%), not #4 — #6 and #7 share
+    `--connector-merge-m 5.0`, so only the fan-in cap differs between them (#4 is a
+    full-configuration comparator, `--connector-merge-m 0.0` as well, so a #7-vs-#4
+    delta would conflate both flags' effects). #6 vs #7: **-1.01pp**, a real but
+    small dip. (#4's 86.78% is noted for completeness; not the isolating comparison.)
   - **POI-pair reachability** (767 named POIs common to both #4 and #7, matched by
     name, 293,761 pairs checked): **0 lost, 0 gained** — the edge-length dip above
     does not correspond to any real place-pair losing routability. This project's
     own history (§6.1) already flagged raw edge-length-% as a metric that can look
     like a regression while POI-pair reachability shows none — confirmed again here.
+    (This particular check used #4 as the control since that's what was on hand;
+    the conclusion — zero reachability loss — doesn't depend on isolating #6 vs #7
+    specifically, unlike the edge-length-% comparison above.)
 - **Installed live** 2026-09-04 (see deploy notes below).
 - **Log**: `data/zeeland_pass0targetcap_build.log`
 
