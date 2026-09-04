@@ -33,7 +33,7 @@ Nodes/Edges delta.
 | 6 | 2026-09-04 | `f560cbf` | `data/zeeland_fresh_clip` | same as #3 but `--pass2-max-fanin-per-node 6` | Does §6.6's Pass 2 fan-in cap fix the hub problem? | 58,215 | 224,553 | 56 | 42 | 0 | no |
 | 7 | 2026-09-04 | `6165615` | `data/zeeland_fresh_clip` | same as #6 but `--pass0-target-fanin-cap 4` | §6.7 fix — Pass 0c/0d Direction A target cap | 58,215 | **187,551** | **0** | **12** | 0 | **YES** |
 | 8 | 2026-09-04 | this commit (`FAIRWAY_MATCH_BUFFER_M` fix, on top of `d9eb3c5`) | `data/zeeland_fresh_clip` | same as #7 (unchanged flags — the fix is in `calculate_edge_attributes`, not a CLI flag) | Fix the fairway cost_factor coverage regression traced from the Krammersluis routing bug report | 58,215 | 187,551 | 0 | 12 | 0 | **YES** |
-| 9 | 2026-09-04 | this commit (`--node-merge-m` fix, on top of `64c38f1`) | `data/zeeland_fresh_clip` | same as #8 plus `--node-merge-m 5.0` | §6.8 fix — generalize `connector_merge_m`'s tolerance-merge to `_get_or_create_node` itself | 57,264 | 185,155 | 0 | 11 | 0 | no |
+| 9 | 2026-09-04 | `ba07297` | `data/zeeland_fresh_clip` | same as #8 plus `--node-merge-m 5.0` | §6.8 fix — generalize `connector_merge_m`'s tolerance-merge to `_get_or_create_node` itself | 57,264 | 185,155 | 0 | 11 | 0 | **YES (currently live)** |
 
 **Row #1 is not a valid comparison baseline** — its input clip/flags are unknown, so
 its counts cannot be attributed to any specific configuration. It's recorded because
@@ -305,8 +305,9 @@ confirming the fix changes edge attributes only, not topology):
   parity, tolerance merge/no-merge, diagonal-neighbor-cell lookup, stale-node
   pruning, context tagging, `_validate_node_merge_m` bounds). Full suite: 226/226
   passing.
-- **Installed live**: no — kept as a local test build pending explicit deploy
-  confirmation, per this repo's deploy convention.
+- **Installed live** 2026-09-04 (`signalk-routeiq/data/zeeland.sqlite`, previous
+  live db backed up to `zeeland_pre_nodemergefix.sqlite.bak`; `signalk-server`
+  container restarted).
 - **Log**: `data/zeeland_nodemerge_build.log`
 
 ## Resolved: why the live db (#1) had only 5 hubs when #2-#6 had 56-231
