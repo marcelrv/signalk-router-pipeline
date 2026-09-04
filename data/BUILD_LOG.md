@@ -33,7 +33,8 @@ Nodes/Edges delta.
 | 6 | 2026-09-04 | `f560cbf` | `data/zeeland_fresh_clip` | same as #3 but `--pass2-max-fanin-per-node 6` | Does §6.6's Pass 2 fan-in cap fix the hub problem? | 58,215 | 224,553 | 56 | 42 | 0 | no |
 | 7 | 2026-09-04 | `6165615` | `data/zeeland_fresh_clip` | same as #6 but `--pass0-target-fanin-cap 4` | §6.7 fix — Pass 0c/0d Direction A target cap | 58,215 | **187,551** | **0** | **12** | 0 | **YES** |
 | 8 | 2026-09-04 | this commit (`FAIRWAY_MATCH_BUFFER_M` fix, on top of `d9eb3c5`) | `data/zeeland_fresh_clip` | same as #7 (unchanged flags — the fix is in `calculate_edge_attributes`, not a CLI flag) | Fix the fairway cost_factor coverage regression traced from the Krammersluis routing bug report | 58,215 | 187,551 | 0 | 12 | 0 | **YES** |
-| 9 | 2026-09-04 | `ba07297` | `data/zeeland_fresh_clip` | same as #8 plus `--node-merge-m 5.0` | §6.8 fix — generalize `connector_merge_m`'s tolerance-merge to `_get_or_create_node` itself | 57,264 | 185,155 | 0 | 11 | 0 | **YES (currently live)** |
+| 9 | 2026-09-04 | `ba07297` | `data/zeeland_fresh_clip` | same as #8 plus `--node-merge-m 5.0` | §6.8 fix — generalize `connector_merge_m`'s tolerance-merge to `_get_or_create_node` itself | 57,264 | 185,155 | 0 | 11 | 0 | superseded by #10 |
+| 10 | 2026-09-04 | this commit (§6.9 follow-up, on top of `8e9f507`/`4ae9cd9`) | `data/zeeland_fresh_clip` | same as #9 plus `--sagitta-cap 250.0 --axis-dedup-cap 100.0 --axis-dedup-floor-m 100.0 --min-navmesh-radius-m 1200.0` | §6.9 follow-up — flat 100m axis-dedup floor to fix real crisscross at the Vossemeersebrug/Tholen narrows | 42,092 | 124,689 | 0 | 14 | 0 | **YES (currently live)** |
 
 **Row #1 is not a valid comparison baseline** — its input clip/flags are unknown, so
 its counts cannot be attributed to any specific configuration. It's recorded because
@@ -325,8 +326,86 @@ confirming the fix changes edge attributes only, not topology):
   number or redeploy needed.
 - **Installed live** 2026-09-04 (`signalk-routeiq/data/zeeland.sqlite`, previous
   live db backed up to `zeeland_pre_nodemergefix.sqlite.bak`; `signalk-server`
-  container restarted).
+  container restarted). Superseded same-day by #10 below.
 - **Log**: `data/zeeland_nodemerge_build.log`
+
+### #10 — `zeeland_axisdedup_wide.sqlite` — §6.9 follow-up: fix a real crisscross at Vossemeersebrug/Tholen narrows
+
+```bash
+... identical command to #9 plus four new flags:
+.venv/bin/python3 nautical_routing_pipeline.py \
+  --input-dir data/zeeland_fresh_clip \
+  --output data/zeeland_axisdedup_wide.sqlite \
+  --country NL --name "Zeeland" \
+  --description "Zeeland province and approaches (Westerschelde, Oosterschelde, Veerse Meer, Grevelingen, Haringvliet, North Sea approach), based on Rijkswaterstaat IENC / ENC data" \
+  --tags '["ienc","rws","coastal","inland"]' \
+  --url "https://github.com/marcelrv/signalk-router-data" \
+  --license "Public Domain (Rijkswaterstaat)" --copyright "Rijkswaterstaat" \
+  --depth-ceiling 6.0 \
+  --sagitta-cap 250.0 --max-segment-m 2000 \
+  --axis-dedup-cap 100.0 --axis-dedup-floor-m 100.0 \
+  --min-navmesh-radius-m 1200.0 \
+  --connector-merge-m 5.0 \
+  --inland-densify-max-segment-m 120.0 \
+  --pass2-max-fanin-per-node 6 \
+  --pass0-target-fanin-cap 4 \
+  --node-merge-m 5.0
+```
+
+- **Bug report**: a screenshot at the Vossemeersebrug bridge (Nieuw-Vossemeer/Tholen
+  narrows, ~51.584N 4.201E) showed a dense crisscross/triangulated web of nodes and
+  edges paralleling a real `inland_waterways` axis line through a genuinely narrow
+  fairway — the same visual symptom as §6.8's Krammersluis case, but this junction
+  has no lock and every node/edge involved was already confirmed correct topology
+  (0 hubs, 0 crosses_land) -- so it traces to §6.9's documented mechanism, not a new
+  bug: axis-dedup's suppression tolerance is `clip(0.5 * local_width, 5, cap)`,
+  which for a 22-79m-wide channel (measured directly against #9) only reaches
+  11-40m -- not enough to suppress skeleton branches near the banks, so they stay
+  unsuppressed alongside the real axis line.
+- **New CLI flags added** (this commit, `nautical_routing_pipeline.py`):
+  `--axis-dedup-fraction`, `--axis-dedup-floor-m`, `--min-navmesh-radius-m` --
+  `ClassificationConfig` fields that already existed but had no CLI override before
+  now (only `--axis-dedup-cap`/`--sagitta-cap` were exposed). All three default to
+  `None` (= keep the dataclass default), so omitting them reproduces prior builds
+  byte-for-byte.
+- **Root cause confirmed, then ruled OUT one hypothesis**: queried the live db (#9)
+  directly at the Vossemeersebrug bbox before building anything -- every node there
+  is `node_kind=point` (skeleton-derived), not `navmesh_vertex`, and
+  `min_navmesh_radius_m=800` already correctly excludes this channel from navmesh
+  treatment. So `--min-navmesh-radius-m` (raised to 1200 here anyway, for general
+  robustness) is NOT what fixes this specific symptom -- `--axis-dedup-floor-m` is:
+  flooring the suppression tolerance at a flat 100m regardless of local width
+  directly closes the 11-40m gap measured above.
+- **Measured against #9** (same input clip, `--sagitta-cap`/`--axis-dedup-cap`/
+  `--axis-dedup-floor-m`/`--min-navmesh-radius-m` raised, everything else unchanged):
+
+  | build | nodes | edges | hubs (od>30) | max out-deg | crosses_land |
+  |---|---|---|---|---|---|
+  | #9 | 57,264 | 185,155 | 0 | 11 | 0 |
+  | **#10** | **42,092** | **124,689** | **0** | **14** | **0** |
+
+  Vossemeersebrug bbox (`lat 51.578-51.590, lon 4.192-4.211`): **52 -> 29 nodes,
+  182 -> 74 edges**, and the remaining topology is mostly a clean out-degree-2
+  chain (a simple line) instead of a fan -- the few remaining degree 3-6 nodes are
+  legitimate bridge/waterway-crossing junctions, not rounding artifacts. Krammersluis
+  junction (§6.8's own case, `lat 51.657-51.667, lon 4.158-4.166`) also improved
+  further: 62 -> 44 nodes, 211 -> 164 outgoing edges, still 0 sub-3m stub edges.
+  **POI-pair reachability** (767 named POIs common to #9 and #10, matched by name):
+  1 lost from the main component (a minor buoy/cycle-path marker), 3 gained (three
+  real marinas) -- net neutral to positive, no real regression. Largest-component
+  share: 84.18% (#9) -> 82.26% (#10), the expected small dip from removing ~26% of
+  total nodes, not a connectivity problem (confirmed by the reachability check
+  above).
+- **Operational note**: a first attempt at `--axis-dedup-cap 150.0` was OOM-killed
+  by the host (a shared machine also running signalk-server, openhab, grafana, and
+  other live services) partway through the wide/narrow polygon split step -- dialed
+  back to `--axis-dedup-cap 100.0` (matching the bug report's own "100m or so"
+  estimate) and it completed cleanly, peaking around 3.4GB RSS with 7+GB still
+  available system-wide.
+- **Installed live** 2026-09-04 (`signalk-routeiq/data/zeeland.sqlite`, previous
+  live db backed up to `zeeland_pre_axisdedupwide.sqlite.bak`; `signalk-server`
+  container restarted).
+- **Log**: `data/zeeland_axisdedup_wide_build.log`
 
 ## Resolved: why the live db (#1) had only 5 hubs when #2-#6 had 56-231
 
