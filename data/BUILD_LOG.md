@@ -18,13 +18,23 @@ command unknown/unreproduced — flagged in #1 below): **64,717 nodes / 203,582 
 
 ## Table
 
-| # | Date | Commit | Output file | Nodes | Edges | Hubs (od>30) | Max out-deg | crosses_land | Installed live? |
-|---|---|---|---|---|---|---|---|---|---|
-| 1 | (unknown, ~2026-09-03) | unknown | `signalk-routeiq/data/zeeland.sqlite` | 64,717 | 203,582 | 5 | 33 | 0 | **YES (currently live)** |
-| 2 | 2026-09-04 | `38a09ed` | `data/zeeland_connectormerge.sqlite` | 45,765 | 162,004 | 231 | 222 | 0 | no |
-| 3 | 2026-09-04 | `38a09ed` | `data/zeeland_connectormerge2.sqlite` | 58,215 | 224,553 | 56 | 42 | 0 | no |
-| 4 | 2026-09-04 | `38a09ed` | `data/zeeland_control_nomerge.sqlite` | 56,433 | 217,787 | 65 | 42 | 0 | no |
-| 5 | 2026-09-04 | `38a09ed` | `data/zeeland_dedup25.sqlite` | 59,544 | 229,379 | 57 | 42 | 0 | no |
+**Node/edge counts are only comparable across rows with the same Input dir.** Two
+rows built from different source clips are not an A/B pair no matter how similar
+their flags look — check the Input dir column before drawing any conclusion from a
+Nodes/Edges delta.
+
+| # | Date | Commit | Input dir (clip) | Flags (non-default only) | Purpose | Nodes | Edges | Hubs (od>30) | Max out-deg | crosses_land | Installed live? |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| 1 | unknown (~2026-09-03) | unknown | **UNKNOWN — not reconstructed** | **UNKNOWN** | n/a (found already deployed) | 64,717 | 203,582 | 5 | 33 | 0 | **YES (currently live)** |
+| 2 | 2026-09-04 | `38a09ed` | `data/zeeland_fresh_clip` | `--sagitta-cap 75 --max-segment-m 2000 --axis-dedup-cap 50 --connector-merge-m 5.0 --inland-densify-max-segment-m 0.0` | Does §6.5 alone (no §6.4 densify) fix the hub problem? | 45,765 | 162,004 | 231 | 222 | 0 | no |
+| 3 | 2026-09-04 | `38a09ed` | `data/zeeland_fresh_clip` | `--sagitta-cap 75 --max-segment-m 2000 --axis-dedup-cap 50 --connector-merge-m 5.0 --inland-densify-max-segment-m 120.0` | "Everything on" recommended config | 58,215 | 224,553 | 56 | 42 | 0 | no |
+| 4 | 2026-09-04 | `38a09ed` | `data/zeeland_fresh_clip` | same as #3 but `--connector-merge-m 0.0` | Clean control for #3 — isolate §6.5's own effect | 56,433 | 217,787 | 65 | 42 | 0 | no |
+| 5 | 2026-09-04 | `38a09ed` | `data/zeeland_fresh_clip` | same as #3 but `--axis-dedup-cap 25.0` | Does a tighter axis-dedup cap reduce stitch-pass hubs? | 59,544 | 229,379 | 57 | 42 | 0 | no |
+
+**Row #1 is not a valid comparison baseline** — its input clip/flags are unknown, so
+its counts cannot be attributed to any specific configuration. It's recorded because
+it's what's currently live, not because it's a controlled data point. Rows #2-#5 are
+the only mutually-comparable set so far (identical `data/zeeland_fresh_clip` input).
 
 ## Details
 
