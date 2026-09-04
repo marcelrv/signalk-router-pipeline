@@ -1008,20 +1008,47 @@ class ClassificationConfig:
     # geometrically nearest cross-group candidate with no per-node fan-in limit --
     # unlike Pass 0c/Pass 0d, which each cap how many cross-type connectors a single
     # node can accumulate (MAX_CROSS_CONNECTORS_PER_NAVMESH_NODE / MAX_LOCAL_
-    # CONNECTORS_PER_INLAND_NODE, both 2). Across many rounds, many different groups
-    # can independently pick the SAME well-placed node as their nearest candidate,
-    # producing a hub with dozens to hundreds of edges (measured directly: up to
-    # out-degree 42 from as few as ~58 Pass 2 successes on one real Zeeland build).
-    # 0 (default) disables this entirely -- Pass 2 stays byte-identical to today's,
-    # matching --sagitta-cap/--axis-dedup-cap/--inland-densify-max-segment-m/
-    # --connector-merge-m's convention. > 0: a node that has already accumulated
-    # this many Pass-2-added edges is skipped as a candidate target (source or
-    # sink) -- Pass 2 tries the next-nearest candidate instead, same as it already
-    # does for a poly/land-rejected one. A group that only ever discovers capped-out
-    # candidates falls through to _resolve_local_skeleton_gaps' own, differently-
-    # mechanised fallback (already the existing safety net for whatever Pass 2
-    # can't merge), not left permanently disconnected.
+    # CONNECTORS_PER_INLAND_NODE, both 2, though see §6.7: that cap turned out to
+    # only cover one direction). Across many rounds, many different groups can
+    # independently pick the SAME well-placed node as their nearest candidate,
+    # producing a hub. 0 (default) disables this entirely -- Pass 2 stays
+    # byte-identical to today's, matching --sagitta-cap/--axis-dedup-cap/
+    # --inland-densify-max-segment-m/--connector-merge-m's convention. > 0: a node
+    # that has already accumulated this many Pass-2-added edges is skipped as a
+    # candidate target (source or sink) -- Pass 2 tries the next-nearest candidate
+    # instead, same as it already does for a poly/land-rejected one. A group that
+    # only ever discovers capped-out candidates falls through to
+    # _resolve_local_skeleton_gaps' own, differently-mechanised fallback (already
+    # the existing safety net for whatever Pass 2 can't merge), not left
+    # permanently disconnected. NOTE (§6.7): verifying this on a real build found
+    # Pass 2 was NOT the dominant real-world hub source on that dataset -- see
+    # pass0_target_fanin_cap below for the mechanism that was.
     pass2_max_fanin_per_node: int = 0
+    # SPEC-GRAPH-DENSITY.md §6.7: Pass 0c (navmesh perimeter) and Pass 0d (inland
+    # nodes) each cap cross-type fan-in -- but only in ONE direction. Direction A
+    # ("each navmesh/inland vertex -> its k nearest cross-type neighbours") caps how
+    # many connectors THAT vertex's own search may add, keyed by the navmesh/inland
+    # node; Direction B (the symmetric reverse query) caps a navmesh/inland node as
+    # a TARGET. Direction A's own target side (the "other"/non-inland node being
+    # picked) has no cap at all: many different navmesh vertices (or inland nodes)
+    # can each independently pick the SAME nearby point as one of their allotted
+    # connectors, with nothing stopping that point from accumulating dozens of
+    # edges. Measured directly against a real Zeeland build (with
+    # pass2_max_fanin_per_node enabled and NOT reducing the hub count at all): a
+    # single "point"-kind node accumulated 42 edges, 40 of them to distinct
+    # navmesh-perimeter vertices, every edge 44-93m (short -- confirming Pass 0c's
+    # radius-gated Direction A, not Pass 2's unbounded-distance search, as the
+    # actual source). 0 (default) disables this entirely -- Pass 0c/0d's Direction A
+    # target side stays uncapped, byte-identical to today's. > 0: that value caps
+    # how many Direction-A-sourced connectors a single "other"/non-inland target may
+    # accumulate (across BOTH Pass 0c and Pass 0d, and counting Direction B's own
+    # successes against the same node too, so the two directions share one real
+    # budget) -- once hit, Direction A skips that target and tries the next-nearest
+    # candidate instead, same pattern as every other cap in this file. Safe to
+    # enable independently of pass2_max_fanin_per_node: Pass 1/Pass 2 run after
+    # Pass 0c/0d and remain the connectivity guarantee regardless of how tightly
+    # this caps Pass 0c/0d.
+    pass0_target_fanin_cap: int = 0
 
     def pixel_size_for(self, min_dimension_m: float) -> float:
         return float(np.clip(min_dimension_m / self.pixel_dim_divisor,
@@ -1260,7 +1287,8 @@ class NauticalRoutingPipeline:
                  axis_dedup_cap: float = 0.0,
                  inland_densify_max_segment_m: float = 0.0,
                  connector_merge_m: float = 0.0,
-                 pass2_max_fanin_per_node: int = 0):
+                 pass2_max_fanin_per_node: int = 0,
+                 pass0_target_fanin_cap: int = 0):
         self.data_paths = data_paths
         self.db_path = db_path
         self.country = country
@@ -1278,7 +1306,8 @@ class NauticalRoutingPipeline:
                                                            axis_dedup_cap_m=axis_dedup_cap,
                                                            inland_densify_max_segment_m=inland_densify_max_segment_m,
                                                            connector_merge_m=connector_merge_m,
-                                                           pass2_max_fanin_per_node=pass2_max_fanin_per_node)
+                                                           pass2_max_fanin_per_node=pass2_max_fanin_per_node,
+                                                           pass0_target_fanin_cap=pass0_target_fanin_cap)
         if max_segment_m is not None:
             self.classification_config.max_segment_m = float(max_segment_m)
         self.geod = Geod(ellps="WGS84")
@@ -3231,6 +3260,21 @@ class NauticalRoutingPipeline:
             diag["success"] += 1
             return True
 
+        # SPEC-GRAPH-DENSITY.md §6.7: shared Direction-A target-side fan-in budget
+        # for BOTH Pass 0c and Pass 0d (see ClassificationConfig.pass0_target_fanin_
+        # cap's docstring) -- declared once here, before either pass, so a node
+        # targeted by both mechanisms shares one real cap rather than getting a
+        # fresh budget from each.
+        pass0_target_fanin_cap = self.classification_config.pass0_target_fanin_cap
+        pass0_target_fanin_count: Dict[int, int] = {}
+
+        def _pass0_target_capped(node_id) -> bool:
+            return pass0_target_fanin_cap > 0 and pass0_target_fanin_count.get(node_id, 0) >= pass0_target_fanin_cap
+
+        def _pass0_record_target(node_id):
+            if pass0_target_fanin_cap > 0:
+                pass0_target_fanin_count[node_id] = pass0_target_fanin_count.get(node_id, 0) + 1
+
         # Pass 0: k-nearest-neighbor pass, independent of Pass 1's
         # MAX_IDS_FOR_PASS1 gate. That gate exists because materializing every
         # coastal-node pair within snap_radius_m (tree.query_pairs()) blows up
@@ -3448,11 +3492,16 @@ class NauticalRoutingPipeline:
                     if cross_count[u] >= MAX_CROSS_CONNECTORS_PER_NAVMESH_NODE:
                         break
                     gj = other_idx[int(local_j)]
+                    v = ids[gj]
+                    if _pass0_target_capped(v):
+                        self._stitch_diag["pass0c"]["target_fanin_capped"] += 1
+                        continue
                     if np.linalg.norm(coords_m[gi] - coords_m[gj]) > snap_radius_m:
                         self._stitch_diag["pass0c"]["radius_reject"] += 1
                         continue
                     if try_add_local(gi, gj):
                         cross_count[u] += 1
+                        _pass0_record_target(v)
 
             # Direction B (symmetric): each non-navmesh node -> its k
             # nearest navmesh vertices. Direction A alone caps how many
@@ -3475,7 +3524,12 @@ class NauticalRoutingPipeline:
                     logger.info(f"  Stitch Pass 0c (local adjacency, direction B): {local_i}/{len(other_idx)} "
                                 f"non-navmesh nodes processed, {added} stitch edges added so far.")
                 gi = other_idx[local_i]
+                v = ids[gi]
+                if _pass0_target_capped(v):
+                    continue
                 for local_j in neighbors:
+                    if _pass0_target_capped(v):
+                        break
                     gj = navmesh_idx[int(local_j)]
                     u = ids[gj]
                     if cross_count[u] >= MAX_CROSS_CONNECTORS_PER_NAVMESH_NODE:
@@ -3485,6 +3539,7 @@ class NauticalRoutingPipeline:
                         continue
                     if try_add_local(gj, gi):
                         cross_count[u] += 1
+                        _pass0_record_target(v)
 
         # Pass 0d (Round 15, NEXT_PHASES.md §5.2.2): LOCAL adjacency guarantee for
         # in-polygon inland nodes, generalizing Pass 0c to a second cross-type
@@ -3580,11 +3635,16 @@ class NauticalRoutingPipeline:
                     if inland_cross_count[u] >= MAX_LOCAL_CONNECTORS_PER_INLAND_NODE:
                         break
                     gj = noninland_idx[int(local_j)]
+                    v = ids[gj]
+                    if _pass0_target_capped(v):
+                        self._stitch_diag["pass0d"]["target_fanin_capped"] += 1
+                        continue
                     if np.linalg.norm(coords_m[gi] - coords_m[gj]) > INLAND_LOCAL_RADIUS_M:
                         self._stitch_diag["pass0d"]["radius_reject"] += 1
                         continue
                     if try_add_inland_local(gi, gj):
                         inland_cross_count[u] += 1
+                        _pass0_record_target(v)
 
             # Direction B (symmetric): each non-inland node -> its k nearest inland
             # nodes -- same rationale as Pass 0c's Direction B: a node's own
@@ -3597,7 +3657,12 @@ class NauticalRoutingPipeline:
                 nn_local_b = nn_local_b.reshape(-1, 1)
             for local_i, neighbors in enumerate(nn_local_b):
                 gi = noninland_idx[local_i]
+                v = ids[gi]
+                if _pass0_target_capped(v):
+                    continue
                 for local_j in neighbors:
+                    if _pass0_target_capped(v):
+                        break
                     gj = inland_idx[int(local_j)]
                     u = ids[gj]
                     if inland_cross_count[u] >= MAX_LOCAL_CONNECTORS_PER_INLAND_NODE:
@@ -3607,6 +3672,7 @@ class NauticalRoutingPipeline:
                         continue
                     if try_add_inland_local(gj, gi):
                         inland_cross_count[u] += 1
+                        _pass0_record_target(v)
 
         # Pass 1: cheap radius-limited KD-tree pass, handles the common case of a
         # small local gap between two adjacent pieces. SKIPPED for large node counts:
@@ -6753,16 +6819,39 @@ if __name__ == "__main__":
                              "(SPEC-GRAPH-DENSITY.md §6.6). Pass 2 picks each still-"
                              "disconnected group's nearest cross-group candidate with no "
                              "per-node limit, unlike Pass 0c/0d (which already cap cross-type "
-                             "fan-in at 2) -- across many rounds, many different groups can "
-                             "independently converge on the same well-placed node, producing a "
-                             "hub with dozens to hundreds of edges (measured: out-degree up to "
-                             "42-222 from a real Zeeland build). Default 0 DISABLES this "
+                             "fan-in at 2, though see --pass0-target-fanin-cap: that cap turned "
+                             "out to only cover one direction) -- across many rounds, many "
+                             "different groups can independently converge on the same "
+                             "well-placed node, producing a hub. Default 0 DISABLES this "
                              "entirely and reproduces today's Pass 2 output byte-for-byte. > 0: "
                              "once a node has this many Pass-2-added edges, Pass 2 skips it as "
                              "a candidate (source or sink) and tries the next-nearest one "
                              "instead -- a group that only ever finds capped-out candidates "
                              "falls through to _resolve_local_skeleton_gaps' existing fallback "
-                             "rather than being left disconnected. Must be >= 0.")
+                             "rather than being left disconnected. Must be >= 0. NOTE: on a real "
+                             "Zeeland build this was NOT the dominant hub source -- see "
+                             "--pass0-target-fanin-cap for the mechanism that was (out-degree up "
+                             "to 42, from Pass 0c's Direction A, not Pass 2).")
+    parser.add_argument("--pass0-target-fanin-cap", type=int, default=0,
+                        help="Cap how many Direction-A-sourced connectors a single node may "
+                             "accumulate as a TARGET in Pass 0c (navmesh perimeter) and Pass 0d "
+                             "(inland nodes) combined (SPEC-GRAPH-DENSITY.md §6.7). Direction A "
+                             "(\"each navmesh/inland vertex -> its k nearest cross-type "
+                             "neighbours\") caps how many connectors THAT vertex's own search "
+                             "adds; Direction B (the symmetric reverse query) caps a navmesh/"
+                             "inland node as a target -- but Direction A's own target side (the "
+                             "\"other\" node being picked) has no cap at all, so many different "
+                             "navmesh/inland vertices can each independently pick the SAME "
+                             "nearby point. Measured directly against a real Zeeland build: a "
+                             "single node accumulated 42 edges this way, all 44-93m long "
+                             "(confirming this radius-gated mechanism, not Pass 2's unbounded-"
+                             "distance search, as the source). Default 0 DISABLES this entirely "
+                             "and reproduces today's Pass 0c/0d output byte-for-byte. > 0: once a "
+                             "node has accumulated this many such connectors (Direction A and B "
+                             "combined, across both passes), it's skipped as a target and the "
+                             "next-nearest candidate is tried instead. Safe to enable regardless "
+                             "of --pass2-max-fanin-per-node: Pass 1/Pass 2 run afterward and "
+                             "remain the connectivity guarantee. Must be >= 0.")
     parser.add_argument("--stitch-registry", nargs="?", const="data/seam_registry.sqlite", default="",
                         help="Enable Round 25 cross-database seam stitching (STITCHING_DESIGN.md "
                              "Section 3) against the shared global-node registry at this SQLite "
@@ -6792,6 +6881,9 @@ if __name__ == "__main__":
     if args.pass2_max_fanin_per_node < 0:
         raise SystemExit(f"--pass2-max-fanin-per-node must be >= 0 "
                           f"(got {args.pass2_max_fanin_per_node!r}).")
+    if args.pass0_target_fanin_cap < 0:
+        raise SystemExit(f"--pass0-target-fanin-cap must be >= 0 "
+                          f"(got {args.pass0_target_fanin_cap!r}).")
 
     stitch_registry_path = args.stitch_registry or os.environ.get("SK_ROUTING_STITCH_REGISTRY", "")
     coverage_bbox = None
@@ -6836,5 +6928,6 @@ if __name__ == "__main__":
                                        axis_dedup_cap=args.axis_dedup_cap,
                                        inland_densify_max_segment_m=args.inland_densify_max_segment_m,
                                        connector_merge_m=args.connector_merge_m,
-                                       pass2_max_fanin_per_node=args.pass2_max_fanin_per_node)
+                                       pass2_max_fanin_per_node=args.pass2_max_fanin_per_node,
+                                       pass0_target_fanin_cap=args.pass0_target_fanin_cap)
     pipeline.run_pipeline()
