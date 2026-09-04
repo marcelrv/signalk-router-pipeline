@@ -35,6 +35,8 @@ Nodes/Edges delta.
 | 8 | 2026-09-04 | this commit (`FAIRWAY_MATCH_BUFFER_M` fix, on top of `d9eb3c5`) | `data/zeeland_fresh_clip` | same as #7 (unchanged flags — the fix is in `calculate_edge_attributes`, not a CLI flag) | Fix the fairway cost_factor coverage regression traced from the Krammersluis routing bug report | 58,215 | 187,551 | 0 | 12 | 0 | **YES** |
 | 9 | 2026-09-04 | `ba07297` | `data/zeeland_fresh_clip` | same as #8 plus `--node-merge-m 5.0` | §6.8 fix — generalize `connector_merge_m`'s tolerance-merge to `_get_or_create_node` itself | 57,264 | 185,155 | 0 | 11 | 0 | superseded by #10 |
 | 10 | 2026-09-04 | this commit (§6.9 follow-up, on top of `8e9f507`/`4ae9cd9`) | `data/zeeland_fresh_clip` | same as #9 plus `--sagitta-cap 250.0 --axis-dedup-cap 100.0 --axis-dedup-floor-m 100.0 --min-navmesh-radius-m 1200.0` | §6.9 follow-up — flat 100m axis-dedup floor to fix real crisscross at the Vossemeersebrug/Tholen narrows | 42,092 | 124,689 | 0 | 14 | 0 | **YES (currently live)** |
+| 11 | 2026-09-04 | this commit (`--inland-resample-max-segment-m`, on top of `c2259f2`) | `data/zeeland_fresh_clip` | same as #10 plus `--inland-resample-max-segment-m 250.0` | Try to close the "still ~71-100m spacing on fairways" gap -- REGRESSED, not deployed (21 named POIs lost from main component, incl. Krammersluizen) | 29,006 | 80,064 | 0 | 14 | 0 | no -- regressed |
+| 12 | 2026-09-04 | this commit, same as #11 but a smaller cap | `data/zeeland_fresh_clip` | same as #10 plus `--inland-resample-max-segment-m 100.0` | Same idea, more conservative cap -- STILL regressed (9 named POIs lost, incl. Middelburg harbours), not deployed | 31,457 | 68,884 | 0 | 14 | 0 | no -- regressed |
 
 **Row #1 is not a valid comparison baseline** — its input clip/flags are unknown, so
 its counts cannot be attributed to any specific configuration. It's recorded because
@@ -406,6 +408,62 @@ confirming the fix changes edge attributes only, not topology):
   live db backed up to `zeeland_pre_axisdedupwide.sqlite.bak`; `signalk-server`
   container restarted).
 - **Log**: `data/zeeland_axisdedup_wide_build.log`
+
+### #11/#12 — `--inland-resample-max-segment-m` — REGRESSED, NOT deployed (kept live on #10)
+
+**Bug report**: even after #10, a live screenshot showed node spacing along a plain
+open-water fairway still ~71m, not the requested ~250m. Traced directly (queried
+#10's own db before building anything): that edge's nodes have `source_id=14`
+(`inland_waterways`), `edge_kind_id=0` (`centerline`) -- it's a RAW
+`_build_inland_network` vertex-to-vertex ingestion edge, not a skeleton edge.
+`--sagitta-cap`/`--max-segment-m` only govern `_resample_long_skeleton_edges`
+(skeleton resampling) -- `_build_inland_network` has NO consolidation mechanism at
+all, so it reproduces the source IENC line's own raw digitization density (~70-100m
+here) regardless of either flag. This is a real gap, not user error.
+
+**Fix implemented**: new `--inland-resample-max-segment-m` flag (default 0.0,
+disabled) plus `_resample_inland_waterways`, reusing
+`_resample_long_skeleton_edges`'s plain cumulative-arc-length walk to consolidate
+consecutive EXISTING vertices of each `inland_waterways` line down to this many
+metres, run once at parse time (same pattern as `_densify_inland_waterways`, the
+complementary opposite operation). Unit-tested in isolation
+(`tests/test_inland_resample.py`, 15 tests, all passing) -- the function correctly
+does what it says on a `GeoDataFrame` in isolation.
+
+**Regression found before deploying either build** (POI-pair reachability check,
+same methodology as #7-#10, run against #10 as the control BEFORE any deploy):
+
+  | build | cap | nodes | edges | POIs lost from main component |
+  |---|---|---|---|---|
+  | #11 | 250m | 29,006 | 80,064 | **21**, incl. Krammersluizen, Jachtensluis Krammersluizen, 4 Middelburg harbour POIs, Bruinisse/Ellewoutsdijk marinas, 3 bridges |
+  | #12 | 100m | 31,457 | 68,884 | **9** (Krammersluis Noord/Zuid actually recovered at this cap; Middelburg harbours and 2 bridges still lost) |
+
+**Root cause of the regression**: traced one lost POI (Krammersluizen) directly --
+its nearest node in #11 sits in an isolated 8-node island, disconnected from the
+34,623-node main component. This is the SAME class of problem §6.1/§6.2 already
+fought for skeleton/navmesh density: `_stitch_component_pieces`' Pass 0c/0d/Pass 2
+and `_connect_waterway_crossing`'s own candidate search sample from the
+`inland_waterways` vertex list -- reducing that list's density (exactly what
+`_resample_inland_waterways` does) starves those passes of candidates near real
+harbours/locks/bridges, the same way sparser skeleton/navmesh sampling did before.
+Unlike `_get_or_split_inland_segment`'s TRUE segment-projection (unaffected by
+vertex density when `connector_merge_m > 0`), the STITCHING passes' own sampling
+apparently is not immune -- confirmed empirically (9 losses even at 100m, a cap
+well inside `connector_merge_m`'s own established "safe" range), not fully
+explained/fixed here.
+
+**Decision: do not ship at any cap tried so far.** The flag/function stay in the
+codebase (default-off, unit-tested, don't change any existing build) since the root
+cause diagnosis (raw inland ingestion has no consolidation mechanism) is correct and
+real -- but actually closing the user's "~250m spacing" request safely needs either
+a much smaller cap with a full zero-regression re-verification, or a real fix to the
+stitching passes' candidate sampling (mirroring the depth of work §6.1-§6.7 already
+put into the equivalent skeleton/navmesh problem), not just a quick line-
+simplification pass. Left as an open follow-up. **Live db is still #10** --
+`zeeland_pre_axisdedupwide.sqlite.bak`'s replacement was never touched by this
+investigation.
+- **Logs**: `data/zeeland_inlandresample_build.log` (#11, 250m),
+  `data/zeeland_inlandresample100_build.log` (#12, 100m)
 
 ## Resolved: why the live db (#1) had only 5 hubs when #2-#6 had 56-231
 
