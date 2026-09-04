@@ -1003,6 +1003,25 @@ class ClassificationConfig:
     # point. Recommended once enabled: 5.0m (see _connect_waterway_crossing's docstring
     # for the calibration).
     connector_merge_m: float = 0.0
+    # SPEC-GRAPH-DENSITY.md §6.6: _stitch_component_pieces' Pass 2 (the "guarantee,
+    # one merge round at a time" pass) picks each still-disconnected group's
+    # geometrically nearest cross-group candidate with no per-node fan-in limit --
+    # unlike Pass 0c/Pass 0d, which each cap how many cross-type connectors a single
+    # node can accumulate (MAX_CROSS_CONNECTORS_PER_NAVMESH_NODE / MAX_LOCAL_
+    # CONNECTORS_PER_INLAND_NODE, both 2). Across many rounds, many different groups
+    # can independently pick the SAME well-placed node as their nearest candidate,
+    # producing a hub with dozens to hundreds of edges (measured directly: up to
+    # out-degree 42 from as few as ~58 Pass 2 successes on one real Zeeland build).
+    # 0 (default) disables this entirely -- Pass 2 stays byte-identical to today's,
+    # matching --sagitta-cap/--axis-dedup-cap/--inland-densify-max-segment-m/
+    # --connector-merge-m's convention. > 0: a node that has already accumulated
+    # this many Pass-2-added edges is skipped as a candidate target (source or
+    # sink) -- Pass 2 tries the next-nearest candidate instead, same as it already
+    # does for a poly/land-rejected one. A group that only ever discovers capped-out
+    # candidates falls through to _resolve_local_skeleton_gaps' own, differently-
+    # mechanised fallback (already the existing safety net for whatever Pass 2
+    # can't merge), not left permanently disconnected.
+    pass2_max_fanin_per_node: int = 0
 
     def pixel_size_for(self, min_dimension_m: float) -> float:
         return float(np.clip(min_dimension_m / self.pixel_dim_divisor,
@@ -1240,7 +1259,8 @@ class NauticalRoutingPipeline:
                  max_segment_m: Optional[float] = None,
                  axis_dedup_cap: float = 0.0,
                  inland_densify_max_segment_m: float = 0.0,
-                 connector_merge_m: float = 0.0):
+                 connector_merge_m: float = 0.0,
+                 pass2_max_fanin_per_node: int = 0):
         self.data_paths = data_paths
         self.db_path = db_path
         self.country = country
@@ -1257,7 +1277,8 @@ class NauticalRoutingPipeline:
                                                            max_chord_sagitta_m=sagitta_cap,
                                                            axis_dedup_cap_m=axis_dedup_cap,
                                                            inland_densify_max_segment_m=inland_densify_max_segment_m,
-                                                           connector_merge_m=connector_merge_m)
+                                                           connector_merge_m=connector_merge_m,
+                                                           pass2_max_fanin_per_node=pass2_max_fanin_per_node)
         if max_segment_m is not None:
             self.classification_config.max_segment_m = float(max_segment_m)
         self.geod = Geod(ellps="WGS84")
@@ -3719,6 +3740,23 @@ class NauticalRoutingPipeline:
         # Built once outside the round loop (geometric path only) -- `coords_m`
         # never changes across rounds, only which group each node belongs to does.
         pass2_tree = cKDTree(coords_m) if use_geometric_search else None
+        # SPEC-GRAPH-DENSITY.md §6.6: per-node fan-in cap on edges Pass 2 itself
+        # adds (see ClassificationConfig.pass2_max_fanin_per_node's docstring for
+        # why this pass, specifically, needed one). Counts only edges created in
+        # THIS call/pass -- pre-existing structural degree (ring/chain edges,
+        # Pass 0/0b/0c/0d/1 connectors) is deliberately not counted against it, so
+        # a node's ordinary topology never itself triggers the cap.
+        pass2_fanin_cap = self.classification_config.pass2_max_fanin_per_node
+        pass2_fanin_count: Dict[int, int] = {}
+
+        def _pass2_fanin_capped(node_id) -> bool:
+            return pass2_fanin_cap > 0 and pass2_fanin_count.get(node_id, 0) >= pass2_fanin_cap
+
+        def _pass2_record_fanin(u, v):
+            if pass2_fanin_cap > 0:
+                pass2_fanin_count[u] = pass2_fanin_count.get(u, 0) + 1
+                pass2_fanin_count[v] = pass2_fanin_count.get(v, 0) + 1
+
         for _round in range(MAX_ROUNDS):
             groups: Dict[Any, List[int]] = {}
             for idx, node in enumerate(ids):
@@ -3770,9 +3808,13 @@ class NauticalRoutingPipeline:
                         nearest_cross_group_m = dist
                     if evaluated >= PASS2_GEOMETRIC_MAX_EVALUATIONS_PER_ROUND:
                         break
+                    evaluated += 1
+                    if _pass2_fanin_capped(ids[i]) or _pass2_fanin_capped(ids[j]):
+                        self._stitch_diag["pass2"]["fanin_capped"] += 1
+                        continue
                     if try_add(i, j, "pass2"):
                         merged_this_round += 1
-                    evaluated += 1
+                        _pass2_record_fanin(ids[i], ids[j])
             else:
                 # Legacy path -- byte-for-bit unchanged from before this fix.
                 # See the fix comment above for why this must stay untouched:
@@ -3804,8 +3846,12 @@ class NauticalRoutingPipeline:
                         continue
                     if find(ids[sample_idxs[si]]) != find(ids[sample_idxs[sj]]) and nearest_cross_group_m is None:
                         nearest_cross_group_m = float(dmat[si, sj])
-                    if try_add(sample_idxs[si], sample_idxs[sj], "pass2"):
+                    u, v = ids[sample_idxs[si]], ids[sample_idxs[sj]]
+                    if _pass2_fanin_capped(u) or _pass2_fanin_capped(v):
+                        self._stitch_diag["pass2"]["fanin_capped"] += 1
+                    elif try_add(sample_idxs[si], sample_idxs[sj], "pass2"):
                         merged_this_round += 1
+                        _pass2_record_fanin(u, v)
                     evaluated += 1
                     if evaluated >= MAX_EVALUATIONS_PER_ROUND:
                         break
@@ -6701,6 +6747,22 @@ if __name__ == "__main__":
                              "so it essentially never merges a candidate that should have gotten "
                              "its own split/node. Must be finite, >= 0.0, and < "
                              f"{WATERWAY_CONNECTOR_MAX_M:.0f}m if enabled (raises otherwise).")
+    parser.add_argument("--pass2-max-fanin-per-node", type=int, default=0,
+                        help="Cap how many edges _stitch_component_pieces' Pass 2 (the "
+                             "connectivity-guarantee pass) may add to any single node "
+                             "(SPEC-GRAPH-DENSITY.md §6.6). Pass 2 picks each still-"
+                             "disconnected group's nearest cross-group candidate with no "
+                             "per-node limit, unlike Pass 0c/0d (which already cap cross-type "
+                             "fan-in at 2) -- across many rounds, many different groups can "
+                             "independently converge on the same well-placed node, producing a "
+                             "hub with dozens to hundreds of edges (measured: out-degree up to "
+                             "42-222 from a real Zeeland build). Default 0 DISABLES this "
+                             "entirely and reproduces today's Pass 2 output byte-for-byte. > 0: "
+                             "once a node has this many Pass-2-added edges, Pass 2 skips it as "
+                             "a candidate (source or sink) and tries the next-nearest one "
+                             "instead -- a group that only ever finds capped-out candidates "
+                             "falls through to _resolve_local_skeleton_gaps' existing fallback "
+                             "rather than being left disconnected. Must be >= 0.")
     parser.add_argument("--stitch-registry", nargs="?", const="data/seam_registry.sqlite", default="",
                         help="Enable Round 25 cross-database seam stitching (STITCHING_DESIGN.md "
                              "Section 3) against the shared global-node registry at this SQLite "
@@ -6727,6 +6789,9 @@ if __name__ == "__main__":
         NauticalRoutingPipeline._validate_connector_merge_m(args.connector_merge_m)
     except ValueError as e:
         raise SystemExit(f"--connector-merge-m: {e}")
+    if args.pass2_max_fanin_per_node < 0:
+        raise SystemExit(f"--pass2-max-fanin-per-node must be >= 0 "
+                          f"(got {args.pass2_max_fanin_per_node!r}).")
 
     stitch_registry_path = args.stitch_registry or os.environ.get("SK_ROUTING_STITCH_REGISTRY", "")
     coverage_bbox = None
@@ -6770,5 +6835,6 @@ if __name__ == "__main__":
                                        max_segment_m=args.max_segment_m,
                                        axis_dedup_cap=args.axis_dedup_cap,
                                        inland_densify_max_segment_m=args.inland_densify_max_segment_m,
-                                       connector_merge_m=args.connector_merge_m)
+                                       connector_merge_m=args.connector_merge_m,
+                                       pass2_max_fanin_per_node=args.pass2_max_fanin_per_node)
     pipeline.run_pipeline()

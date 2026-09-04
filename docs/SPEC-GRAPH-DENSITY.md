@@ -1,8 +1,11 @@
 # Spec: Graph Node Density — Over-Sampling and Fairway Duplication
 
 Status: §4.1 implemented and verified. §4.1.2, §4.1.3, §5.1 and §6.1 fixed. §6.3, §6.4,
-and §6.5 implemented. None enabled by default; §6.5 is the fix for the net density
-regression §6.3+§6.4 compounded (see §6.5) and should ship before either is defaulted on.
+§6.5, and §6.6 implemented. None enabled by default. §6.5 is the fix for the net
+density regression §6.3+§6.4 compounded; §6.6 is the fix for the residual hub-fanout
+§6.5 alone did not resolve (traced to a separate mechanism, `_stitch_component_pieces`
+Pass 2). See `data/BUILD_LOG.md` for every real build's measured effect before
+assuming any of these should ship enabled by default.
 Complements: `SPEC-RECOMMENDED-TRACK.md`, `SPEC-FAIRWAY-HARMONIZATION.md`
 Scope: `nautical_routing_pipeline.py` (`build_skeleton_network`, `_resample_long_skeleton_edges`, `_skeleton_raster_to_graph`, `ClassificationConfig`)
 Measured against: `data/zeeland_full.sqlite` (48,553 nodes / 137,718 directed edges), RWS source GeoJSON
@@ -1007,6 +1010,56 @@ the evidence needed before recommending §6.4 be defaulted back off.
 
 Covered by `tests/test_waterway_connector_merge.py` and extensions to
 `tests/test_axis_dedup.py`'s `TestNavmeshCarveReconnect`/`TestSkeletonCarveReconnect`.
+
+### 6.6 Pass 2's connectivity guarantee has no per-node fan-in cap — IMPLEMENTED
+
+**Symptom.** Verifying §6.5 with real Zeeland rebuilds (`data/BUILD_LOG.md` #2-#5)
+found hub nodes (out-degree > 30) persisting at 56-231 regardless of
+`connector_merge_m` or `axis_dedup_cap` — nowhere near the live database's 5. Traced
+to `_ensure_coastal_connectivity`/`_stitch_component_pieces`, entirely separate from
+what §6.5 touches.
+
+**Root cause.** `_stitch_component_pieces` runs several stitching passes. Pass 0c
+(navmesh perimeter) and Pass 0d (inland nodes) each explicitly cap cross-type fan-in
+per node (`MAX_CROSS_CONNECTORS_PER_NAVMESH_NODE` / `MAX_LOCAL_CONNECTORS_PER_INLAND_
+NODE`, both 2) — a deliberate, documented guard against exactly this class of problem.
+**Pass 2** (the "connectivity guarantee, one merge round at a time" pass, run last,
+up to 30 rounds) has no such cap: each round it finds every still-disconnected
+group's geometrically nearest cross-group candidate and merges via union-find, with
+no limit on how many different groups can pick the *same* node as their nearest
+candidate. Measured directly: as few as ~58 Pass 2 successes on one real build
+produced out-degree up to 42 on a single node.
+
+**Design options considered.** Capping fan-in risks stranding a group whose only
+nearby candidates are all capped-out — unlike Pass 0c/0d (which have a distance
+radius and can simply give up on a specific connector, leaving the broader guarantee
+to Pass 2), Pass 2 *is* the guarantee, so silently refusing a candidate needs a safe
+fallback, not a dropped connection.
+
+**Chosen approach.** `pass2_max_fanin_per_node` (`--pass2-max-fanin-per-node`,
+default 0/disabled, matching this spec's established convention). When a candidate's
+source or target node has already accumulated this many *Pass-2-added* edges (not
+counting pre-existing structural degree — a node's ordinary ring/chain topology
+never itself triggers the cap), Pass 2 skips it and tries the next-nearest candidate
+instead — mirroring how it already skips a poly/land-rejected candidate. A group that
+only ever discovers capped-out candidates falls through to
+`_resolve_local_skeleton_gaps`, which already runs immediately after Pass 2 as the
+existing fallback for whatever Pass 2 can't merge — no new fallback mechanism needed.
+Applied symmetrically to both Pass 2 code paths (the geometric escalating-k search
+active when `--sagitta-cap` is set, and the legacy per-group-sample path used at
+`--sagitta-cap 0`), gated purely on `pass2_max_fanin_per_node > 0` so it composes
+with either.
+
+**Verification.** Synthetic hub-and-spokes test (`tests/test_pass2_fanin_cap.py`):
+one hub node equidistant from N spoke nodes (each spoke's true nearest cross-group
+candidate is unambiguously the hub), `snap_radius_m` set below every pairwise
+distance so Pass 0/Pass 1 (both distance-gated) contribute nothing, isolating Pass 2
+as the only mechanism under test. Confirms: cap=0 lets the hub accumulate a connector
+to every spoke (documented pre-existing behaviour); cap=N bounds the hub's
+Pass-2-added out-degree at N while every spoke still ends up in the same connected
+component (via a different, uncapped node) rather than being stranded; a larger cap
+allows proportionally more fan-in. Full real-build verification (five-gate
+discipline, against `data/BUILD_LOG.md`'s baseline) pending.
 
 ## 7. Risks
 
