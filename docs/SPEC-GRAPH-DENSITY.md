@@ -1,11 +1,13 @@
 # Spec: Graph Node Density — Over-Sampling and Fairway Duplication
 
 Status: §4.1 implemented and verified. §4.1.2, §4.1.3, §5.1 and §6.1 fixed. §6.3, §6.4,
-§6.5, and §6.6 implemented. None enabled by default. §6.5 is the fix for the net
-density regression §6.3+§6.4 compounded; §6.6 is the fix for the residual hub-fanout
-§6.5 alone did not resolve (traced to a separate mechanism, `_stitch_component_pieces`
-Pass 2). See `data/BUILD_LOG.md` for every real build's measured effect before
-assuming any of these should ship enabled by default.
+§6.5, §6.6, and §6.7 implemented. None enabled by default. §6.5 is the fix for the net
+density regression §6.3+§6.4 compounded; §6.6 (Pass 2 fan-in) and §6.7 (Pass 0c/0d
+Direction-A target fan-in) are two independent fixes for residual hub-fanout §6.5
+alone did not resolve — §6.7 is the one a real build confirmed as the actual dominant
+cause (§6.6's own real-build verification found Pass 2 was NOT it). See
+`data/BUILD_LOG.md` for every real build's measured effect before assuming any of
+these should ship enabled by default.
 Complements: `SPEC-RECOMMENDED-TRACK.md`, `SPEC-FAIRWAY-HARMONIZATION.md`
 Scope: `nautical_routing_pipeline.py` (`build_skeleton_network`, `_resample_long_skeleton_edges`, `_skeleton_raster_to_graph`, `ClassificationConfig`)
 Measured against: `data/zeeland_full.sqlite` (48,553 nodes / 137,718 directed edges), RWS source GeoJSON
@@ -1060,6 +1062,51 @@ Pass-2-added out-degree at N while every spoke still ends up in the same connect
 component (via a different, uncapped node) rather than being stranded; a larger cap
 allows proportionally more fan-in. Full real-build verification (five-gate
 discipline, against `data/BUILD_LOG.md`'s baseline) pending.
+
+### 6.7 Pass 0c/0d's fan-in cap only covers one direction — IMPLEMENTED
+
+**Symptom.** §6.6's `pass2_max_fanin_per_node`, verified on a real Zeeland build
+(`data/BUILD_LOG.md` #6), did not reduce the hub count at all — 56 hubs before and
+after, `fanin_capped` never firing once. The cap was correctly implemented but aimed
+at the wrong mechanism.
+
+**Root cause, this time confirmed empirically, not inferred.** Queried the actual
+highest-degree node in the build (#6): 42 edges, every one 44-93m long, 40 of the 42
+neighbors navmesh-perimeter (`node_kind_id=navmesh_vertex`) nodes. Pass 2 has no
+distance cap — finding a valid connector "even when the two nearest groups are
+genuinely far apart" is its entire purpose — so a hub built entirely of short edges
+cannot be Pass 2's doing. It's Pass 0c. Pass 0c's Direction A ("each navmesh vertex
+-> its k nearest cross-type neighbours") caps how many connectors *that vertex's own
+search* may add, keyed by the navmesh vertex. Direction B (the symmetric reverse
+query, "each non-navmesh node -> its k nearest navmesh vertices") caps a navmesh node
+as a *target*. But Direction A's own target side — the non-navmesh point being picked
+— has no cap at all: many different navmesh vertices, each individually within its
+own 2-connector budget, can all independently pick the *same* nearby point. Pass 0d
+(inland nodes) has the identical asymmetry in its own Direction A.
+
+**Chosen approach.** `pass0_target_fanin_cap` (`--pass0-target-fanin-cap`, default
+0/disabled, matching this spec's convention). A single shared counter, keyed by node
+id, spans Direction A *and* Direction B of *both* Pass 0c and Pass 0d — a node
+targeted by more than one of these four code paths shares one real budget rather than
+getting a fresh allotment from each. When a node has already accumulated this many
+Direction-A-or-B-sourced connectors, Direction A skips it as a target and tries the
+next-nearest candidate instead — the identical pattern every other cap in this file
+already uses for a poly/land-rejected or radius-rejected candidate. Safe regardless
+of `pass2_max_fanin_per_node`: Pass 1/Pass 2 run afterward and remain the
+connectivity guarantee no matter how tightly Pass 0c/0d are capped.
+
+**Verification.** Synthetic test (`tests/test_pass0_target_fanin_cap.py`): one target
+node plus N navmesh-kind nodes wired into a ring (mirroring a real navmesh perimeter
+piece — deliberately *not* N unconnected singletons, since plain Pass 0, which is
+union-find gated and runs first, would otherwise connect the target to every source
+before Pass 0c gets a chance to contribute anything at all; a pre-connected ring
+reproduces Pass 0c's own documented motivating scenario, where the ring is already
+one union-find group and Pass 0/0b/1 only ever add a single connection to it before
+treating it as "already connected"). Confirms: cap=0 lets the target accumulate every
+ring member's connector; cap=N bounds Pass 0c's own contribution at N
+(`_stitch_diag["pass0c"]["success"] <= N`, `target_fanin_capped` firing) while the
+graph stays fully connected regardless. Real-build five-gate verification (does hub
+count actually drop against `data/BUILD_LOG.md`'s baseline) pending.
 
 ## 7. Risks
 
