@@ -30,6 +30,8 @@ Nodes/Edges delta.
 | 3 | 2026-09-04 | `38a09ed` | `data/zeeland_fresh_clip` | `--sagitta-cap 75 --max-segment-m 2000 --axis-dedup-cap 50 --connector-merge-m 5.0 --inland-densify-max-segment-m 120.0` | "Everything on" recommended config | 58,215 | 224,553 | 56 | 42 | 0 | no |
 | 4 | 2026-09-04 | `38a09ed` | `data/zeeland_fresh_clip` | same as #3 but `--connector-merge-m 0.0` | Clean control for #3 — isolate §6.5's own effect | 56,433 | 217,787 | 65 | 42 | 0 | no |
 | 5 | 2026-09-04 | `38a09ed` | `data/zeeland_fresh_clip` | same as #3 but `--axis-dedup-cap 25.0` | Does a tighter axis-dedup cap reduce stitch-pass hubs? | 59,544 | 229,379 | 57 | 42 | 0 | no |
+| 6 | 2026-09-04 | `f560cbf` | `data/zeeland_fresh_clip` | same as #3 but `--pass2-max-fanin-per-node 6` | Does §6.6's Pass 2 fan-in cap fix the hub problem? | 58,215 | 224,553 | 56 | 42 | 0 | no |
+| 7 | 2026-09-04 | `6165615` | `data/zeeland_fresh_clip` | same as #6 but `--pass0-target-fanin-cap 4` | §6.7 fix — Pass 0c/0d Direction A target cap | 58,215 | **187,551** | **0** | **12** | 0 | **YES** |
 
 **Row #1 is not a valid comparison baseline** — its input clip/flags are unknown, so
 its counts cannot be attributed to any specific configuration. It's recorded because
@@ -133,15 +135,55 @@ the only mutually-comparable set so far (identical `data/zeeland_fresh_clip` inp
   axis-dedup carving ever runs. Do not re-try tuning this flag for the hub issue.
 - **Log**: `data/zeeland_dedup25_build.log`
 
-## Open question — not yet resolved
+### #6 — `zeeland_pass2cap.sqlite` — same as #3 but `--pass2-max-fanin-per-node 6`
 
-**Why does the live db (#1) have only 5 hubs when every reproduction attempt here
-(#2-#5) has 56-231?** Root cause traced (2026-09-04 session) to
-`_ensure_coastal_connectivity`/`_stitch_component_pieces` candidate selection
-concentrating stitching edges onto a small set of inland nodes — confirmed NOT
-sensitive to axis-dedup-cap (#3 vs #5). Not yet resolved: whether it's sensitive to
-the exact source clip, to `connector_merge_m`/`inland_densify_max_segment_m`
-interacting with the stitching pass's own candidate list, or something else entirely
-about how #1 was actually built. This is the next thing to investigate before
-trusting any new build's hub count as representative — see session picking this back
-up for progress.
+```
+... same as #3's command, plus:
+  --pass2-max-fanin-per-node 6
+```
+
+- **Purpose**: test SPEC-GRAPH-DENSITY.md §6.6 — does capping Pass 2's per-node
+  stitching fan-in fix the residual hub problem?
+- **Result**: 58,215 nodes / 224,553 edges / 56 hubs (max 42) — **identical** to #3
+  in every count. `fanin_capped` never fired once (confirmed by grepping the build
+  log). **Conclusion: Pass 2 was NOT the dominant real-world hub source on this
+  dataset.** Diagnosed directly: queried the actual max-out-degree node (42 edges) —
+  every edge 44-93m long. Pass 2 has no distance cap by design, so a hub built
+  entirely of short edges cannot be Pass 2's doing.
+- **Log**: `data/zeeland_pass2cap_build.log`
+
+### #7 — `zeeland_pass0targetcap.sqlite` — same as #6 but `--pass0-target-fanin-cap 4`
+
+```
+... same as #6's command, plus:
+  --pass0-target-fanin-cap 4
+```
+
+- **Purpose**: test SPEC-GRAPH-DENSITY.md §6.7 — the actual mechanism traced from
+  #6's diagnosis (Pass 0c's Direction A has no target-side fan-in cap, unlike
+  Direction B).
+- **Result**: 58,215 nodes / **187,551 edges** (−37,002 vs #6) / **0 hubs** (max
+  out-degree **12**, down from 42) / `crosses_land=0`. **This is now better than the
+  live db (#1) on every measured axis except raw node count**: fewer edges
+  (187,551 vs 203,582), zero hubs (vs 5), lower max out-degree (12 vs 33).
+- **Additional verification done** (not yet a scripted/repeatable check — ad hoc
+  this session):
+  - Largest-component-by-edge-length: 85.62% (vs #4's 86.78% control on identical
+    data/flags-minus-caps) — a real but small (1.16pp) dip.
+  - **POI-pair reachability** (767 named POIs common to both #4 and #7, matched by
+    name, 293,761 pairs checked): **0 lost, 0 gained** — the edge-length dip above
+    does not correspond to any real place-pair losing routability. This project's
+    own history (§6.1) already flagged raw edge-length-% as a metric that can look
+    like a regression while POI-pair reachability shows none — confirmed again here.
+- **Installed live** 2026-09-04 (see deploy notes below).
+- **Log**: `data/zeeland_pass0targetcap_build.log`
+
+## Resolved: why the live db (#1) had only 5 hubs when #2-#6 had 56-231
+
+Traced across #2-#7 (2026-09-04 session): `_ensure_coastal_connectivity`'s Pass 2 was
+the first suspect (§6.6) but confirmed NOT the cause (#6). The real mechanism (§6.7,
+confirmed by #7) is `_stitch_component_pieces`' Pass 0c/0d Direction A having no
+target-side fan-in cap — Direction B already had one, Direction A didn't. #7's build
+resolves this to 0 hubs, better than #1's own 5. #1's own exact flags are still
+unknown/unreproduced, so it's not established that #1 used equivalent caps — #7
+reaches a better result via a different, now-understood mechanism.
