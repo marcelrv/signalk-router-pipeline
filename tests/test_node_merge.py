@@ -109,6 +109,25 @@ class TestGetOrCreateNodeMerge:
         assert a == b
         assert p.graph.number_of_nodes() == 1
 
+    def test_enabled_high_latitude_nonzero_longitude_points_still_merge(self):
+        # CodeRabbit (PR #20): an earlier version derived the longitude grid-cell
+        # size from each POINT's own raw latitude via cos(lat). At high latitude
+        # AND high |longitude|, floor(lon / cell_lon_deg) divides a large lon by a
+        # tiny cell -- so even the sub-cell latitude spread between two points that
+        # are genuinely within tolerance can shift cos(lat) enough to move the
+        # quotient by more than one grid index, landing outside the 3x3 neighbour
+        # scan and minting a duplicate instead of merging. 70N/120E, offset
+        # (dx=1m, dy=24m) -- 24.02m apart, inside a 25m tolerance -- lands 2 grid
+        # cells apart (not 1) against the unfixed per-point cos(lat) cell-index
+        # math; the fix (a canonical per-latitude-bucket cell size, recomputed per
+        # scanned row) must still merge these.
+        p = _pipeline(node_merge_m=25.0)
+        lon2, lat2 = _meters_offset(120.0, 70.0, 1.0, 24.0)
+        a = p._get_or_create_node(120.0, 70.0, "coastal", context="a")
+        b = p._get_or_create_node(lon2, lat2, "coastal", context="b")
+        assert a == b
+        assert p.graph.number_of_nodes() == 1
+
     def test_stale_node_removed_from_graph_is_not_reused(self):
         p = _pipeline(node_merge_m=3.0)
         a = p._get_or_create_node(self.BASE_LON, self.BASE_LAT, "coastal", context="a")

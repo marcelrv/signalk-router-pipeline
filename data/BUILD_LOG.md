@@ -305,6 +305,24 @@ confirming the fix changes edge attributes only, not topology):
   parity, tolerance merge/no-merge, diagonal-neighbor-cell lookup, stale-node
   pruning, context tagging, `_validate_node_merge_m` bounds). Full suite: 226/226
   passing.
+- **Follow-up (CodeRabbit, PR #20): grid-index correctness fix, re-verified
+  byte-identical.** `_register_node_in_merge_grid`/`_find_nearby_node` originally
+  derived the longitude grid-cell size from each POINT's own raw latitude via
+  `cos(lat)`. At high latitude AND high `|longitude|` this is unsafe: dividing a
+  large `lon` by a tiny cell size means even the sub-cell latitude spread between
+  two points genuinely within tolerance can shift `cos(lat)` enough to move the
+  cell index by more than one, outside the 3x3 neighbour scan (confirmed: two
+  points ~24m apart at 70N/120E, well inside a 25m tolerance, landed 2 grid cells
+  apart). Fixed by keying the longitude cell size off each latitude BUCKET's
+  canonical (centre) latitude instead of each point's raw latitude, and
+  recomputing the query's longitude index once per scanned latitude row. Added
+  `tests/test_node_merge.py::test_enabled_high_latitude_nonzero_longitude_points_
+  still_merge` (fails against the pre-fix code, passes after). Not a real-world
+  Zeeland bug -- rebuilt `zeeland_nodemerge.sqlite` with the fixed code and
+  confirmed byte-identical nodes/edges tables (same SHA-256 hash) to the build
+  logged above, exactly as expected: Zeeland's lon 3-7/lat 51-53 range is nowhere
+  near where the old per-point `cos(lat)` math actually diverges. No new build
+  number or redeploy needed.
 - **Installed live** 2026-09-04 (`signalk-routeiq/data/zeeland.sqlite`, previous
   live db backed up to `zeeland_pre_nodemergefix.sqlite.bak`; `signalk-server`
   container restarted).

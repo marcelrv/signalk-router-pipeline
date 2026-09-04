@@ -2446,36 +2446,66 @@ class NauticalRoutingPipeline:
                 self._node_contexts[node_id].add(context)
         return node_id
 
-    def _node_merge_cell(self, lon: float, lat: float, merge_tol_m: float):
-        """SPEC-GRAPH-DENSITY.md §6.8: grid-cell index for `_node_merge_grid`, sized
-        so a cell is exactly `merge_tol_m` wide on each axis at this point's own
-        latitude (same 111320 m/deg / cos(lat) approximation the rest of this file
-        already uses for metre<->degree conversions, e.g. `_lonlat_margin_deg`).
-        Candidate points within tolerance can therefore differ by at most one cell
-        index per axis, which is what makes `_find_nearby_node`'s 3x3 neighbour
-        scan sufficient.
+    @staticmethod
+    def _node_merge_lat_cell(lat: float, merge_tol_m: float) -> int:
+        """SPEC-GRAPH-DENSITY.md §6.8: latitude grid-cell index for
+        `_node_merge_grid`, sized so a cell is exactly `merge_tol_m` wide on the
+        latitude axis (111320 m/deg is a fixed, latitude-independent conversion --
+        see `_lonlat_margin_deg` -- so this cell size never varies)."""
+        cell_lat_deg = merge_tol_m / 111320.0
+        return int(math.floor(lat / cell_lat_deg))
+
+    @staticmethod
+    def _node_merge_lon_cell(lon: float, cy: int, merge_tol_m: float) -> int:
+        """SPEC-GRAPH-DENSITY.md §6.8: longitude grid-cell index for a given
+        latitude BUCKET `cy` (not a raw latitude -- see below), sized so a cell is
+        exactly `merge_tol_m` wide at that bucket's own canonical (centre)
+        latitude.
+
+        CodeRabbit (PR #20): deriving the longitude cell size from each POINT's
+        own raw latitude (as an earlier version of this method did) is unsafe --
+        `floor(lon / cell_lon_deg)` divides a potentially large `lon` (up to 180)
+        by a tiny `cell_lon_deg`, so even the sub-cell-sized latitude difference
+        between two points that are genuinely within `merge_tol_m` of each other
+        can shift `cos(lat)` just enough to move the quotient by more than one
+        index at high latitude/longitude (confirmed: two points ~19m apart at
+        70N/120E landed 4 x-indices apart, well outside a 3x3 neighbour scan).
+        Keying the longitude cell size off the BUCKET's canonical latitude instead
+        -- the same value for every point that lands in that bucket, and for every
+        query scanning it -- makes registration and lookup agree by construction,
+        regardless of the raw latitude spread within the bucket.
         """
         cell_lat_deg = merge_tol_m / 111320.0
-        cell_lon_deg = merge_tol_m / (111320.0 * max(math.cos(math.radians(lat)), 1e-6))
-        return int(math.floor(lon / cell_lon_deg)), int(math.floor(lat / cell_lat_deg))
+        canonical_lat = (cy + 0.5) * cell_lat_deg
+        cell_lon_deg = merge_tol_m / (111320.0 * max(math.cos(math.radians(canonical_lat)), 1e-6))
+        return int(math.floor(lon / cell_lon_deg))
 
     def _register_node_in_merge_grid(self, lon: float, lat: float, node_id: int, merge_tol_m: float):
-        cell = self._node_merge_cell(lon, lat, merge_tol_m)
-        self._node_merge_grid[cell].append((lon, lat, node_id))
+        cy = self._node_merge_lat_cell(lat, merge_tol_m)
+        cx = self._node_merge_lon_cell(lon, cy, merge_tol_m)
+        self._node_merge_grid[(cx, cy)].append((lon, lat, node_id))
 
     def _find_nearby_node(self, lon: float, lat: float, merge_tol_m: float):
         """SPEC-GRAPH-DENSITY.md §6.8: nearest existing node within `merge_tol_m`
         metres of (lon, lat), or None. Scans the point's own grid cell plus its 8
-        neighbours (see `_node_merge_cell`), pruning any bucket entry whose node no
-        longer exists in `self.graph` -- the same staleness defence
-        `_get_or_create_node`'s exact-rounding path already applies to
-        `coords_to_node`.
+        neighbours, pruning any bucket entry whose node no longer exists in
+        `self.graph` -- the same staleness defence `_get_or_create_node`'s
+        exact-rounding path already applies to `coords_to_node`.
+
+        The longitude x-index is NOT computed once from (lon, lat) and offset by
+        dx -- each scanned latitude row (cy0 + dy) has its own canonical latitude
+        and therefore its own longitude cell size (see `_node_merge_lon_cell`), so
+        the query's x-index for that row is recomputed per row before scanning its
+        3 x-neighbours. This is what makes registration (keyed the same way) and
+        lookup agree at any latitude/longitude, not just near the equator.
         """
-        cx, cy = self._node_merge_cell(lon, lat, merge_tol_m)
+        cy0 = self._node_merge_lat_cell(lat, merge_tol_m)
         best_id, best_dist = None, merge_tol_m
-        for dx in (-1, 0, 1):
-            for dy in (-1, 0, 1):
-                bucket = self._node_merge_grid.get((cx + dx, cy + dy))
+        for dy in (-1, 0, 1):
+            cy = cy0 + dy
+            cx0 = self._node_merge_lon_cell(lon, cy, merge_tol_m)
+            for dx in (-1, 0, 1):
+                bucket = self._node_merge_grid.get((cx0 + dx, cy))
                 if not bucket:
                     continue
                 live = []
@@ -2490,7 +2520,7 @@ class NauticalRoutingPipeline:
                         best_dist = dist
                         best_id = node_id
                 if len(live) != len(bucket):
-                    self._node_merge_grid[(cx + dx, cy + dy)] = live
+                    self._node_merge_grid[(cx0 + dx, cy)] = live
         return best_id
 
     def _build_inland_network(self):
