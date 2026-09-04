@@ -1,6 +1,13 @@
 # Spec: Graph Node Density — Over-Sampling and Fairway Duplication
 
-Status: §4.1 implemented and verified. §4.1.2, §4.1.3, §5.1 and §6.1 fixed. Not enabled by default.
+Status: §4.1 implemented and verified. §4.1.2, §4.1.3, §5.1 and §6.1 fixed. §6.3, §6.4,
+§6.5, §6.6, and §6.7 implemented. None enabled by default. §6.5 is the fix for the net
+density regression §6.3+§6.4 compounded; §6.6 (Pass 2 fan-in) and §6.7 (Pass 0c/0d
+Direction-A target fan-in) are two independent fixes for residual hub-fanout §6.5
+alone did not resolve — §6.7 is the one a real build confirmed as the actual dominant
+cause (§6.6's own real-build verification found Pass 2 was NOT it). See
+`data/BUILD_LOG.md` for every real build's measured effect before assuming any of
+these should ship enabled by default.
 Complements: `SPEC-RECOMMENDED-TRACK.md`, `SPEC-FAIRWAY-HARMONIZATION.md`
 Scope: `nautical_routing_pipeline.py` (`build_skeleton_network`, `_resample_long_skeleton_edges`, `_skeleton_raster_to_graph`, `ClassificationConfig`)
 Measured against: `data/zeeland_full.sqlite` (48,553 nodes / 137,718 directed edges), RWS source GeoJSON
@@ -912,6 +919,194 @@ in `tests/test_inland_densify.py` (`TestDensifyRejectsUnsafeCaps`): NaN, `+inf`,
 `1e-9` cap all raise `ValueError` instead of reaching `shapely.segmentize`; the floor
 value itself (1.0m) is still accepted; a negative cap keeps taking the pre-existing
 "disabled" path unchanged, since it never reaches the new check.
+
+### 6.5 The net effect: five rounds of locally-valid fixes compounded into a regression — connector merge/split — IMPLEMENTED
+
+**Symptom.** A rendered screenshot at a bridge crossing over a narrow canal (Postbrug,
+Yerseke) showed dense clusters of nodes still present after §4.1, §4.3, §6.3, and §6.4
+all shipped — including nodes less than 5m apart with no depth difference to explain
+it, and nodes right on the fairway line that should have been suppressed by axis-dedup.
+
+**Measurement.** Every prior round in this section verified itself only against its own
+immediate predecessor build, never against this spec's own original baseline. Traced
+via the `.bak`/`.disabled` snapshots each round leaves behind before shipping the next:
+
+| stage | nodes | edges |
+|---|---|---|
+| original baseline (§1) | 48,553 | 137,718 |
+| + §4.1 sagitta resampling | 32,918 | 98,091 |
+| + §4.3 axis-dedup + §6.3 carve-reconnect | 50,432 | 175,743 |
+| + §6.4 inland-waterways densify | **64,717** | **203,582** |
+
+§4.1 was a real win (48,553 → 32,918). Everything shipped after it added nodes back
+faster than it removed them: the deployed database ends 33% above the original node
+count and 48% above the original edge count — worse than doing nothing.
+
+**Root cause, traced to a specific shared mechanism.** Two independent call sites each
+always mint a brand-new node instead of first checking whether the pipeline already has
+something equivalent nearby:
+
+1. `_connect_waterway_crossing` always snaps to the *nearest existing vertex* of the
+   target `inland_waterways` line, never the true point of contact. §6.3's
+   carve-reconnect calls it for every carve-induced dead end — which, by construction,
+   sits within a few metres to tens of metres of the very axis line responsible for
+   carving it — and gets a permanent new node + stub edge instead of merging straight
+   into that axis. §6.4's fan-out fix (densify the entire ~3,700km network to
+   100-150m spacing so a nearby vertex always exists) is the same "pay the cost
+   everywhere" anti-pattern §4.1 already replaced once, one section later.
+2. `_add_opening_bridge_edges` runs *after* `build_network()` (all of axis-dedup
+   carving and §6.3's reconnect included) and is completely unaware of any of it: for
+   every movable bridge it unconditionally mints a new node at each
+   fairway/inland-waterways intersection with the bridge polygon, sited essentially on
+   the axis by construction, then always wires up to 4 more edges outward. A bridge
+   where both a fairway line and an inland-waterways line intersect produces two
+   near-coincident opening nodes, each independently fanning out its own edges — the
+   fairway-adjacent clusters the screenshot showed were never in axis-dedup's path at
+   all.
+
+**Design options considered.** Following §6.4.1's own precedent for choosing between
+raster-time carving and post-hoc pruning: fixing the *symptom* (mint fewer nodes near
+existing ones) by adding yet another compensating pass was rejected outright — that is
+exactly the pattern that produced this regression across five rounds. The fix has to
+replace the root mechanism (always-mint) at both call sites, not add a sixth
+compensating pass on top.
+
+**Chosen approach.** One flag, `connector_merge_m` (`--connector-merge-m`, default
+0.0/disabled, matching this spec's established convention), gating two changes:
+
+- `_connect_waterway_crossing`/new `_get_or_split_inland_segment`: project the
+  crossing/dead-end point onto the target line; reuse an existing vertex (or a
+  previously-inserted split point) within tolerance, or split that segment's current
+  graph edge to insert exactly one new vertex at the true point of contact. Live
+  per-segment split state is tracked pipeline-wide in `self._inland_split_cuts`
+  (reset once per `build_network()`, unlike the call-scoped `line_m_cache`), so a
+  second candidate landing on a segment a first candidate already split — from any of
+  the three call sites, across any piece, in any order — always sees the current
+  sub-segment structure rather than stale original geometry. This is the true
+  edge-splitting option §6.4.1 named and deferred for its own fan-out fix; doing it
+  here, driven by real contact points rather than a flat network-wide cap, is expected
+  to make §6.4's blanket densify unnecessary as a follow-up (not part of this change).
+- `_add_opening_bridge_edges`: dedupe near-coincident `opening_pts` before planting
+  any node, and search for an existing nearby node before minting a new one. A reused
+  node may already carry real data, so the merge never blindly re-stamps it:
+  `node_depth` only ever tightens (never relaxes a more restrictive existing
+  constraint with the bridge's permissive 99.0 sentinel), and `node_kind_id`/`source`
+  are left alone if the node is already typed.
+
+Recommended tolerance once enabled: 5.0m — comfortably above `_get_or_create_node`'s
+~1.1m coordinate-rounding grain, matching `axis_dedup_floor_m`'s own established 5m
+"effectively coincident" floor, and two orders of magnitude below
+`WATERWAY_CONNECTOR_MAX_M` (250m).
+
+**Verification.** Same five-gate discipline as §4.3.3/§6.3.4: `connector_merge_m ==
+0.0` reproduces prior output byte-for-byte (194/194 unit tests pass unchanged);
+`crosses_land == 0`; connectivity measured by edge length, not node count, against
+`data/zeeland_clip`; POI-pair reachability (zero pairs lost, Krammersluizen checked
+explicitly given its history in this area); and — the specific gate the prior five
+rounds skipped — node/edge counts measured against the *original* baseline
+(48,553/137,718), not just the immediately-prior build. Also: a connector-edge-length
+spot check, and a re-run of §6.4's own hub-node scan (`out-degree > 30`) with
+`--connector-merge-m 5.0` and `--inland-densify-max-segment-m 0.0` to confirm splitting
+alone fixes the original hub-fanout problem without needing §6.4's blanket densify —
+the evidence needed before recommending §6.4 be defaulted back off.
+
+Covered by `tests/test_waterway_connector_merge.py` and extensions to
+`tests/test_axis_dedup.py`'s `TestNavmeshCarveReconnect`/`TestSkeletonCarveReconnect`.
+
+### 6.6 Pass 2's connectivity guarantee has no per-node fan-in cap — IMPLEMENTED
+
+**Symptom.** Verifying §6.5 with real Zeeland rebuilds (`data/BUILD_LOG.md` #2-#5)
+found hub nodes (out-degree > 30) persisting at 56-231 regardless of
+`connector_merge_m` or `axis_dedup_cap` — nowhere near the live database's 5. Traced
+to `_ensure_coastal_connectivity`/`_stitch_component_pieces`, entirely separate from
+what §6.5 touches.
+
+**Root cause.** `_stitch_component_pieces` runs several stitching passes. Pass 0c
+(navmesh perimeter) and Pass 0d (inland nodes) each explicitly cap cross-type fan-in
+per node (`MAX_CROSS_CONNECTORS_PER_NAVMESH_NODE` / `MAX_LOCAL_CONNECTORS_PER_INLAND_
+NODE`, both 2) — a deliberate, documented guard against exactly this class of problem.
+**Pass 2** (the "connectivity guarantee, one merge round at a time" pass, run last,
+up to 30 rounds) has no such cap: each round it finds every still-disconnected
+group's geometrically nearest cross-group candidate and merges via union-find, with
+no limit on how many different groups can pick the *same* node as their nearest
+candidate. Measured directly: as few as ~58 Pass 2 successes on one real build
+produced out-degree up to 42 on a single node.
+
+**Design options considered.** Capping fan-in risks stranding a group whose only
+nearby candidates are all capped-out — unlike Pass 0c/0d (which have a distance
+radius and can simply give up on a specific connector, leaving the broader guarantee
+to Pass 2), Pass 2 *is* the guarantee, so silently refusing a candidate needs a safe
+fallback, not a dropped connection.
+
+**Chosen approach.** `pass2_max_fanin_per_node` (`--pass2-max-fanin-per-node`,
+default 0/disabled, matching this spec's established convention). When a candidate's
+source or target node has already accumulated this many *Pass-2-added* edges (not
+counting pre-existing structural degree — a node's ordinary ring/chain topology
+never itself triggers the cap), Pass 2 skips it and tries the next-nearest candidate
+instead — mirroring how it already skips a poly/land-rejected candidate. A group that
+only ever discovers capped-out candidates falls through to
+`_resolve_local_skeleton_gaps`, which already runs immediately after Pass 2 as the
+existing fallback for whatever Pass 2 can't merge — no new fallback mechanism needed.
+Applied symmetrically to both Pass 2 code paths (the geometric escalating-k search
+active when `--sagitta-cap` is set, and the legacy per-group-sample path used at
+`--sagitta-cap 0`), gated purely on `pass2_max_fanin_per_node > 0` so it composes
+with either.
+
+**Verification.** Synthetic hub-and-spokes test (`tests/test_pass2_fanin_cap.py`):
+one hub node equidistant from N spoke nodes (each spoke's true nearest cross-group
+candidate is unambiguously the hub), `snap_radius_m` set below every pairwise
+distance so Pass 0/Pass 1 (both distance-gated) contribute nothing, isolating Pass 2
+as the only mechanism under test. Confirms: cap=0 lets the hub accumulate a connector
+to every spoke (documented pre-existing behaviour); cap=N bounds the hub's
+Pass-2-added out-degree at N while every spoke still ends up in the same connected
+component (via a different, uncapped node) rather than being stranded; a larger cap
+allows proportionally more fan-in. Full real-build verification (five-gate
+discipline, against `data/BUILD_LOG.md`'s baseline) pending.
+
+### 6.7 Pass 0c/0d's fan-in cap only covers one direction — IMPLEMENTED
+
+**Symptom.** §6.6's `pass2_max_fanin_per_node`, verified on a real Zeeland build
+(`data/BUILD_LOG.md` #6), did not reduce the hub count at all — 56 hubs before and
+after, `fanin_capped` never firing once. The cap was correctly implemented but aimed
+at the wrong mechanism.
+
+**Root cause, this time confirmed empirically, not inferred.** Queried the actual
+highest-degree node in the build (#6): 42 edges, every one 44-93m long, 40 of the 42
+neighbors navmesh-perimeter (`node_kind_id=navmesh_vertex`) nodes. Pass 2 has no
+distance cap — finding a valid connector "even when the two nearest groups are
+genuinely far apart" is its entire purpose — so a hub built entirely of short edges
+cannot be Pass 2's doing. It's Pass 0c. Pass 0c's Direction A ("each navmesh vertex
+-> its k nearest cross-type neighbours") caps how many connectors *that vertex's own
+search* may add, keyed by the navmesh vertex. Direction B (the symmetric reverse
+query, "each non-navmesh node -> its k nearest navmesh vertices") caps a navmesh node
+as a *target*. But Direction A's own target side — the non-navmesh point being picked
+— has no cap at all: many different navmesh vertices, each individually within its
+own 2-connector budget, can all independently pick the *same* nearby point. Pass 0d
+(inland nodes) has the identical asymmetry in its own Direction A.
+
+**Chosen approach.** `pass0_target_fanin_cap` (`--pass0-target-fanin-cap`, default
+0/disabled, matching this spec's convention). A single shared counter, keyed by node
+id, spans Direction A *and* Direction B of *both* Pass 0c and Pass 0d — a node
+targeted by more than one of these four code paths shares one real budget rather than
+getting a fresh allotment from each. When a node has already accumulated this many
+Direction-A-or-B-sourced connectors, Direction A skips it as a target and tries the
+next-nearest candidate instead — the identical pattern every other cap in this file
+already uses for a poly/land-rejected or radius-rejected candidate. Safe regardless
+of `pass2_max_fanin_per_node`: Pass 1/Pass 2 run afterward and remain the
+connectivity guarantee no matter how tightly Pass 0c/0d are capped.
+
+**Verification.** Synthetic test (`tests/test_pass0_target_fanin_cap.py`): one target
+node plus N navmesh-kind nodes wired into a ring (mirroring a real navmesh perimeter
+piece — deliberately *not* N unconnected singletons, since plain Pass 0, which is
+union-find gated and runs first, would otherwise connect the target to every source
+before Pass 0c gets a chance to contribute anything at all; a pre-connected ring
+reproduces Pass 0c's own documented motivating scenario, where the ring is already
+one union-find group and Pass 0/0b/1 only ever add a single connection to it before
+treating it as "already connected"). Confirms: cap=0 lets the target accumulate every
+ring member's connector; cap=N bounds Pass 0c's own contribution at N
+(`_stitch_diag["pass0c"]["success"] <= N`, `target_fanin_capped` firing) while the
+graph stays fully connected regardless. Real-build five-gate verification (does hub
+count actually drop against `data/BUILD_LOG.md`'s baseline) pending.
 
 ## 7. Risks
 
