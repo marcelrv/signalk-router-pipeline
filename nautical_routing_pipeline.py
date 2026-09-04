@@ -1012,6 +1012,20 @@ class ClassificationConfig:
     # matching --sagitta-cap/--axis-dedup-cap's convention. Densifying makes the
     # nearest-existing-vertex assumption true again instead of changing either consumer.
     inland_densify_max_segment_m: float = 0.0  # max vertex spacing (m) after densifying; 0.0 = disabled
+    # SPEC-GRAPH-DENSITY.md §6.9 follow-up: _build_inland_network ingests every vertex
+    # of the raw inland_waterways source line directly, vertex-to-vertex, with NO
+    # consolidation -- a densely-digitized IENC line (measured as low as ~70-100m
+    # vertex spacing on a real Zeeland build) reproduces that exact density in the
+    # graph regardless of --sagitta-cap/--max-segment-m, which only govern SKELETON
+    # resampling (_resample_long_skeleton_edges), never this raw ingestion path.
+    # 0.0 (default) disables this entirely -- inland_gdf stays byte-identical to
+    # today's, matching every other flag's convention in this file. > 0.0: reuses
+    # _resample_long_skeleton_edges's own cumulative-arc-length walk (sagitta
+    # disabled -- inland_waterways carries no per-vertex width to scale a tolerance
+    # by) to consolidate consecutive EXISTING vertices into chords up to this many
+    # metres -- it only removes vertices, never inserts new ones (the opposite,
+    # complementary operation to inland_densify_max_segment_m above).
+    inland_resample_max_segment_m: float = 0.0  # max spacing (m) after consolidating; 0.0 = disabled
     # SPEC-GRAPH-DENSITY.md §6.5: §6.3's carve-reconnect and §6.4's blanket densify both
     # compounded density instead of cutting it, because the pipeline's two "plant a node
     # at this point" mechanisms (_connect_waterway_crossing's nearest-EXISTING-vertex
@@ -1331,6 +1345,7 @@ class NauticalRoutingPipeline:
                  axis_dedup_floor_m: Optional[float] = None,
                  min_navmesh_radius_m: Optional[float] = None,
                  inland_densify_max_segment_m: float = 0.0,
+                 inland_resample_max_segment_m: float = 0.0,
                  connector_merge_m: float = 0.0,
                  pass2_max_fanin_per_node: int = 0,
                  pass0_target_fanin_cap: int = 0,
@@ -1351,6 +1366,7 @@ class NauticalRoutingPipeline:
                                                            max_chord_sagitta_m=sagitta_cap,
                                                            axis_dedup_cap_m=axis_dedup_cap,
                                                            inland_densify_max_segment_m=inland_densify_max_segment_m,
+                                                           inland_resample_max_segment_m=inland_resample_max_segment_m,
                                                            connector_merge_m=connector_merge_m,
                                                            pass2_max_fanin_per_node=pass2_max_fanin_per_node,
                                                            pass0_target_fanin_cap=pass0_target_fanin_cap,
@@ -1494,6 +1510,7 @@ class NauticalRoutingPipeline:
                 self.gdfs[layer_name] = gpd.GeoDataFrame(geometry=[], crs=self.CRS_WGS84)
         if "inland_waterways" in self.gdfs:
             self.gdfs["inland_waterways"] = self._densify_inland_waterways(self.gdfs["inland_waterways"])
+            self.gdfs["inland_waterways"] = self._resample_inland_waterways(self.gdfs["inland_waterways"])
         self._build_fairways_unified()
         self.gdfs_metric = {
             name: gdf.to_crs(self.CRS_METRIC) for name, gdf in self.gdfs.items()
@@ -1597,6 +1614,50 @@ class NauticalRoutingPipeline:
         densified = gpd.GeoSeries(densified_m, index=inland_gdf.index, crs=self.CRS_METRIC).to_crs(self.CRS_WGS84)
         out = inland_gdf.copy()
         out["geometry"] = densified
+        return out
+
+    def _resample_inland_waterways(self, inland_gdf):
+        """SPEC-GRAPH-DENSITY.md §6.9 follow-up: `_build_inland_network` ingests
+        every vertex of the raw `inland_waterways` source line directly, vertex-
+        to-vertex, with NO consolidation -- a densely-digitized IENC line (measured
+        as low as ~70-100m vertex spacing on a real Zeeland build) reproduces that
+        exact density in the graph regardless of `--sagitta-cap`/`--max-segment-m`,
+        which only govern SKELETON resampling (`_resample_long_skeleton_edges`),
+        never this raw ingestion path.
+
+        Reuses that same generator's plain cumulative-arc-length walk here rather
+        than a second, separately-implemented mechanism -- `inland_waterways`
+        carries no per-vertex width attribute, so sagitta relaxation is left
+        disabled (`max_chord_sagitta_m=0.0` in the call below) and every vertex's
+        width entry is `None`, simply passed through unused by the fallback path.
+        This only REMOVES existing vertices (never inserts new ones, unlike
+        `_densify_inland_waterways` above) -- the complementary opposite operation,
+        safe to enable independently or together (densify first, then resample,
+        the order `parse_shapefiles` already calls them in).
+
+        Gated on `inland_resample_max_segment_m > 0.0` -- disabled (default) leaves
+        `inland_gdf` untouched, byte-identical to today's build, matching every
+        other flag's convention in this file.
+        """
+        cap_m = self.classification_config.inland_resample_max_segment_m
+        if cap_m <= 0.0 or inland_gdf.empty:
+            return inland_gdf
+        if not math.isfinite(cap_m) or cap_m <= 0.0:
+            raise ValueError(
+                f"--inland-resample-max-segment-m must be finite and > 0.0 "
+                f"(got {cap_m!r}).")
+        new_geoms = []
+        for geom in inland_gdf.geometry:
+            if not isinstance(geom, LineString) or len(geom.coords) < 3:
+                new_geoms.append(geom)
+                continue
+            coords = list(geom.coords)
+            kept = [coords[0]]
+            for sub_pts, _ in self._resample_long_skeleton_edges(coords, [None] * len(coords), cap_m):
+                kept.append(sub_pts[-1])
+            new_geoms.append(LineString(kept))
+        out = inland_gdf.copy()
+        out["geometry"] = new_geoms
         return out
 
     def _build_obstacle_layer(self):
@@ -7040,6 +7101,24 @@ if __name__ == "__main__":
                              "WATERWAY_CONNECTOR_MAX_M (250m). Must be finite and >= "
                              f"{INLAND_DENSIFY_MIN_SEGMENT_M}m if enabled (raises otherwise) "
                              "-- shapely.segmentize has no vertex-count ceiling of its own.")
+    parser.add_argument("--inland-resample-max-segment-m", type=float, default=0.0,
+                        help="Consolidate consecutive EXISTING vertices of inland_waterways "
+                             "lines into chords up to this many metres long (SPEC-GRAPH-"
+                             "DENSITY.md §6.9 follow-up) -- the opposite, complementary "
+                             "operation to --inland-densify-max-segment-m. "
+                             "_build_inland_network ingests every source vertex directly with "
+                             "NO consolidation, so a densely-digitized IENC line (measured as "
+                             "low as ~70-100m spacing on a real Zeeland build) reproduces that "
+                             "exact density in the graph regardless of --sagitta-cap/"
+                             "--max-segment-m, which only govern SKELETON resampling, never "
+                             "this raw ingestion path. Default 0.0 DISABLES this entirely and "
+                             "leaves inland_waterways geometry byte-identical to today's. "
+                             "Recommended once enabled: match --sagitta-cap's value (e.g. "
+                             "250) for visually consistent node spacing between skeleton and "
+                             "inland-line edges. Must be finite and > 0.0 if enabled (raises "
+                             "otherwise); only removes vertices, so unlike "
+                             "--inland-densify-max-segment-m there is no risk of unbounded "
+                             "vertex growth at a small value.")
     parser.add_argument("--connector-merge-m", type=float, default=0.0,
                         help="Merge a new connector/opening node into an existing (or "
                              "previously-inserted) one within this many metres of the true "
@@ -7204,6 +7283,7 @@ if __name__ == "__main__":
                                        axis_dedup_floor_m=args.axis_dedup_floor_m,
                                        min_navmesh_radius_m=args.min_navmesh_radius_m,
                                        inland_densify_max_segment_m=args.inland_densify_max_segment_m,
+                                       inland_resample_max_segment_m=args.inland_resample_max_segment_m,
                                        connector_merge_m=args.connector_merge_m,
                                        pass2_max_fanin_per_node=args.pass2_max_fanin_per_node,
                                        pass0_target_fanin_cap=args.pass0_target_fanin_cap,
