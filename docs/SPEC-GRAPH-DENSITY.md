@@ -1173,11 +1173,44 @@ sixth compensating pass on top of five prior ones):
 default 0.0/disabled) matching this spec's established convention so a `0.0` build
 stays byte-identical to today.
 
-**Status: NOT YET IMPLEMENTED.** Deliberately kept out of the fairway
-`cost_factor`/`FAIRWAY_MATCH_BUFFER_M` fix (a different bug, in a different
-subsystem, verified independently) — this one touches core node identity/merging, a
-different risk class, and deserves its own A/B build verification the way
-`connector_merge_m` got in §6.5.
+**Status: IMPLEMENTED.**
+
+#### 6.8.1 Implementation
+
+Option 1 (the recommendation above), gated behind `--node-merge-m` (default `0.0`,
+disabled — a `0.0` build stays byte-identical to today's exact-rounding dedup,
+matching every other flag in this section's convention). `_get_or_create_node` first
+checks a new grid-bucket spatial index (`_node_merge_grid`, populated by
+`_register_node_in_merge_grid`, queried by `_find_nearby_node`) for an existing node
+within `node_merge_m` metres before falling back to the exact `(round(lon,5),
+round(lat,5))` dedup; on a hit it reuses that node instead of minting a near-
+duplicate. Unlike `connector_merge_m`'s two call sites (each merging against one
+specific `inland_waterways` line, where "split the segment" is meaningful),
+`_get_or_create_node` is called for arbitrary standalone points from ~15 call sites
+with no line to project onto — so this is pure point-level spatial dedup ("is there
+already a node within tolerance? reuse it, else create one"), not a split. A grid
+bucket hash (not a KD-tree) was used because insertions are interleaved with lookups
+throughout the whole build, making a periodically-rebuilt tree impractical; the cell
+sizing reuses this file's existing 111320 m/deg / `cos(lat)` metre-to-degree
+approximation (see `_lonlat_margin_deg`). Bounded by a new, deliberately tight
+ceiling `NODE_MERGE_MAX_M = 20.0` (vs. `connector_merge_m`'s 250m
+`WATERWAY_CONNECTOR_MAX_M`) since this governs every node in the graph, not one
+line's own search radius — a generous value would risk collapsing genuinely distinct
+nearby features (e.g. two adjacent lock chamber approach points), not just the ~1-2m
+rounding-grain duplicates it targets. Not segregated by `node_type`: the existing
+exact-match `coords_to_node` dict was already not `node_type`-aware, and this fix
+preserves that behaviour rather than changing it (out of scope for this bug).
+Regression coverage: `tests/test_node_merge.py`.
+
+**Verified live** (`data/BUILD_LOG.md` build #9 vs. build #8, identical
+`data/zeeland_fresh_clip` input and flags except `--node-merge-m 5.0`): the
+Krammersluis Noord/Zuid junction's sub-3m stub-edge count — the exact symptom this
+section traced — goes from 12 to **0**. Network-wide, edges under 3m drop 79% (1,047
+→ 221 out of ~186k), with the remaining 221 all also under 1.5m (consistent with
+genuine short skeleton segments, not rounding-grain duplicates). Hub count (0) and
+`crosses_land` (0) are unaffected in both builds; max out-degree improves slightly
+(12 → 11) — confirming the fix removes near-duplicate topology without introducing
+new connectivity problems. Not installed live pending explicit deploy confirmation.
 
 ### 6.9 Clarification: `axis_dedup_cap_m` is a ceiling on a width-scaled tolerance, and lock polygons are exempted entirely — not a bug
 
