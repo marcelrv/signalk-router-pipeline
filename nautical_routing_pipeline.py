@@ -517,6 +517,20 @@ def _edge_attr_worker(edge_chunk):
 
 COORD_SPACE = 36000000
 OBSTACLE_BUFFER_METERS = 5
+# The fairway cost-factor test below (_edge_attr_worker) checks a bare
+# `intersects()` between each final graph edge's straight chord and the
+# fairway/inland-waterway reference layer. inland_waterways entries are
+# zero-width centerlines, so an exact intersects() only fires when a chord
+# actually crosses the line -- a chord running parallel to it a few metres
+# off (routine skeleton/medial-axis wobble, or drift introduced by
+# SPEC-GRAPH-DENSITY.md's axis-dedup/densify/connector-merge splitting) misses
+# entirely. The finer the edge splitting, the more of a fairway's real length
+# this silently drops to the 1.2 default: verified on a real Zeeland corridor,
+# splitting from ~98k to ~187k edges dropped fairway-tagged coverage on one
+# route from 83% to 59% of its length with no change to the source geometry.
+# Buffering the reference layer by a few metres before the intersects() test
+# absorbs that drift without needing every edge to land exactly on the line.
+FAIRWAY_MATCH_BUFFER_M = 5.0
 EDGE_TYPE_COASTAL = 0
 EDGE_TYPE_INLAND = 1
 POI_TYPE_HARBOUR = 0
@@ -6361,7 +6375,22 @@ class NauticalRoutingPipeline:
         if not self.gdfs.get("fairways_unified", gpd.GeoDataFrame()).empty:
             fw_gdfs.append(self.gdfs["fairways_unified"])
         if not self.gdfs.get("inland_waterways", gpd.GeoDataFrame()).empty: fw_gdfs.append(self.gdfs["inland_waterways"])
-        highways_gdf = pd.concat(fw_gdfs, ignore_index=True) if fw_gdfs else gpd.GeoDataFrame(geometry=[])
+        highways_gdf = (gpd.GeoDataFrame(pd.concat(fw_gdfs, ignore_index=True), crs=self.CRS_WGS84)
+                        if fw_gdfs else gpd.GeoDataFrame(geometry=[], crs=self.CRS_WGS84))
+        if not highways_gdf.empty:
+            # See FAIRWAY_MATCH_BUFFER_M: buffer in metres so the per-edge
+            # intersects() test in _edge_attr_worker tolerates a skeleton/
+            # medial-axis chord passing near, not exactly through, the
+            # fairway polygon or inland-waterway centerline. CRS_METRIC
+            # (EPSG:3857 / Web Mercator) is NOT equidistant -- at ~52 degN it
+            # stretches ground distance by ~1/cos(lat), so a `.buffer(5.0)`
+            # there only covers ~3.1m on the ground, undershooting the
+            # intended tolerance. Use a local UTM CRS instead, as elsewhere
+            # in this file (_local_utm_crs).
+            utm = self._local_utm_crs(unary_union(list(highways_gdf.geometry)))
+            highways_metric = highways_gdf.to_crs(utm)
+            highways_metric["geometry"] = highways_metric.geometry.buffer(FAIRWAY_MATCH_BUFFER_M)
+            highways_gdf = highways_metric.to_crs(self.CRS_WGS84)
 
         worker_gdfs = {
             "land_metric": self.gdfs_metric.get("land", gpd.GeoDataFrame()),
