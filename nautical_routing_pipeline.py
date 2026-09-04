@@ -1327,6 +1327,9 @@ class NauticalRoutingPipeline:
                  sagitta_cap: float = 0.0,
                  max_segment_m: Optional[float] = None,
                  axis_dedup_cap: float = 0.0,
+                 axis_dedup_fraction: Optional[float] = None,
+                 axis_dedup_floor_m: Optional[float] = None,
+                 min_navmesh_radius_m: Optional[float] = None,
                  inland_densify_max_segment_m: float = 0.0,
                  connector_merge_m: float = 0.0,
                  pass2_max_fanin_per_node: int = 0,
@@ -1354,6 +1357,12 @@ class NauticalRoutingPipeline:
                                                            node_merge_m=node_merge_m)
         if max_segment_m is not None:
             self.classification_config.max_segment_m = float(max_segment_m)
+        if axis_dedup_fraction is not None:
+            self.classification_config.axis_dedup_fraction = float(axis_dedup_fraction)
+        if axis_dedup_floor_m is not None:
+            self.classification_config.axis_dedup_floor_m = float(axis_dedup_floor_m)
+        if min_navmesh_radius_m is not None:
+            self.classification_config.min_navmesh_radius_m = float(min_navmesh_radius_m)
         self.geod = Geod(ellps="WGS84")
         self.CRS_WGS84 = "EPSG:4326"
         self.CRS_METRIC = "EPSG:3857"
@@ -6987,6 +6996,37 @@ if __name__ == "__main__":
                              "byte -- build_skeleton_network never generates a redundant medial-axis "
                              "twin next to a channel the pipeline already ingested from the "
                              "inland_waterways source.")
+    parser.add_argument("--axis-dedup-fraction", type=float, default=None,
+                        help="Override ClassificationConfig.axis_dedup_fraction (default 0.5), "
+                             "the multiplier on local channel width in --axis-dedup-cap's "
+                             "tol = clip(fraction * width, floor, cap) formula. At the default "
+                             "0.5, tol is roughly HALF the local channel width -- enough to just "
+                             "reach the bank if the axis line runs exactly down the centerline, "
+                             "but with no margin for medial-axis wobble near bends/junctions or a "
+                             "locally underestimated width sample, which is why a narrow channel "
+                             "can still show unsuppressed skeleton nodes alongside a real axis "
+                             "line. Raise it (e.g. 1.0) for margin. Only takes effect when "
+                             "--axis-dedup-cap > 0.0.")
+    parser.add_argument("--axis-dedup-floor-m", type=float, default=None,
+                        help="Override ClassificationConfig.axis_dedup_floor_m (default 5.0), the "
+                             "MINIMUM suppression tolerance --axis-dedup-cap's clip() formula ever "
+                             "returns, regardless of how narrow the local channel measures. "
+                             "Raising this guarantees at least this many metres of suppression "
+                             "around a narrow channel even where the width-based "
+                             "--axis-dedup-fraction term would otherwise be tiny -- the direct "
+                             "lever for 'a narrow channel should show only its authoritative axis "
+                             "line, not a parallel skeleton twin next to it'. Only takes effect "
+                             "when --axis-dedup-cap > 0.0; should stay <= --axis-dedup-cap.")
+    parser.add_argument("--min-navmesh-radius-m", type=float, default=None,
+                        help="Override ClassificationConfig.min_navmesh_radius_m (default 800.0): "
+                             "a water body must locally contain a disk of this radius "
+                             "(_split_wide_narrow erodes by this much) to be classified "
+                             "navmesh-eligible ('wide') rather than routed to the skeleton/channel "
+                             "path ('narrow'). Raise it to push more borderline-width water to the "
+                             "single-centerline skeleton representation instead of a full "
+                             "triangulated navmesh region. Already raised once from 300.0 (Round 9 "
+                             "Issue F: 300m was triggering navmesh treatment for water that reads "
+                             "as channel-like, not genuinely open).")
     parser.add_argument("--inland-densify-max-segment-m", type=float, default=0.0,
                         help="Insert interpolated vertices into inland_waterways lines so no "
                              "segment exceeds this length in metres (SPEC-GRAPH-DENSITY.md "
@@ -7160,6 +7200,9 @@ if __name__ == "__main__":
                                        sagitta_cap=args.sagitta_cap,
                                        max_segment_m=args.max_segment_m,
                                        axis_dedup_cap=args.axis_dedup_cap,
+                                       axis_dedup_fraction=args.axis_dedup_fraction,
+                                       axis_dedup_floor_m=args.axis_dedup_floor_m,
+                                       min_navmesh_radius_m=args.min_navmesh_radius_m,
                                        inland_densify_max_segment_m=args.inland_densify_max_segment_m,
                                        connector_merge_m=args.connector_merge_m,
                                        pass2_max_fanin_per_node=args.pass2_max_fanin_per_node,
