@@ -188,7 +188,7 @@ the only mutually-comparable set so far (identical `data/zeeland_fresh_clip` inp
 
 ### #8 — `zeeland_fairwaybufferfix.sqlite` — FAIRWAY_MATCH_BUFFER_M fix, same graph shape as #7
 
-```
+```bash
 ... identical command to #7 (node/edge/hub/max-out-deg counts match exactly,
 confirming the fix changes edge attributes only, not topology):
 .venv/bin/python3 nautical_routing_pipeline.py \

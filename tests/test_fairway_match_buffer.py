@@ -67,6 +67,16 @@ class TestFairwayMatchBuffer:
         p.calculate_edge_attributes()
         assert p.graph.edges[u, v]["cost_factor"] == 1.2
 
+    def test_chord_near_the_full_buffer_radius_still_counts_as_fairway(self):
+        # Buffering in CRS_METRIC (EPSG:3857, Web Mercator) would only cover
+        # ~3.1m on the ground at this latitude instead of the full 5.0m --
+        # this offset (within the documented 4.5-5.5m tolerance) only passes
+        # once the buffer is built in a local metre-based UTM CRS.
+        p = _pipeline()
+        u, v = _add_edge(p, offset_m=4.9, node_prefix="nearfull")
+        p.calculate_edge_attributes()
+        assert p.graph.edges[u, v]["cost_factor"] == 0.8
+
     def test_buffer_constant_is_a_few_metres_not_kilometres(self):
         # Sanity guard: this fix is meant to absorb splitting/skeleton drift, not to
         # blanket-tag distant open water as fairway.

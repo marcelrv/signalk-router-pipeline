@@ -6381,8 +6381,14 @@ class NauticalRoutingPipeline:
             # See FAIRWAY_MATCH_BUFFER_M: buffer in metres so the per-edge
             # intersects() test in _edge_attr_worker tolerates a skeleton/
             # medial-axis chord passing near, not exactly through, the
-            # fairway polygon or inland-waterway centerline.
-            highways_metric = highways_gdf.to_crs(self.CRS_METRIC)
+            # fairway polygon or inland-waterway centerline. CRS_METRIC
+            # (EPSG:3857 / Web Mercator) is NOT equidistant -- at ~52 degN it
+            # stretches ground distance by ~1/cos(lat), so a `.buffer(5.0)`
+            # there only covers ~3.1m on the ground, undershooting the
+            # intended tolerance. Use a local UTM CRS instead, as elsewhere
+            # in this file (_local_utm_crs).
+            utm = self._local_utm_crs(unary_union(list(highways_gdf.geometry)))
+            highways_metric = highways_gdf.to_crs(utm)
             highways_metric["geometry"] = highways_metric.geometry.buffer(FAIRWAY_MATCH_BUFFER_M)
             highways_gdf = highways_metric.to_crs(self.CRS_WGS84)
 
