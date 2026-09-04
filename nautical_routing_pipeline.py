@@ -1,5 +1,6 @@
 import os
 import math
+import bisect
 import inspect
 import json
 import sqlite3
@@ -987,6 +988,21 @@ class ClassificationConfig:
     # matching --sagitta-cap/--axis-dedup-cap's convention. Densifying makes the
     # nearest-existing-vertex assumption true again instead of changing either consumer.
     inland_densify_max_segment_m: float = 0.0  # max vertex spacing (m) after densifying; 0.0 = disabled
+    # SPEC-GRAPH-DENSITY.md §6.5: §6.3's carve-reconnect and §6.4's blanket densify both
+    # compounded density instead of cutting it, because the pipeline's two "plant a node
+    # at this point" mechanisms (_connect_waterway_crossing's nearest-EXISTING-vertex
+    # snap, and _add_opening_bridge_edges's unconditional new node per fairway/bridge
+    # intersection) never check whether something equivalent already sits nearby before
+    # minting a new node. 0.0 (default) disables both mechanisms below entirely --
+    # _connect_waterway_crossing's nearest-vertex search and _add_opening_bridge_edges'
+    # node creation stay byte-identical to today's, matching --sagitta-cap/
+    # --axis-dedup-cap/--inland-densify-max-segment-m's convention. > 0.0: an existing
+    # vertex (or a previously-inserted split point, or an existing bridge-adjacent node)
+    # within this many metres of the true point of contact is reused instead of minting
+    # a near-duplicate; otherwise exactly one new vertex/node is created at the true
+    # point. Recommended once enabled: 5.0m (see _connect_waterway_crossing's docstring
+    # for the calibration).
+    connector_merge_m: float = 0.0
 
     def pixel_size_for(self, min_dimension_m: float) -> float:
         return float(np.clip(min_dimension_m / self.pixel_dim_divisor,
@@ -1223,7 +1239,8 @@ class NauticalRoutingPipeline:
                  sagitta_cap: float = 0.0,
                  max_segment_m: Optional[float] = None,
                  axis_dedup_cap: float = 0.0,
-                 inland_densify_max_segment_m: float = 0.0):
+                 inland_densify_max_segment_m: float = 0.0,
+                 connector_merge_m: float = 0.0):
         self.data_paths = data_paths
         self.db_path = db_path
         self.country = country
@@ -1239,7 +1256,8 @@ class NauticalRoutingPipeline:
         self.classification_config = ClassificationConfig(depth_ceiling_m=depth_ceiling,
                                                            max_chord_sagitta_m=sagitta_cap,
                                                            axis_dedup_cap_m=axis_dedup_cap,
-                                                           inland_densify_max_segment_m=inland_densify_max_segment_m)
+                                                           inland_densify_max_segment_m=inland_densify_max_segment_m,
+                                                           connector_merge_m=connector_merge_m)
         if max_segment_m is not None:
             self.classification_config.max_segment_m = float(max_segment_m)
         self.geod = Geod(ellps="WGS84")
@@ -1283,6 +1301,12 @@ class NauticalRoutingPipeline:
         # distance guards).
         self.axis_dedup_reconnect_stats = {"skeleton_candidates": 0, "skeleton_edges": 0,
                                             "navmesh_candidates": 0, "navmesh_edges": 0}
+        # SPEC-GRAPH-DENSITY.md §6.5: connector_merge_m summary counters, logged once at
+        # the end of build_network. All stay 0 when connector_merge_m == 0.0 (the code
+        # path that increments them is only entered when the feature is on).
+        self.waterway_connector_split_stats = {"candidates": 0, "split": 0, "merged": 0}
+        self.bridge_opening_merge_stats = {"opening_points_deduped": 0, "nodes_merged": 0,
+                                            "nodes_created": 0}
         # DIAGNOSTIC (connectivity-regression investigation, not shipped as a
         # feature): per-pass attempt/outcome counters for _stitch_component_pieces
         # and _resolve_local_skeleton_gaps, plus aggregate union-find group counts
@@ -1392,6 +1416,25 @@ class NauticalRoutingPipeline:
             gpd.GeoDataFrame(pd.concat(parts, ignore_index=True), crs=self.CRS_WGS84)
             if parts else gpd.GeoDataFrame(geometry=[], crs=self.CRS_WGS84)
         )
+
+    @staticmethod
+    def _validate_connector_merge_m(merge_tol_m):
+        """SPEC-GRAPH-DENSITY.md §6.5: `connector_merge_m == 0.0` (the default)
+        disables both mechanisms it gates entirely -- no validation needed, same
+        convention as `--sagitta-cap`/`--axis-dedup-cap`/
+        `--inland-densify-max-segment-m`. `> 0.0` must be finite and strictly
+        less than `WATERWAY_CONNECTOR_MAX_M` (a merge tolerance at or beyond the
+        connector search radius itself would merge candidates that should have
+        gotten their own split/node); `NaN`/negative slip past a bare `<= 0.0`
+        check (`NaN` comparisons are always `False` in Python), so both are
+        checked explicitly rather than relying on that alone.
+        """
+        if merge_tol_m == 0.0:
+            return
+        if not math.isfinite(merge_tol_m) or merge_tol_m < 0.0 or merge_tol_m >= WATERWAY_CONNECTOR_MAX_M:
+            raise ValueError(
+                f"connector_merge_m must be finite, >= 0.0, and < {WATERWAY_CONNECTOR_MAX_M:.0f}m "
+                f"(got {merge_tol_m!r}).")
 
     def _densify_inland_waterways(self, inland_gdf):
         """SPEC-GRAPH-DENSITY.md §6.4: insert interpolated vertices along any
@@ -1529,6 +1572,14 @@ class NauticalRoutingPipeline:
     def build_network(self):
         logger.info("Building base network topology...")
         self.coords_to_node = {}
+        # SPEC-GRAPH-DENSITY.md §6.5: pipeline-wide (not call-scoped, unlike
+        # line_m_cache) live split state for _connect_waterway_crossing's
+        # project-and-split-or-merge logic. Dict[line_iloc, Dict[seg_idx,
+        # {"len_m": float, "cuts": [(t, node_id), ...]}]] -- see that method's
+        # docstring for why this needs to be shared across every piece/call in
+        # this build_network() run rather than reset per navmesh/skeleton piece.
+        self._inland_split_cuts = {}
+        self._validate_connector_merge_m(self.classification_config.connector_merge_m)
         # Inland waterway centerlines are unchanged (already vector line topology).
         if "inland_waterways" in self.gdfs and not self.gdfs["inland_waterways"].empty:
             self._build_inland_network()
@@ -1670,6 +1721,18 @@ class NauticalRoutingPipeline:
                         f"{ars['skeleton_edges']}/{ars['skeleton_candidates']} carve-induced dead ends "
                         f"reconnected, navmesh {ars['navmesh_edges']}/{ars['navmesh_candidates']} -- wired "
                         f"back to the specific inland_waterways line responsible for their own carving.")
+        wcs = self.waterway_connector_split_stats
+        if wcs["candidates"]:
+            logger.info(f"Waterway connector split/merge (SPEC-GRAPH-DENSITY.md §6.5): "
+                        f"{wcs['candidates']} candidates, {wcs['merged']} merged into an existing/"
+                        f"previously-split vertex, {wcs['split']} split a new vertex at the true "
+                        f"point of contact.")
+        boms = self.bridge_opening_merge_stats
+        if boms["nodes_merged"] or boms["nodes_created"] or boms["opening_points_deduped"]:
+            logger.info(f"Bridge opening merge (SPEC-GRAPH-DENSITY.md §6.5): "
+                        f"{boms['opening_points_deduped']} near-coincident opening points deduped, "
+                        f"{boms['nodes_merged']} openings merged into an existing nearby node, "
+                        f"{boms['nodes_created']} new opening nodes created.")
         logger.info(f"Network built with {self.graph.number_of_nodes()} nodes and {self.graph.number_of_edges()} edges.")
 
     # ------------------------------------------------------------------
@@ -2569,11 +2632,134 @@ class NauticalRoutingPipeline:
 
         return new_poly_m, extra_seam_coords, crossing_records
 
+    @staticmethod
+    def _project_point_onto_line(coords_m, xy_m):
+        """SPEC-GRAPH-DENSITY.md §6.5: vectorized point-to-segment projection of
+        `xy_m` onto the polyline `coords_m` ((N,2) ndarray of consecutive vertices
+        in a metric CRS, as cached by `line_m_cache`).
+
+        Returns `(seg_idx, t, proj_xy_m, dist_m)`: the index of the closest
+        segment (`coords_m[seg_idx] -> coords_m[seg_idx+1]`), the clamped
+        parameter `t` in `[0, 1]` along it, the projected point in the same
+        metric CRS, and the perpendicular distance from `xy_m` to that point.
+        A degenerate (zero-length) segment projects to its own single point
+        (`t=0`) rather than dividing by zero.
+        """
+        x, y = xy_m
+        p0 = coords_m[:-1]
+        p1 = coords_m[1:]
+        seg = p1 - p0
+        seg_len2 = seg[:, 0] ** 2 + seg[:, 1] ** 2
+        to_pt_x = x - p0[:, 0]
+        to_pt_y = y - p0[:, 1]
+        with np.errstate(invalid="ignore", divide="ignore"):
+            t = np.where(seg_len2 > 0, (to_pt_x * seg[:, 0] + to_pt_y * seg[:, 1]) / seg_len2, 0.0)
+        t = np.clip(t, 0.0, 1.0)
+        proj_x = p0[:, 0] + t * seg[:, 0]
+        proj_y = p0[:, 1] + t * seg[:, 1]
+        d2 = (proj_x - x) ** 2 + (proj_y - y) ** 2
+        seg_idx = int(np.argmin(d2))
+        return seg_idx, float(t[seg_idx]), (float(proj_x[seg_idx]), float(proj_y[seg_idx])), float(math.sqrt(d2[seg_idx]))
+
+    def _get_or_split_inland_segment(self, line_iloc, seg_idx, t, coords_wgs84, coords_m,
+                                      merge_tol_m, transformer):
+        """SPEC-GRAPH-DENSITY.md §6.5: return the node representing the true point
+        of contact at parameter `t` along original segment `seg_idx` of
+        `inland_waterways` line `line_iloc` -- reusing an existing vertex (or a
+        previously-inserted split point) within `merge_tol_m`, or splitting that
+        segment's current graph edge to insert exactly one new vertex there.
+
+        Live per-segment split state lives in `self._inland_split_cuts`
+        (pipeline-wide, reset once per `build_network()` call) -- deliberately
+        NOT `line_m_cache`, which is call-scoped, static reference geometry and
+        never needs to change (the line's own original vertex positions never
+        move; only the graph topology *between* them does as splits happen).
+        Every candidate that ever touches this segment -- from any of
+        `_connect_waterway_crossing`'s three call sites, across any navmesh or
+        skeleton piece, in any order -- reads and mutates the SAME dict entry,
+        so a second candidate landing on a segment a first candidate already
+        split always sees the current sub-segment structure, never stale
+        original geometry. This is safe under `build_network()`'s single-
+        threaded, strictly sequential piece loop (the only real
+        `multiprocessing.Pool` use, `calculate_edge_attributes`, is a fully
+        separate pass that runs only after `build_network()` completes) -- a
+        stale-cache hazard, not a concurrency one, and a `self.`-scoped dict
+        resolves it by construction.
+        """
+        line_state = self._inland_split_cuts.setdefault(line_iloc, {})
+        entry = line_state.get(seg_idx)
+        if entry is None:
+            u_lon, u_lat = coords_wgs84[seg_idx]
+            v_lon, v_lat = coords_wgs84[seg_idx + 1]
+            u_id = self._get_or_create_node(u_lon, u_lat, "inland", context="waterway_crossing")
+            v_id = self._get_or_create_node(v_lon, v_lat, "inland", context="waterway_crossing")
+            seg_len_m = float(math.hypot(coords_m[seg_idx + 1][0] - coords_m[seg_idx][0],
+                                          coords_m[seg_idx + 1][1] - coords_m[seg_idx][1]))
+            entry = {"len_m": seg_len_m, "cuts": [(0.0, u_id), (1.0, v_id)]}
+            line_state[seg_idx] = entry
+
+        cuts = entry["cuts"]
+        ts = [c[0] for c in cuts]
+        i = bisect.bisect_left(ts, t)
+        for idx in (i - 1, i):
+            if 0 <= idx < len(cuts):
+                cand_t, cand_id = cuts[idx]
+                if abs(cand_t - t) * entry["len_m"] <= merge_tol_m:
+                    self.waterway_connector_split_stats["merged"] += 1
+                    return cand_id
+
+        left_t, left_id = cuts[i - 1]
+        right_t, right_id = cuts[i]
+        if not self.graph.has_edge(left_id, right_id):
+            # Defensive only -- under build_network()'s single-threaded piece
+            # loop this pair should always still be a live edge at this point.
+            # Degrade to "no split" rather than raise on a future bug here.
+            logger.warning(f"  Waterway connector split: expected edge {left_id}<->{right_id} "
+                            f"(inland row {line_iloc}, segment {seg_idx}) missing from the graph; "
+                            f"leaving topology unsplit and returning the nearer existing cut.")
+            self.waterway_connector_split_stats["merged"] += 1
+            return left_id if (t - left_t) <= (right_t - t) else right_id
+
+        proj_x = coords_m[seg_idx][0] + t * (coords_m[seg_idx + 1][0] - coords_m[seg_idx][0])
+        proj_y = coords_m[seg_idx][1] + t * (coords_m[seg_idx + 1][1] - coords_m[seg_idx][1])
+        proj_lon, proj_lat = transformer.transform(proj_x, proj_y)
+        new_id = self._get_or_create_node(proj_lon, proj_lat, "inland", context="waterway_crossing_split")
+
+        eattr = dict(self.graph.get_edge_data(left_id, right_id))
+        self.graph.remove_edge(left_id, right_id)
+        self.graph.remove_edge(right_id, left_id)
+        self.graph.add_edge(left_id, new_id, **eattr)
+        self.graph.add_edge(new_id, left_id, **eattr)
+        self.graph.add_edge(new_id, right_id, **eattr)
+        self.graph.add_edge(right_id, new_id, **eattr)
+        bisect.insort(cuts, (t, new_id))
+        self.waterway_connector_split_stats["split"] += 1
+        return new_id
+
     def _connect_waterway_crossing(self, node_id, line_iloc, utm_crs, crossing_xy_m, line_m_cache):
         """Connect a crossing-derived boundary node to the nearest inland node of
         the SAME waterway line feature (`try_add`'s attrs, mirroring
         `_stitch_component_pieces` -- see that method). Returns the number of
         edges added (0 or 2).
+
+        SPEC-GRAPH-DENSITY.md §6.5: `connector_merge_m == 0.0` (the default)
+        reproduces today's behaviour byte-for-byte -- always snap to the
+        nearest EXISTING vertex of the target line, regardless of how far away
+        it is. `> 0.0` instead projects the crossing point onto the line and
+        reuses/splits at the TRUE point of contact via
+        `_get_or_split_inland_segment` -- this is the root fix for the net
+        density regression §6.3's carve-reconnect and §6.4's blanket densify
+        each independently compounded (see that spec section): a carve-induced
+        dead end sitting a few metres from the axis it was carved against no
+        longer gets a permanent new node + stub edge, it merges straight into
+        the axis.
+
+        One real, intentional behaviour difference confined to the `> 0.0`
+        path: `nearest_dist_m` becomes distance-to-LINE (always <= distance to
+        the nearest vertex), so the `WATERWAY_CONNECTOR_MAX_M`/`_FALLBACK_MAX_M`
+        gates below admit some candidates the nearest-vertex form would have
+        warned on or rejected -- intentional, since it's measuring the
+        distance that actually matters once splitting is possible.
         """
         inland_gdf = self.gdfs["inland_waterways"]
         if line_iloc not in line_m_cache:
@@ -2583,23 +2769,40 @@ class NauticalRoutingPipeline:
             line_m_cache[line_iloc] = (coords_wgs84, np.array(line_m.coords))
         coords_wgs84, coords_m = line_m_cache[line_iloc]
 
+        merge_tol_m = self.classification_config.connector_merge_m
+        split_mode = merge_tol_m > 0.0
         x, y = crossing_xy_m
-        d2 = (coords_m[:, 0] - x) ** 2 + (coords_m[:, 1] - y) ** 2
-        nearest_idx = int(np.argmin(d2))
-        nearest_dist_m = math.sqrt(d2[nearest_idx])
+        if split_mode:
+            seg_idx, t, _proj_xy_m, nearest_dist_m = self._project_point_onto_line(coords_m, crossing_xy_m)
+        else:
+            d2 = (coords_m[:, 0] - x) ** 2 + (coords_m[:, 1] - y) ** 2
+            nearest_idx = int(np.argmin(d2))
+            nearest_dist_m = math.sqrt(d2[nearest_idx])
 
         if nearest_dist_m > WATERWAY_CONNECTOR_FALLBACK_MAX_M:
-            logger.info(f"  Waterway crossing: nearest inland vertex of row {line_iloc} is "
+            noun = "nearest point on" if split_mode else "nearest inland vertex of"
+            logger.info(f"  Waterway crossing: {noun} row {line_iloc} is "
                         f"{nearest_dist_m:.0f}m away (> {WATERWAY_CONNECTOR_FALLBACK_MAX_M:.0f}m); "
                         f"skipping connector.")
             return 0
         if nearest_dist_m > WATERWAY_CONNECTOR_MAX_M:
-            logger.info(f"  Waterway crossing: nearest inland vertex of row {line_iloc} is "
+            noun = "nearest point on" if split_mode else "nearest inland vertex of"
+            logger.info(f"  Waterway crossing: {noun} row {line_iloc} is "
                         f"{nearest_dist_m:.0f}m away (> {WATERWAY_CONNECTOR_MAX_M:.0f}m normal radius, "
                         f"within {WATERWAY_CONNECTOR_FALLBACK_MAX_M:.0f}m fallback); connecting anyway.")
 
-        inland_lon, inland_lat = coords_wgs84[nearest_idx]
-        inland_node_id = self._get_or_create_node(inland_lon, inland_lat, "inland", context="waterway_crossing")
+        if split_mode:
+            from pyproj import Transformer
+            transformer = Transformer.from_crs(utm_crs, self.CRS_WGS84, always_xy=True)
+            self.waterway_connector_split_stats["candidates"] += 1
+            inland_node_id = self._get_or_split_inland_segment(
+                line_iloc, seg_idx, t, coords_wgs84, coords_m, merge_tol_m, transformer)
+            inland_lon = self.graph.nodes[inland_node_id]["lon"]
+            inland_lat = self.graph.nodes[inland_node_id]["lat"]
+        else:
+            inland_lon, inland_lat = coords_wgs84[nearest_idx]
+            inland_node_id = self._get_or_create_node(inland_lon, inland_lat, "inland", context="waterway_crossing")
+
         if inland_node_id == node_id:
             return 0
         crossing_lon = self.graph.nodes[node_id]["lon"]
@@ -4811,13 +5014,37 @@ class NauticalRoutingPipeline:
 
 
     def _add_opening_bridge_edges(self):
-        """Creates accurate nodes exactly at the bridge opening span using centerline intersection."""
+        """Creates accurate nodes exactly at the bridge opening span using centerline intersection.
+
+        SPEC-GRAPH-DENSITY.md §6.5: `connector_merge_m == 0.0` (the default)
+        reproduces today's behaviour byte-for-byte -- one brand-new node per
+        fairway/inland-waterways intersection with the bridge polygon, always.
+        `> 0.0` instead (a) collapses near-coincident opening points (a fairway
+        line AND an inland_waterways line both intersecting the same bridge
+        typically produce two intersection points a few metres apart for what
+        is physically one opening) and (b) reuses an existing nearby node
+        instead of always minting a new one. This function runs AFTER
+        build_network() -- including axis-dedup carving and §6.3's
+        carve-reconnect -- with no awareness of any of it, so before this fix
+        it always planted a brand-new node exactly on/near the axis
+        regardless of whether the pipeline already had one there; that is the
+        other half of the §6.5 fix (the axis-dedup-carve-reconnect half lives
+        in _connect_waterway_crossing/_get_or_split_inland_segment).
+
+        A reused node may already carry real data, so a merge never blindly
+        re-stamps it: node_depth only ever tightens (never relaxes a more
+        restrictive existing constraint with the bridge's permissive 99.0
+        sentinel), and node_kind_id/source are left alone if the node is
+        already typed.
+        """
         bridges_gdf = self.gdfs.get("bridges", gpd.GeoDataFrame())
         if bridges_gdf.empty:
             return
 
         logger.info("Adding opening bridge crossing edges (Fairway Intersections)...")
         added = 0
+        merge_tol_m = self.classification_config.connector_merge_m
+        merge_mode = merge_tol_m > 0.0
 
         # Combine Inland Waterways and Fairways to find the true navigable opening
         fw_gdfs = []
@@ -4855,25 +5082,71 @@ class NauticalRoutingPipeline:
             if not opening_pts:
                 opening_pts.append(bridge_geom.centroid)
 
+            # SPEC-GRAPH-DENSITY.md §6.5: a fairway line AND an inland_waterways
+            # line both intersecting the same bridge typically produce two
+            # near-coincident points for what is physically one opening --
+            # collapse them before planting any node.
+            if merge_mode and len(opening_pts) > 1:
+                deduped = []
+                for pt in opening_pts:
+                    is_dup = False
+                    for kept in deduped:
+                        _, _, dist_m = self.geod.inv(pt.x, pt.y, kept.x, kept.y)
+                        if dist_m <= merge_tol_m:
+                            is_dup = True
+                            break
+                    if is_dup:
+                        self.bridge_opening_merge_stats["opening_points_deduped"] += 1
+                    else:
+                        deduped.append(pt)
+                opening_pts = deduped
+
             bridge_src = self.layer_source_ids.get("bridges") if hasattr(self, "layer_source_ids") else None
             for pt in opening_pts:
                 c_lon, c_lat = pt.x, pt.y
-                b_id = self._get_or_create_node(c_lon, c_lat, node_type="coastal", context="bridge")
-                self.graph.nodes[b_id]["node_depth"] = 99.0
-                self._stamp_node(b_id, NODE_KIND_POINT, DEFAULT_SOURCE_TIER, bridge_src)
+                SEARCH_MARGIN = 0.015  # Connect opening to the 4 nearest surrounding nodes via Quadrant Ray-Casting
 
-                # Connect opening to the 4 nearest surrounding nodes via Quadrant Ray-Casting
-                SEARCH_MARGIN = 0.015
-                candidates = []
-                for nid, data in self.graph.nodes(data=True):
-                    if nid == b_id: continue
-                    lon, lat = data["lon"], data["lat"]
-                    if (c_lon - SEARCH_MARGIN <= lon <= c_lon + SEARCH_MARGIN and
-                        c_lat - SEARCH_MARGIN <= lat <= c_lat + SEARCH_MARGIN):
-                        dx = (lon - c_lon) * 111320 * math.cos(math.radians((lat + c_lat) / 2))
-                        dy = (lat - c_lat) * 111320
-                        candidates.append((math.sqrt(dx*dx + dy*dy), lon, lat, nid))
-                
+                if merge_mode:
+                    candidates = []
+                    for nid, data in self.graph.nodes(data=True):
+                        lon, lat = data["lon"], data["lat"]
+                        if (c_lon - SEARCH_MARGIN <= lon <= c_lon + SEARCH_MARGIN and
+                            c_lat - SEARCH_MARGIN <= lat <= c_lat + SEARCH_MARGIN):
+                            dx = (lon - c_lon) * 111320 * math.cos(math.radians((lat + c_lat) / 2))
+                            dy = (lat - c_lat) * 111320
+                            candidates.append((math.sqrt(dx*dx + dy*dy), lon, lat, nid))
+
+                    b_id = None
+                    if candidates:
+                        nearest = min(candidates, key=lambda c: c[0])
+                        if nearest[0] <= merge_tol_m:
+                            b_id = nearest[3]
+                            self.bridge_opening_merge_stats["nodes_merged"] += 1
+                    if b_id is None:
+                        b_id = self._get_or_create_node(c_lon, c_lat, node_type="coastal", context="bridge")
+                        self.bridge_opening_merge_stats["nodes_created"] += 1
+                    candidates = [c for c in candidates if c[3] != b_id]
+
+                    existing_depth = self.graph.nodes[b_id].get("node_depth")
+                    self.graph.nodes[b_id]["node_depth"] = (
+                        99.0 if existing_depth is None else min(existing_depth, 99.0))
+                    if "node_kind_id" not in self.graph.nodes[b_id]:
+                        self._stamp_node(b_id, NODE_KIND_POINT, DEFAULT_SOURCE_TIER, bridge_src)
+                else:
+                    b_id = self._get_or_create_node(c_lon, c_lat, node_type="coastal", context="bridge")
+                    self.graph.nodes[b_id]["node_depth"] = 99.0
+                    self._stamp_node(b_id, NODE_KIND_POINT, DEFAULT_SOURCE_TIER, bridge_src)
+
+                    candidates = []
+                    for nid, data in self.graph.nodes(data=True):
+                        if nid == b_id: continue
+                        lon, lat = data["lon"], data["lat"]
+                        if (c_lon - SEARCH_MARGIN <= lon <= c_lon + SEARCH_MARGIN and
+                            c_lat - SEARCH_MARGIN <= lat <= c_lat + SEARCH_MARGIN):
+                            dx = (lon - c_lon) * 111320 * math.cos(math.radians((lat + c_lat) / 2))
+                            dy = (lat - c_lat) * 111320
+                            candidates.append((math.sqrt(dx*dx + dy*dy), lon, lat, nid))
+
                 quadrants = {"NE": [], "NW": [], "SE": [], "SW": []}
                 for d, lon, lat, nid in candidates:
                     if lon >= c_lon and lat >= c_lat: quadrants["NE"].append((d, nid))
@@ -6408,6 +6681,26 @@ if __name__ == "__main__":
                              "WATERWAY_CONNECTOR_MAX_M (250m). Must be finite and >= "
                              f"{INLAND_DENSIFY_MIN_SEGMENT_M}m if enabled (raises otherwise) "
                              "-- shapely.segmentize has no vertex-count ceiling of its own.")
+    parser.add_argument("--connector-merge-m", type=float, default=0.0,
+                        help="Merge a new connector/opening node into an existing (or "
+                             "previously-inserted) one within this many metres of the true "
+                             "point of contact, instead of always minting a new node "
+                             "(SPEC-GRAPH-DENSITY.md §6.5 -- the root fix for the net density "
+                             "regression sections §6.3 and §6.4 each independently compounded). "
+                             "Governs two mechanisms: (1) _connect_waterway_crossing projects "
+                             "onto the target inland_waterways line and splits its current graph "
+                             "edge at the true contact point instead of always snapping to the "
+                             "line's nearest EXISTING vertex; (2) _add_opening_bridge_edges "
+                             "dedupes near-coincident fairway/bridge intersection points and "
+                             "reuses a nearby existing node instead of always minting a new one. "
+                             "Default 0.0 DISABLES both entirely and reproduces today's output "
+                             "byte-for-byte. Recommended once enabled: 5.0m -- comfortably above "
+                             "_get_or_create_node's ~1.1m coordinate-rounding grain, matching "
+                             "axis_dedup_floor_m's established 5m 'effectively coincident' floor, "
+                             "and two orders of magnitude below WATERWAY_CONNECTOR_MAX_M (250m) "
+                             "so it essentially never merges a candidate that should have gotten "
+                             "its own split/node. Must be finite, >= 0.0, and < "
+                             f"{WATERWAY_CONNECTOR_MAX_M:.0f}m if enabled (raises otherwise).")
     parser.add_argument("--stitch-registry", nargs="?", const="data/seam_registry.sqlite", default="",
                         help="Enable Round 25 cross-database seam stitching (STITCHING_DESIGN.md "
                              "Section 3) against the shared global-node registry at this SQLite "
@@ -6429,6 +6722,11 @@ if __name__ == "__main__":
                         help="Adopt pass: max distance (m) from an adopted seam node to a native "
                              "graph node it may connect to (default 500).")
     args = parser.parse_args()
+
+    try:
+        NauticalRoutingPipeline._validate_connector_merge_m(args.connector_merge_m)
+    except ValueError as e:
+        raise SystemExit(f"--connector-merge-m: {e}")
 
     stitch_registry_path = args.stitch_registry or os.environ.get("SK_ROUTING_STITCH_REGISTRY", "")
     coverage_bbox = None
@@ -6471,5 +6769,6 @@ if __name__ == "__main__":
                                        sagitta_cap=args.sagitta_cap,
                                        max_segment_m=args.max_segment_m,
                                        axis_dedup_cap=args.axis_dedup_cap,
-                                       inland_densify_max_segment_m=args.inland_densify_max_segment_m)
+                                       inland_densify_max_segment_m=args.inland_densify_max_segment_m,
+                                       connector_merge_m=args.connector_merge_m)
     pipeline.run_pipeline()
