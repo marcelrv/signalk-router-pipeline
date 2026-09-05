@@ -767,6 +767,16 @@ WATERWAY_CROSSING_CAP_PER_LINE = 8     # sanity cap per (navmesh piece, line) --
 WATERWAY_CONNECTOR_MAX_M = 250.0       # normal connector search radius to the nearest inland vertex
 WATERWAY_CONNECTOR_FALLBACK_MAX_M = 500.0  # widened radius for sparsely-digitized lines (logged)
 
+# SPEC-GRAPH-DENSITY.md §6.8: ceiling for --node-merge-m. Unlike connector_merge_m
+# (bounded by WATERWAY_CONNECTOR_MAX_M, a specific line-search radius),
+# node_merge_m governs EVERY _get_or_create_node call site pipeline-wide -- a
+# generous value risks silently collapsing genuinely distinct nearby features
+# (e.g. two adjacent lock chamber approach points) instead of just the ~1-2m
+# rounding-grain duplicates it's meant to fix. 20.0m stays well above the
+# observed 1.11-2.08m problem scale while remaining far below real feature
+# separations this pipeline needs to keep distinct.
+NODE_MERGE_MAX_M = 20.0
+
 # SPEC-GRAPH-DENSITY.md §6.4: floor for --inland-densify-max-segment-m. shapely.segmentize
 # generates roughly (segment_length / cap) vertices per source segment with no cap of its
 # own -- a mistyped sub-metre value (or NaN/inf slipping past a bare `<= 0.0` check) on an
@@ -1002,6 +1012,20 @@ class ClassificationConfig:
     # matching --sagitta-cap/--axis-dedup-cap's convention. Densifying makes the
     # nearest-existing-vertex assumption true again instead of changing either consumer.
     inland_densify_max_segment_m: float = 0.0  # max vertex spacing (m) after densifying; 0.0 = disabled
+    # SPEC-GRAPH-DENSITY.md §6.9 follow-up: _build_inland_network ingests every vertex
+    # of the raw inland_waterways source line directly, vertex-to-vertex, with NO
+    # consolidation -- a densely-digitized IENC line (measured as low as ~70-100m
+    # vertex spacing on a real Zeeland build) reproduces that exact density in the
+    # graph regardless of --sagitta-cap/--max-segment-m, which only govern SKELETON
+    # resampling (_resample_long_skeleton_edges), never this raw ingestion path.
+    # 0.0 (default) disables this entirely -- inland_gdf stays byte-identical to
+    # today's, matching every other flag's convention in this file. > 0.0: reuses
+    # _resample_long_skeleton_edges's own cumulative-arc-length walk (sagitta
+    # disabled -- inland_waterways carries no per-vertex width to scale a tolerance
+    # by) to consolidate consecutive EXISTING vertices into chords up to this many
+    # metres -- it only removes vertices, never inserts new ones (the opposite,
+    # complementary operation to inland_densify_max_segment_m above).
+    inland_resample_max_segment_m: float = 0.0  # max spacing (m) after consolidating; 0.0 = disabled
     # SPEC-GRAPH-DENSITY.md §6.5: §6.3's carve-reconnect and §6.4's blanket densify both
     # compounded density instead of cutting it, because the pipeline's two "plant a node
     # at this point" mechanisms (_connect_waterway_crossing's nearest-EXISTING-vertex
@@ -1063,6 +1087,24 @@ class ClassificationConfig:
     # Pass 0c/0d and remain the connectivity guarantee regardless of how tightly
     # this caps Pass 0c/0d.
     pass0_target_fanin_cap: int = 0
+    # SPEC-GRAPH-DENSITY.md §6.8: _get_or_create_node (every node-creation call site
+    # pipeline-wide -- skeleton medial-axis extraction, navmesh boundary generation,
+    # lock/bridge crossings, gap-resolve, coastal-connectivity stitching) dedupes
+    # nodes purely by (round(lon, 5), round(lat, 5)), a grid roughly 1.1m wide at
+    # Zeeland's latitude. Independent call sites computing "the same" real-world
+    # junction point via different geometric paths routinely land a metre or two
+    # apart -- on opposite sides of that rounding boundary -- producing permanently
+    # distinct nodes joined by a near-zero-length stub edge (confirmed live: edges
+    # as short as 1.11m, 1,047 under 3m network-wide, concentrated at multi-
+    # subsystem junctions). connector_merge_m (above) already solved exactly this
+    # class of problem, but only at its own two call sites. 0.0 (default) disables
+    # this entirely -- _get_or_create_node stays byte-identical to today's exact-
+    # rounding dedup, matching every other flag's convention in this dataclass.
+    # > 0.0: an existing node within this many metres is reused instead of minting
+    # a near-duplicate. Recommended once enabled: 5.0m, matching connector_merge_m/
+    # axis_dedup_floor_m's established "effectively coincident" floor. Must be
+    # finite, >= 0.0, and < NODE_MERGE_MAX_M (see _validate_node_merge_m).
+    node_merge_m: float = 0.0
 
     def pixel_size_for(self, min_dimension_m: float) -> float:
         return float(np.clip(min_dimension_m / self.pixel_dim_divisor,
@@ -1286,7 +1328,7 @@ def _obstruction_depth_disposition(row):
     return True, None
 
 class NauticalRoutingPipeline:
-    def __init__(self, data_paths: Dict[str, str], db_path: str,
+    def __init__(self, data_paths: Dict[str, str], db_path: str, *,
                  country: str = "", region_name: str = "", description: str = "",
                  tags: Optional[str] = None, contributor: str = "", url: str = "",
                  license: str = "", copyright: str = "",
@@ -1299,10 +1341,15 @@ class NauticalRoutingPipeline:
                  sagitta_cap: float = 0.0,
                  max_segment_m: Optional[float] = None,
                  axis_dedup_cap: float = 0.0,
+                 axis_dedup_fraction: Optional[float] = None,
+                 axis_dedup_floor_m: Optional[float] = None,
+                 min_navmesh_radius_m: Optional[float] = None,
                  inland_densify_max_segment_m: float = 0.0,
+                 inland_resample_max_segment_m: float = 0.0,
                  connector_merge_m: float = 0.0,
                  pass2_max_fanin_per_node: int = 0,
-                 pass0_target_fanin_cap: int = 0):
+                 pass0_target_fanin_cap: int = 0,
+                 node_merge_m: float = 0.0):
         self.data_paths = data_paths
         self.db_path = db_path
         self.country = country
@@ -1319,11 +1366,21 @@ class NauticalRoutingPipeline:
                                                            max_chord_sagitta_m=sagitta_cap,
                                                            axis_dedup_cap_m=axis_dedup_cap,
                                                            inland_densify_max_segment_m=inland_densify_max_segment_m,
+                                                           inland_resample_max_segment_m=inland_resample_max_segment_m,
                                                            connector_merge_m=connector_merge_m,
                                                            pass2_max_fanin_per_node=pass2_max_fanin_per_node,
-                                                           pass0_target_fanin_cap=pass0_target_fanin_cap)
+                                                           pass0_target_fanin_cap=pass0_target_fanin_cap,
+                                                           node_merge_m=node_merge_m)
         if max_segment_m is not None:
             self.classification_config.max_segment_m = float(max_segment_m)
+        self._validate_classification_overrides(axis_dedup_cap, axis_dedup_fraction,
+                                                 axis_dedup_floor_m, min_navmesh_radius_m)
+        if axis_dedup_fraction is not None:
+            self.classification_config.axis_dedup_fraction = float(axis_dedup_fraction)
+        if axis_dedup_floor_m is not None:
+            self.classification_config.axis_dedup_floor_m = float(axis_dedup_floor_m)
+        if min_navmesh_radius_m is not None:
+            self.classification_config.min_navmesh_radius_m = float(min_navmesh_radius_m)
         self.geod = Geod(ellps="WGS84")
         self.CRS_WGS84 = "EPSG:4326"
         self.CRS_METRIC = "EPSG:3857"
@@ -1371,6 +1428,10 @@ class NauticalRoutingPipeline:
         self.waterway_connector_split_stats = {"candidates": 0, "split": 0, "merged": 0}
         self.bridge_opening_merge_stats = {"opening_points_deduped": 0, "nodes_merged": 0,
                                             "nodes_created": 0}
+        # SPEC-GRAPH-DENSITY.md §6.8: node_merge_m summary counters, logged once at
+        # the end of build_network. Both stay 0 when node_merge_m == 0.0 (the code
+        # path that increments them is only entered when the feature is on).
+        self.node_merge_stats = {"created": 0, "merged": 0}
         # DIAGNOSTIC (connectivity-regression investigation, not shipped as a
         # feature): per-pass attempt/outcome counters for _stitch_component_pieces
         # and _resolve_local_skeleton_gaps, plus aggregate union-find group counts
@@ -1451,6 +1512,7 @@ class NauticalRoutingPipeline:
                 self.gdfs[layer_name] = gpd.GeoDataFrame(geometry=[], crs=self.CRS_WGS84)
         if "inland_waterways" in self.gdfs:
             self.gdfs["inland_waterways"] = self._densify_inland_waterways(self.gdfs["inland_waterways"])
+            self.gdfs["inland_waterways"] = self._resample_inland_waterways(self.gdfs["inland_waterways"])
         self._build_fairways_unified()
         self.gdfs_metric = {
             name: gdf.to_crs(self.CRS_METRIC) for name, gdf in self.gdfs.items()
@@ -1500,6 +1562,59 @@ class NauticalRoutingPipeline:
                 f"connector_merge_m must be finite, >= 0.0, and < {WATERWAY_CONNECTOR_MAX_M:.0f}m "
                 f"(got {merge_tol_m!r}).")
 
+    @staticmethod
+    def _validate_node_merge_m(merge_tol_m):
+        """SPEC-GRAPH-DENSITY.md §6.8: `node_merge_m == 0.0` (the default) disables
+        `_get_or_create_node`'s tolerance merge entirely -- no validation needed,
+        same convention as `connector_merge_m`. `> 0.0` must be finite and strictly
+        less than `NODE_MERGE_MAX_M` (see that constant's comment for why the
+        ceiling is much tighter here than `connector_merge_m`'s); `NaN`/negative
+        slip past a bare `<= 0.0` check (`NaN` comparisons are always `False` in
+        Python), so both are checked explicitly rather than relying on that alone.
+        """
+        if merge_tol_m == 0.0:
+            return
+        if not math.isfinite(merge_tol_m) or merge_tol_m < 0.0 or merge_tol_m >= NODE_MERGE_MAX_M:
+            raise ValueError(
+                f"node_merge_m must be finite, >= 0.0, and < {NODE_MERGE_MAX_M:.0f}m "
+                f"(got {merge_tol_m!r}).")
+
+    @staticmethod
+    def _validate_classification_overrides(axis_dedup_cap_m, axis_dedup_fraction,
+                                            axis_dedup_floor_m, min_navmesh_radius_m):
+        """CodeRabbit (PR #20): `axis_dedup_fraction`/`axis_dedup_floor_m`/
+        `min_navmesh_radius_m` bypassed validation entirely when overridden via the
+        constructor -- a negative `min_navmesh_radius_m` reaches `_split_wide_narrow`'s
+        `buffer(-radius_m)` and reverses erosion into DILATION, silently inverting
+        which parts of a water polygon count as navmesh-eligible ("wide") vs.
+        skeleton/channel ("narrow"); `NaN`/`inf` on any of the three can reach
+        downstream geometry/raster operations. Each is validated only when actually
+        provided (`None` means "keep the `ClassificationConfig` default", already
+        valid by construction). `axis_dedup_floor_m` above the active
+        `axis_dedup_cap_m` is also rejected -- `clip(fraction * width, floor, cap)`
+        with `floor > cap` degenerates to a constant `floor` regardless of width,
+        silently defeating the cap the caller explicitly set.
+        """
+        if axis_dedup_fraction is not None:
+            if not math.isfinite(axis_dedup_fraction) or axis_dedup_fraction < 0.0:
+                raise ValueError(
+                    f"axis_dedup_fraction must be finite and >= 0.0 "
+                    f"(got {axis_dedup_fraction!r}).")
+        if axis_dedup_floor_m is not None:
+            if not math.isfinite(axis_dedup_floor_m) or axis_dedup_floor_m < 0.0:
+                raise ValueError(
+                    f"axis_dedup_floor_m must be finite and >= 0.0 "
+                    f"(got {axis_dedup_floor_m!r}).")
+            if axis_dedup_cap_m > 0.0 and axis_dedup_floor_m > axis_dedup_cap_m:
+                raise ValueError(
+                    f"axis_dedup_floor_m ({axis_dedup_floor_m!r}) must not exceed the "
+                    f"active axis_dedup_cap_m ({axis_dedup_cap_m!r}).")
+        if min_navmesh_radius_m is not None:
+            if not math.isfinite(min_navmesh_radius_m) or min_navmesh_radius_m <= 0.0:
+                raise ValueError(
+                    f"min_navmesh_radius_m must be finite and > 0.0 "
+                    f"(got {min_navmesh_radius_m!r}).")
+
     def _densify_inland_waterways(self, inland_gdf):
         """SPEC-GRAPH-DENSITY.md §6.4: insert interpolated vertices along any
         `inland_waterways` segment longer than `inland_densify_max_segment_m`, so no
@@ -1537,6 +1652,50 @@ class NauticalRoutingPipeline:
         densified = gpd.GeoSeries(densified_m, index=inland_gdf.index, crs=self.CRS_METRIC).to_crs(self.CRS_WGS84)
         out = inland_gdf.copy()
         out["geometry"] = densified
+        return out
+
+    def _resample_inland_waterways(self, inland_gdf):
+        """SPEC-GRAPH-DENSITY.md §6.9 follow-up: `_build_inland_network` ingests
+        every vertex of the raw `inland_waterways` source line directly, vertex-
+        to-vertex, with NO consolidation -- a densely-digitized IENC line (measured
+        as low as ~70-100m vertex spacing on a real Zeeland build) reproduces that
+        exact density in the graph regardless of `--sagitta-cap`/`--max-segment-m`,
+        which only govern SKELETON resampling (`_resample_long_skeleton_edges`),
+        never this raw ingestion path.
+
+        Reuses that same generator's plain cumulative-arc-length walk here rather
+        than a second, separately-implemented mechanism -- `inland_waterways`
+        carries no per-vertex width attribute, so sagitta relaxation is left
+        disabled (`max_chord_sagitta_m=0.0` in the call below) and every vertex's
+        width entry is `None`, simply passed through unused by the fallback path.
+        This only REMOVES existing vertices (never inserts new ones, unlike
+        `_densify_inland_waterways` above) -- the complementary opposite operation,
+        safe to enable independently or together (densify first, then resample,
+        the order `parse_shapefiles` already calls them in).
+
+        Gated on `inland_resample_max_segment_m > 0.0` -- disabled (default) leaves
+        `inland_gdf` untouched, byte-identical to today's build, matching every
+        other flag's convention in this file.
+        """
+        cap_m = self.classification_config.inland_resample_max_segment_m
+        if cap_m <= 0.0 or inland_gdf.empty:
+            return inland_gdf
+        if not math.isfinite(cap_m) or cap_m <= 0.0:
+            raise ValueError(
+                f"--inland-resample-max-segment-m must be finite and > 0.0 "
+                f"(got {cap_m!r}).")
+        new_geoms = []
+        for geom in inland_gdf.geometry:
+            if not isinstance(geom, LineString) or len(geom.coords) < 3:
+                new_geoms.append(geom)
+                continue
+            coords = list(geom.coords)
+            kept = [coords[0]]
+            for sub_pts, _ in self._resample_long_skeleton_edges(coords, [None] * len(coords), cap_m):
+                kept.append(sub_pts[-1])
+            new_geoms.append(LineString(kept))
+        out = inland_gdf.copy()
+        out["geometry"] = new_geoms
         return out
 
     def _build_obstacle_layer(self):
@@ -1643,7 +1802,14 @@ class NauticalRoutingPipeline:
         # docstring for why this needs to be shared across every piece/call in
         # this build_network() run rather than reset per navmesh/skeleton piece.
         self._inland_split_cuts = {}
+        # SPEC-GRAPH-DENSITY.md §6.8: grid-bucket spatial index backing
+        # _get_or_create_node's tolerance merge (node_merge_m > 0.0). Reset per
+        # build_network() run, same as coords_to_node. Dict[(cell_x, cell_y),
+        # List[(lon, lat, node_id)]] -- see _find_nearby_node/
+        # _register_node_in_merge_grid.
+        self._node_merge_grid = defaultdict(list)
         self._validate_connector_merge_m(self.classification_config.connector_merge_m)
+        self._validate_node_merge_m(self.classification_config.node_merge_m)
         # Inland waterway centerlines are unchanged (already vector line topology).
         if "inland_waterways" in self.gdfs and not self.gdfs["inland_waterways"].empty:
             self._build_inland_network()
@@ -1797,6 +1963,12 @@ class NauticalRoutingPipeline:
                         f"{boms['opening_points_deduped']} near-coincident opening points deduped, "
                         f"{boms['nodes_merged']} openings merged into an existing nearby node, "
                         f"{boms['nodes_created']} new opening nodes created.")
+        nms = self.node_merge_stats
+        if nms["merged"]:
+            logger.info(f"Node merge (SPEC-GRAPH-DENSITY.md §6.8): {nms['merged']} "
+                        f"_get_or_create_node calls reused an existing node within "
+                        f"{self.classification_config.node_merge_m:.1f}m instead of minting a "
+                        f"near-duplicate, {nms['created']} new nodes created under this tolerance.")
         logger.info(f"Network built with {self.graph.number_of_nodes()} nodes and {self.graph.number_of_edges()} edges.")
 
     # ------------------------------------------------------------------
@@ -2332,6 +2504,26 @@ class NauticalRoutingPipeline:
         return int(hashlib.md5(unique_str.encode("utf-8")).hexdigest()[:13], 16)
 
     def _get_or_create_node(self, lon: float, lat: float, node_type: str = "coastal", context=None) -> int:
+        """SPEC-GRAPH-DENSITY.md §6.8: `node_merge_m == 0.0` (the default) is the
+        exact-rounding dedup below, byte-for-byte today's behaviour. `> 0.0` first
+        checks `_find_nearby_node` -- reusing an existing node within tolerance
+        instead of relying purely on `(round(lon, 5), round(lat, 5))` landing on the
+        same 5-decimal grid cell as some earlier, independently-computed "same"
+        point (the root cause of the near-zero-length stub edges this section
+        documents). Not segregated by `node_type`, matching the exact-rounding path
+        below, which already reuses a coordinate-matched node regardless of the
+        `node_type` a later call passes in -- an existing, unrelated behaviour this
+        fix deliberately leaves unchanged.
+        """
+        merge_tol_m = self.classification_config.node_merge_m
+        if merge_tol_m > 0.0:
+            existing_id = self._find_nearby_node(lon, lat, merge_tol_m)
+            if existing_id is not None:
+                self.node_merge_stats["merged"] += 1
+                if context is not None:
+                    if self._node_origin_diag:
+                        self._node_contexts[existing_id].add(context)
+                return existing_id
         coord = (round(lon, 5), round(lat, 5))
         if coord in self.coords_to_node:
             existing_id = self.coords_to_node[coord]
@@ -2340,6 +2532,9 @@ class NauticalRoutingPipeline:
                 node_id = self._coord_to_id(lon, lat, node_type)
                 self.graph.add_node(node_id, lon=coord[0], lat=coord[1], node_type=node_type)
                 self.coords_to_node[coord] = node_id
+                if merge_tol_m > 0.0:
+                    self._register_node_in_merge_grid(coord[0], coord[1], node_id, merge_tol_m)
+                    self.node_merge_stats["created"] += 1
                 if context is not None:
                     if self._node_origin_diag:
                         self._node_contexts[node_id].add(context)
@@ -2351,10 +2546,90 @@ class NauticalRoutingPipeline:
         node_id = self._coord_to_id(lon, lat, node_type)
         self.graph.add_node(node_id, lon=coord[0], lat=coord[1], node_type=node_type)
         self.coords_to_node[coord] = node_id
+        if merge_tol_m > 0.0:
+            self._register_node_in_merge_grid(coord[0], coord[1], node_id, merge_tol_m)
+            self.node_merge_stats["created"] += 1
         if context is not None:
             if self._node_origin_diag:
                 self._node_contexts[node_id].add(context)
         return node_id
+
+    @staticmethod
+    def _node_merge_lat_cell(lat: float, merge_tol_m: float) -> int:
+        """SPEC-GRAPH-DENSITY.md §6.8: latitude grid-cell index for
+        `_node_merge_grid`, sized so a cell is exactly `merge_tol_m` wide on the
+        latitude axis (111320 m/deg is a fixed, latitude-independent conversion --
+        see `_lonlat_margin_deg` -- so this cell size never varies)."""
+        cell_lat_deg = merge_tol_m / 111320.0
+        return int(math.floor(lat / cell_lat_deg))
+
+    @staticmethod
+    def _node_merge_lon_cell(lon: float, cy: int, merge_tol_m: float) -> int:
+        """SPEC-GRAPH-DENSITY.md §6.8: longitude grid-cell index for a given
+        latitude BUCKET `cy` (not a raw latitude -- see below), sized so a cell is
+        exactly `merge_tol_m` wide at that bucket's own canonical (centre)
+        latitude.
+
+        CodeRabbit (PR #20): deriving the longitude cell size from each POINT's
+        own raw latitude (as an earlier version of this method did) is unsafe --
+        `floor(lon / cell_lon_deg)` divides a potentially large `lon` (up to 180)
+        by a tiny `cell_lon_deg`, so even the sub-cell-sized latitude difference
+        between two points that are genuinely within `merge_tol_m` of each other
+        can shift `cos(lat)` just enough to move the quotient by more than one
+        index at high latitude/longitude (confirmed: two points ~19m apart at
+        70N/120E landed 4 x-indices apart, well outside a 3x3 neighbour scan).
+        Keying the longitude cell size off the BUCKET's canonical latitude instead
+        -- the same value for every point that lands in that bucket, and for every
+        query scanning it -- makes registration and lookup agree by construction,
+        regardless of the raw latitude spread within the bucket.
+        """
+        cell_lat_deg = merge_tol_m / 111320.0
+        canonical_lat = (cy + 0.5) * cell_lat_deg
+        cell_lon_deg = merge_tol_m / (111320.0 * max(math.cos(math.radians(canonical_lat)), 1e-6))
+        return int(math.floor(lon / cell_lon_deg))
+
+    def _register_node_in_merge_grid(self, lon: float, lat: float, node_id: int, merge_tol_m: float):
+        cy = self._node_merge_lat_cell(lat, merge_tol_m)
+        cx = self._node_merge_lon_cell(lon, cy, merge_tol_m)
+        self._node_merge_grid[(cx, cy)].append((lon, lat, node_id))
+
+    def _find_nearby_node(self, lon: float, lat: float, merge_tol_m: float):
+        """SPEC-GRAPH-DENSITY.md §6.8: nearest existing node within `merge_tol_m`
+        metres of (lon, lat), or None. Scans the point's own grid cell plus its 8
+        neighbours, pruning any bucket entry whose node no longer exists in
+        `self.graph` -- the same staleness defence `_get_or_create_node`'s
+        exact-rounding path already applies to `coords_to_node`.
+
+        The longitude x-index is NOT computed once from (lon, lat) and offset by
+        dx -- each scanned latitude row (cy0 + dy) has its own canonical latitude
+        and therefore its own longitude cell size (see `_node_merge_lon_cell`), so
+        the query's x-index for that row is recomputed per row before scanning its
+        3 x-neighbours. This is what makes registration (keyed the same way) and
+        lookup agree at any latitude/longitude, not just near the equator.
+        """
+        cy0 = self._node_merge_lat_cell(lat, merge_tol_m)
+        best_id, best_dist = None, merge_tol_m
+        for dy in (-1, 0, 1):
+            cy = cy0 + dy
+            cx0 = self._node_merge_lon_cell(lon, cy, merge_tol_m)
+            for dx in (-1, 0, 1):
+                bucket = self._node_merge_grid.get((cx0 + dx, cy))
+                if not bucket:
+                    continue
+                live = []
+                for (blon, blat, node_id) in bucket:
+                    if node_id not in self.graph:
+                        continue
+                    live.append((blon, blat, node_id))
+                    ddx = (blon - lon) * 111320.0 * math.cos(math.radians((lat + blat) / 2.0))
+                    ddy = (blat - lat) * 111320.0
+                    dist = math.hypot(ddx, ddy)
+                    if dist <= best_dist:
+                        best_dist = dist
+                        best_id = node_id
+                if len(live) != len(bucket):
+                    self._node_merge_grid[(cx0 + dx, cy)] = live
+        return best_id
 
     def _build_inland_network(self):
         inland_gdf = self.gdfs["inland_waterways"]
@@ -6820,6 +7095,37 @@ if __name__ == "__main__":
                              "byte -- build_skeleton_network never generates a redundant medial-axis "
                              "twin next to a channel the pipeline already ingested from the "
                              "inland_waterways source.")
+    parser.add_argument("--axis-dedup-fraction", type=float, default=None,
+                        help="Override ClassificationConfig.axis_dedup_fraction (default 0.5), "
+                             "the multiplier on local channel width in --axis-dedup-cap's "
+                             "tol = clip(fraction * width, floor, cap) formula. At the default "
+                             "0.5, tol is roughly HALF the local channel width -- enough to just "
+                             "reach the bank if the axis line runs exactly down the centerline, "
+                             "but with no margin for medial-axis wobble near bends/junctions or a "
+                             "locally underestimated width sample, which is why a narrow channel "
+                             "can still show unsuppressed skeleton nodes alongside a real axis "
+                             "line. Raise it (e.g. 1.0) for margin. Only takes effect when "
+                             "--axis-dedup-cap > 0.0.")
+    parser.add_argument("--axis-dedup-floor-m", type=float, default=None,
+                        help="Override ClassificationConfig.axis_dedup_floor_m (default 5.0), the "
+                             "MINIMUM suppression tolerance --axis-dedup-cap's clip() formula ever "
+                             "returns, regardless of how narrow the local channel measures. "
+                             "Raising this guarantees at least this many metres of suppression "
+                             "around a narrow channel even where the width-based "
+                             "--axis-dedup-fraction term would otherwise be tiny -- the direct "
+                             "lever for 'a narrow channel should show only its authoritative axis "
+                             "line, not a parallel skeleton twin next to it'. Only takes effect "
+                             "when --axis-dedup-cap > 0.0; should stay <= --axis-dedup-cap.")
+    parser.add_argument("--min-navmesh-radius-m", type=float, default=None,
+                        help="Override ClassificationConfig.min_navmesh_radius_m (default 800.0): "
+                             "a water body must locally contain a disk of this radius "
+                             "(_split_wide_narrow erodes by this much) to be classified "
+                             "navmesh-eligible ('wide') rather than routed to the skeleton/channel "
+                             "path ('narrow'). Raise it to push more borderline-width water to the "
+                             "single-centerline skeleton representation instead of a full "
+                             "triangulated navmesh region. Already raised once from 300.0 (Round 9 "
+                             "Issue F: 300m was triggering navmesh treatment for water that reads "
+                             "as channel-like, not genuinely open).")
     parser.add_argument("--inland-densify-max-segment-m", type=float, default=0.0,
                         help="Insert interpolated vertices into inland_waterways lines so no "
                              "segment exceeds this length in metres (SPEC-GRAPH-DENSITY.md "
@@ -6833,6 +7139,24 @@ if __name__ == "__main__":
                              "WATERWAY_CONNECTOR_MAX_M (250m). Must be finite and >= "
                              f"{INLAND_DENSIFY_MIN_SEGMENT_M}m if enabled (raises otherwise) "
                              "-- shapely.segmentize has no vertex-count ceiling of its own.")
+    parser.add_argument("--inland-resample-max-segment-m", type=float, default=0.0,
+                        help="Consolidate consecutive EXISTING vertices of inland_waterways "
+                             "lines into chords up to this many metres long (SPEC-GRAPH-"
+                             "DENSITY.md §6.9 follow-up) -- the opposite, complementary "
+                             "operation to --inland-densify-max-segment-m. "
+                             "_build_inland_network ingests every source vertex directly with "
+                             "NO consolidation, so a densely-digitized IENC line (measured as "
+                             "low as ~70-100m spacing on a real Zeeland build) reproduces that "
+                             "exact density in the graph regardless of --sagitta-cap/"
+                             "--max-segment-m, which only govern SKELETON resampling, never "
+                             "this raw ingestion path. Default 0.0 DISABLES this entirely and "
+                             "leaves inland_waterways geometry byte-identical to today's. "
+                             "Recommended once enabled: match --sagitta-cap's value (e.g. "
+                             "250) for visually consistent node spacing between skeleton and "
+                             "inland-line edges. Must be finite and > 0.0 if enabled (raises "
+                             "otherwise); only removes vertices, so unlike "
+                             "--inland-densify-max-segment-m there is no risk of unbounded "
+                             "vertex growth at a small value.")
     parser.add_argument("--connector-merge-m", type=float, default=0.0,
                         help="Merge a new connector/opening node into an existing (or "
                              "previously-inserted) one within this many metres of the true "
@@ -6892,6 +7216,29 @@ if __name__ == "__main__":
                              "next-nearest candidate is tried instead. Safe to enable regardless "
                              "of --pass2-max-fanin-per-node: Pass 1/Pass 2 run afterward and "
                              "remain the connectivity guarantee. Must be >= 0.")
+    parser.add_argument("--node-merge-m", type=float, default=0.0,
+                        help="Reuse an existing node within this many metres of a new point "
+                             "instead of always minting one, at EVERY _get_or_create_node call "
+                             "site pipeline-wide (SPEC-GRAPH-DENSITY.md §6.8). "
+                             "_get_or_create_node dedupes purely by (round(lon, 5), round(lat, "
+                             "5)) -- a grid roughly 1.1m wide at Zeeland's latitude -- so "
+                             "independent call sites (skeleton medial-axis extraction, navmesh "
+                             "boundary generation, lock/bridge crossings, gap-resolve, coastal-"
+                             "connectivity stitching) computing 'the same' real-world junction "
+                             "point via different geometric paths routinely land a metre or two "
+                             "apart, on opposite sides of that rounding boundary, producing "
+                             "permanently distinct nodes joined by a near-zero-length stub edge "
+                             "(confirmed live: edges as short as 1.11m, 1,047 under 3m network-"
+                             "wide, concentrated at multi-subsystem junctions). Generalizes "
+                             "--connector-merge-m's tolerance-merge pattern, which solves exactly "
+                             "this class of problem but only at its own two call sites. Default "
+                             "0.0 DISABLES this entirely and reproduces today's output byte-for-"
+                             "byte. Recommended once enabled: 5.0m, matching --connector-merge-m/"
+                             "axis_dedup_floor_m's established 5m 'effectively coincident' floor. "
+                             "Must be finite, >= 0.0, and < "
+                             f"{NODE_MERGE_MAX_M:.0f}m if enabled (raises otherwise) -- a much "
+                             "tighter ceiling than --connector-merge-m since this governs every "
+                             "node in the graph, not one line's own search radius.")
     parser.add_argument("--stitch-registry", nargs="?", const="data/seam_registry.sqlite", default="",
                         help="Enable Round 25 cross-database seam stitching (STITCHING_DESIGN.md "
                              "Section 3) against the shared global-node registry at this SQLite "
@@ -6924,6 +7271,16 @@ if __name__ == "__main__":
     if args.pass0_target_fanin_cap < 0:
         raise SystemExit(f"--pass0-target-fanin-cap must be >= 0 "
                           f"(got {args.pass0_target_fanin_cap!r}).")
+    try:
+        NauticalRoutingPipeline._validate_node_merge_m(args.node_merge_m)
+    except ValueError as e:
+        raise SystemExit(f"--node-merge-m: {e}")
+    try:
+        NauticalRoutingPipeline._validate_classification_overrides(
+            args.axis_dedup_cap, args.axis_dedup_fraction,
+            args.axis_dedup_floor_m, args.min_navmesh_radius_m)
+    except ValueError as e:
+        raise SystemExit(str(e))
 
     stitch_registry_path = args.stitch_registry or os.environ.get("SK_ROUTING_STITCH_REGISTRY", "")
     coverage_bbox = None
@@ -6966,8 +7323,13 @@ if __name__ == "__main__":
                                        sagitta_cap=args.sagitta_cap,
                                        max_segment_m=args.max_segment_m,
                                        axis_dedup_cap=args.axis_dedup_cap,
+                                       axis_dedup_fraction=args.axis_dedup_fraction,
+                                       axis_dedup_floor_m=args.axis_dedup_floor_m,
+                                       min_navmesh_radius_m=args.min_navmesh_radius_m,
                                        inland_densify_max_segment_m=args.inland_densify_max_segment_m,
+                                       inland_resample_max_segment_m=args.inland_resample_max_segment_m,
                                        connector_merge_m=args.connector_merge_m,
                                        pass2_max_fanin_per_node=args.pass2_max_fanin_per_node,
-                                       pass0_target_fanin_cap=args.pass0_target_fanin_cap)
+                                       pass0_target_fanin_cap=args.pass0_target_fanin_cap,
+                                       node_merge_m=args.node_merge_m)
     pipeline.run_pipeline()
