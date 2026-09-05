@@ -307,7 +307,7 @@ confirming the fix changes edge attributes only, not topology):
 - **Regression coverage**: `tests/test_node_merge.py` (14 tests: default-disabled
   parity, tolerance merge/no-merge, diagonal-neighbor-cell lookup, stale-node
   pruning, context tagging, `_validate_node_merge_m` bounds). Full suite: 226/226
-  passing.
+  passing (227/227 once the CodeRabbit grid-index fix below adds its own test).
 - **Follow-up (CodeRabbit, PR #20): grid-index correctness fix, re-verified
   byte-identical.** `_register_node_in_merge_grid`/`_find_nearby_node` originally
   derived the longitude grid-cell size from each POINT's own raw latitude via
