@@ -1328,7 +1328,7 @@ def _obstruction_depth_disposition(row):
     return True, None
 
 class NauticalRoutingPipeline:
-    def __init__(self, data_paths: Dict[str, str], db_path: str,
+    def __init__(self, data_paths: Dict[str, str], db_path: str, *,
                  country: str = "", region_name: str = "", description: str = "",
                  tags: Optional[str] = None, contributor: str = "", url: str = "",
                  license: str = "", copyright: str = "",
@@ -1373,6 +1373,8 @@ class NauticalRoutingPipeline:
                                                            node_merge_m=node_merge_m)
         if max_segment_m is not None:
             self.classification_config.max_segment_m = float(max_segment_m)
+        self._validate_classification_overrides(axis_dedup_cap, axis_dedup_fraction,
+                                                 axis_dedup_floor_m, min_navmesh_radius_m)
         if axis_dedup_fraction is not None:
             self.classification_config.axis_dedup_fraction = float(axis_dedup_fraction)
         if axis_dedup_floor_m is not None:
@@ -1576,6 +1578,42 @@ class NauticalRoutingPipeline:
             raise ValueError(
                 f"node_merge_m must be finite, >= 0.0, and < {NODE_MERGE_MAX_M:.0f}m "
                 f"(got {merge_tol_m!r}).")
+
+    @staticmethod
+    def _validate_classification_overrides(axis_dedup_cap_m, axis_dedup_fraction,
+                                            axis_dedup_floor_m, min_navmesh_radius_m):
+        """CodeRabbit (PR #20): `axis_dedup_fraction`/`axis_dedup_floor_m`/
+        `min_navmesh_radius_m` bypassed validation entirely when overridden via the
+        constructor -- a negative `min_navmesh_radius_m` reaches `_split_wide_narrow`'s
+        `buffer(-radius_m)` and reverses erosion into DILATION, silently inverting
+        which parts of a water polygon count as navmesh-eligible ("wide") vs.
+        skeleton/channel ("narrow"); `NaN`/`inf` on any of the three can reach
+        downstream geometry/raster operations. Each is validated only when actually
+        provided (`None` means "keep the `ClassificationConfig` default", already
+        valid by construction). `axis_dedup_floor_m` above the active
+        `axis_dedup_cap_m` is also rejected -- `clip(fraction * width, floor, cap)`
+        with `floor > cap` degenerates to a constant `floor` regardless of width,
+        silently defeating the cap the caller explicitly set.
+        """
+        if axis_dedup_fraction is not None:
+            if not math.isfinite(axis_dedup_fraction) or axis_dedup_fraction < 0.0:
+                raise ValueError(
+                    f"axis_dedup_fraction must be finite and >= 0.0 "
+                    f"(got {axis_dedup_fraction!r}).")
+        if axis_dedup_floor_m is not None:
+            if not math.isfinite(axis_dedup_floor_m) or axis_dedup_floor_m < 0.0:
+                raise ValueError(
+                    f"axis_dedup_floor_m must be finite and >= 0.0 "
+                    f"(got {axis_dedup_floor_m!r}).")
+            if axis_dedup_cap_m > 0.0 and axis_dedup_floor_m > axis_dedup_cap_m:
+                raise ValueError(
+                    f"axis_dedup_floor_m ({axis_dedup_floor_m!r}) must not exceed the "
+                    f"active axis_dedup_cap_m ({axis_dedup_cap_m!r}).")
+        if min_navmesh_radius_m is not None:
+            if not math.isfinite(min_navmesh_radius_m) or min_navmesh_radius_m <= 0.0:
+                raise ValueError(
+                    f"min_navmesh_radius_m must be finite and > 0.0 "
+                    f"(got {min_navmesh_radius_m!r}).")
 
     def _densify_inland_waterways(self, inland_gdf):
         """SPEC-GRAPH-DENSITY.md §6.4: insert interpolated vertices along any
@@ -7237,6 +7275,12 @@ if __name__ == "__main__":
         NauticalRoutingPipeline._validate_node_merge_m(args.node_merge_m)
     except ValueError as e:
         raise SystemExit(f"--node-merge-m: {e}")
+    try:
+        NauticalRoutingPipeline._validate_classification_overrides(
+            args.axis_dedup_cap, args.axis_dedup_fraction,
+            args.axis_dedup_floor_m, args.min_navmesh_radius_m)
+    except ValueError as e:
+        raise SystemExit(str(e))
 
     stitch_registry_path = args.stitch_registry or os.environ.get("SK_ROUTING_STITCH_REGISTRY", "")
     coverage_bbox = None
