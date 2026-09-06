@@ -1663,11 +1663,17 @@ class NauticalRoutingPipeline:
         which only govern SKELETON resampling (`_resample_long_skeleton_edges`),
         never this raw ingestion path.
 
-        Reuses that same generator's plain cumulative-arc-length walk here rather
-        than a second, separately-implemented mechanism -- `inland_waterways`
-        carries no per-vertex width attribute, so sagitta relaxation is left
-        disabled (`max_chord_sagitta_m=0.0` in the call below) and every vertex's
-        width entry is `None`, simply passed through unused by the fallback path.
+        CodeRabbit (PR #20): does NOT reuse `_resample_long_skeleton_edges` --
+        that generator closes a segment only AFTER accumulated length reaches
+        `max_segment_m` (correct for its own skeleton callers, which never asked
+        for a strict ceiling), so two 60m source edges under a 100m cap would
+        keep a single 120m chord. This walk instead looks ahead before adding a
+        vertex: it closes the CURRENT segment at the previous vertex first if
+        doing so would push accumulated length over `cap_m`, so no emitted chord
+        exceeds the cap except the one unavoidable case -- a single original
+        source edge that is already longer than `cap_m` on its own (nothing to
+        cut it at; this is a removal-only operation, never inserting new points).
+
         This only REMOVES existing vertices (never inserts new ones, unlike
         `_densify_inland_waterways` above) -- the complementary opposite operation,
         safe to enable independently or together (densify first, then resample,
@@ -1675,15 +1681,21 @@ class NauticalRoutingPipeline:
 
         Gated on `inland_resample_max_segment_m > 0.0` -- disabled (default) leaves
         `inland_gdf` untouched, byte-identical to today's build, matching every
-        other flag's convention in this file.
+        other flag's convention in this file. CodeRabbit: validated BEFORE the
+        disabled-path check (unlike `_densify_inland_waterways`'s deliberate
+        negative-is-disabled precedent) -- `0.0` is the only value treated as
+        "disabled"; a stray negative/NaN/inf typo raises instead of silently
+        no-opping.
         """
         cap_m = self.classification_config.inland_resample_max_segment_m
-        if cap_m <= 0.0 or inland_gdf.empty:
+        if cap_m == 0.0:
             return inland_gdf
         if not math.isfinite(cap_m) or cap_m <= 0.0:
             raise ValueError(
                 f"--inland-resample-max-segment-m must be finite and > 0.0 "
                 f"(got {cap_m!r}).")
+        if inland_gdf.empty:
+            return inland_gdf
         new_geoms = []
         for geom in inland_gdf.geometry:
             if not isinstance(geom, LineString) or len(geom.coords) < 3:
@@ -1691,8 +1703,17 @@ class NauticalRoutingPipeline:
                 continue
             coords = list(geom.coords)
             kept = [coords[0]]
-            for sub_pts, _ in self._resample_long_skeleton_edges(coords, [None] * len(coords), cap_m):
-                kept.append(sub_pts[-1])
+            acc_m = 0.0
+            for i in range(1, len(coords)):
+                _, _, step_m = self.geod.inv(coords[i - 1][0], coords[i - 1][1],
+                                              coords[i][0], coords[i][1])
+                if acc_m > 0.0 and acc_m + step_m > cap_m:
+                    if kept[-1] != coords[i - 1]:
+                        kept.append(coords[i - 1])
+                    acc_m = 0.0
+                acc_m += step_m
+            if kept[-1] != coords[-1]:
+                kept.append(coords[-1])
             new_geoms.append(LineString(kept))
         out = inland_gdf.copy()
         out["geometry"] = new_geoms

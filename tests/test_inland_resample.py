@@ -65,14 +65,17 @@ class TestResampleDisabledByDefault:
         out = p._resample_inland_waterways(gdf)
         assert out is gdf
 
-    def test_negative_cap_is_still_a_plain_disable_not_an_error(self):
-        p = _pipeline(inland_resample_max_segment_m=-5.0)
-        gdf = _gdf([DENSE_LINE])
-        out = p._resample_inland_waterways(gdf)
-        assert out is gdf
-
 
 class TestResampleRejectsUnsafeCaps:
+    # CodeRabbit (PR #20): unlike _densify_inland_waterways's deliberate
+    # negative-is-disabled precedent, only exactly 0.0 disables resampling here
+    # -- a negative cap raises instead of silently no-opping, so a stray CLI typo
+    # (e.g. --inland-resample-max-segment-m -1) is caught rather than ignored.
+    def test_negative_cap_raises(self):
+        p = _pipeline(inland_resample_max_segment_m=-5.0)
+        with pytest.raises(ValueError):
+            p._resample_inland_waterways(_gdf([DENSE_LINE]))
+
     def test_nan_raises(self):
         p = _pipeline(inland_resample_max_segment_m=float("nan"))
         with pytest.raises(ValueError):
@@ -91,25 +94,32 @@ class TestResampleEnabled:
         coords = list(out.geometry.iloc[0].coords)
         assert len(coords) < len(list(DENSE_LINE.coords))
 
-    def test_no_output_segment_exceeds_the_cap_by_more_than_one_source_step(self):
-        # The walk can only ever close a segment AT an existing source vertex (it
-        # never inserts new points), so a segment can overshoot the cap by up to
-        # one source step's length -- e.g. 5 vertices totalling 242m is still under
-        # a 250m cap, so a 6th ~48m vertex gets folded in too, landing at ~291m.
-        # That's correct "close at the first vertex where cumulative length >=
-        # cap" behaviour, not a bug -- the real invariant is cap <= length <
-        # cap + one source step, not a strict cap ceiling.
+    def test_no_output_segment_ever_exceeds_the_cap(self):
+        # CodeRabbit (PR #20): unlike _resample_long_skeleton_edges (which closes
+        # AFTER reaching the cap, so two 60m source edges under a 100m cap would
+        # keep a 120m chord), this walk looks ahead and closes at the PREVIOUS
+        # vertex before a step would push it over -- a strict ceiling, since no
+        # single source edge in DENSE_LINE is longer than the cap on its own
+        # (the one case that would be unavoidable for a removal-only operation).
         cap_m = 250.0
-        source_step_m = 55.0  # ~48.5m at this latitude/spacing, with slack
         p = _pipeline(inland_resample_max_segment_m=cap_m)
         out = p._resample_inland_waterways(_gdf([DENSE_LINE]))
         line_m = gpd.GeoSeries([out.geometry.iloc[0]], crs="EPSG:4326").to_crs("EPSG:32631").iloc[0]
         coords = list(line_m.coords)
         seg_lens = [Point(coords[i]).distance(Point(coords[i + 1])) for i in range(len(coords) - 1)]
-        # Every segment except possibly the last (the walk's final, possibly-short
-        # remainder) must be at least the cap.
-        assert all(s >= cap_m or s == seg_lens[-1] for s in seg_lens)
-        assert max(seg_lens) <= cap_m + source_step_m
+        assert max(seg_lens) <= cap_m * 1.01
+
+    def test_a_single_source_edge_longer_than_the_cap_is_the_one_unavoidable_exception(self):
+        # A removal-only operation can't cut a single original segment in two --
+        # if the source line itself has one edge longer than the cap, that edge
+        # must survive intact rather than being silently dropped or corrupted.
+        long_edge = LineString([(3.70, 51.45), (3.70, 51.451), (3.75, 51.451)])  # ~3.5km 2nd edge
+        p = _pipeline(inland_resample_max_segment_m=250.0)
+        out = p._resample_inland_waterways(_gdf([long_edge]))
+        coords = list(out.geometry.iloc[0].coords)
+        assert coords[0] == pytest.approx(long_edge.coords[0], abs=1e-9)
+        assert coords[-1] == pytest.approx(long_edge.coords[-1], abs=1e-9)
+        assert tuple(long_edge.coords[1]) in [tuple(c) for c in coords]
 
     def test_endpoints_are_unchanged(self):
         p = _pipeline(inland_resample_max_segment_m=250.0)
