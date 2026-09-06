@@ -37,6 +37,7 @@ Nodes/Edges delta.
 | 10 | 2026-09-04 | this commit (§6.9 follow-up, on top of `8e9f507`/`4ae9cd9`) | `data/zeeland_fresh_clip` | same as #9 plus `--sagitta-cap 250.0 --axis-dedup-cap 100.0 --axis-dedup-floor-m 100.0 --min-navmesh-radius-m 1200.0` | §6.9 follow-up — flat 100m axis-dedup floor to fix real crisscross at the Vossemeersebrug/Tholen narrows | 42,092 | 124,689 | 0 | 14 | 0 | **YES (currently live)** |
 | 11 | 2026-09-04 | this commit (`--inland-resample-max-segment-m`, on top of `c2259f2`) | `data/zeeland_fresh_clip` | same as #10 plus `--inland-resample-max-segment-m 250.0` | Try to close the "still ~71-100m spacing on fairways" gap -- REGRESSED, not deployed (21 named POIs lost from main component, incl. Krammersluizen) | 29,006 | 80,064 | 0 | 14 | 0 | no -- regressed |
 | 12 | 2026-09-04 | this commit, same as #11 but a smaller cap | `data/zeeland_fresh_clip` | same as #10 plus `--inland-resample-max-segment-m 100.0` | Same idea, more conservative cap -- STILL regressed (9 named POIs lost, incl. Middelburg harbours), not deployed | 31,457 | 68,884 | 0 | 14 | 0 | no -- regressed |
+| 13 | 2026-09-06 | `8652bda` | `data/geojson/ct_reclip` (re-derived via `data/raw/us-east-coast/CT`) | Zeeland build #10's tuning config (`--sagitta-cap 250.0 --max-segment-m 2000 --axis-dedup-cap 100.0 --axis-dedup-floor-m 100.0 --min-navmesh-radius-m 1200.0 --connector-merge-m 5.0 --inland-densify-max-segment-m 120.0 --pass2-max-fanin-per-node 6 --pass0-target-fanin-cap 4 --node-merge-m 5.0`) applied to US East Coast region `us_east_ct_stitched` | Roll out Zeeland's verified density-tuning config to US East Coast regions | 20,359 | 47,902 | 0 | 19 | 0 | **YES** |
 
 **Row #1 is not a valid comparison baseline** — its input clip/flags are unknown, so
 its counts cannot be attributed to any specific configuration. It's recorded because
@@ -464,6 +465,45 @@ simplification pass. Left as an open follow-up. **Live db is still #10** --
 investigation.
 - **Logs**: `data/zeeland_inlandresample_build.log` (#11, 250m),
   `data/zeeland_inlandresample100_build.log` (#12, 100m)
+
+### #13 — `us_east_ct_stitched_v2.sqlite` — Zeeland's verified tuning config, rolled out to US East Coast/CT
+
+```
+./build_region.sh us-east-ct-stitched-v2 --states CT --source-region us-east-coast \
+  --clip-bbox "-73.81,40.84,-71.83999999999999,41.41" --overlap-deg 0.01 \
+  --stitch-registry data/seam_registry.sqlite \
+  --extra-pipeline-args "--sagitta-cap 250.0 --max-segment-m 2000 --axis-dedup-cap 100.0 --axis-dedup-floor-m 100.0 --min-navmesh-radius-m 1200.0 --connector-merge-m 5.0 --inland-densify-max-segment-m 120.0 --pass2-max-fanin-per-node 6 --pass0-target-fanin-cap 4 --node-merge-m 5.0"
+```
+
+- **Purpose**: this is the first of 19 US East Coast regional rebuilds applying
+  Zeeland build #10's exact verified-safe tuning config (this file, builds #7-#12)
+  to the already-live US East Coast region set, via the new `build_region.sh
+  --extra-pipeline-args` passthrough (this commit's parent, `8652bda`).
+  `--inland-resample-max-segment-m` is deliberately NOT included (builds #11/#12
+  above document a real connectivity regression from it; never shipped).
+- **Input**: `data/geojson/ct_reclip` already existed from a prior session, but
+  `build_region.sh --states CT --clip-bbox ... --overlap-deg 0.01` re-derives its
+  own `data/geojson/us-east-ct-stitched-v2_clipped` from `data/raw/us-east-coast/CT`
+  (already local, no NOAA download) rather than reusing `ct_reclip` directly — cheap
+  and expected per this task's brief. Clip bbox and 0.01deg overlap read from this
+  region's original `data/us_east_ct_clip.log`.
+- **Result vs currently-live** (`signalk-routeiq/data/us_east_ct_stitched.sqlite`,
+  original build recipe/commit unknown/unreproduced — same "unknown baseline"
+  situation as Zeeland row #1 above):
+
+  | build | nodes | edges | hubs (od>30) | max out-deg | crosses_land |
+  |---|---|---|---|---|---|
+  | live (pre-tuning, unknown recipe) | 31,278 | 74,235 | n/a (not measured) | n/a | n/a |
+  | **v2 (this build, tuning applied)** | **20,359** | **47,902** | **0** | **19** | **0** |
+
+  Node/edge counts are NOT a controlled A/B (different, unreproduced source
+  recipe/flags) — recorded for context only, same caveat as Zeeland's row #1
+  comparisons. Zero hubs and zero crosses_land confirm the tuning config produces
+  the same clean topology on this dataset as it did on Zeeland.
+- **Installed live** 2026-09-06 (deployed in a batch with the other successful
+  regions at the end of this rollout — see the batch deploy note below).
+- **Logs**: `data/us_east_ct_stitched_v2_run.log` (full script output),
+  `data/us_east_ct_stitched_v2_build.log` (pipeline step only), `data/us_east_ct_stitched_v2_clip.log`.
 
 ## Resolved: why the live db (#1) had only 5 hubs when #2-#6 had 56-231
 
