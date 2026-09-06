@@ -121,6 +121,18 @@ class TestResampleEnabled:
         assert coords[-1] == pytest.approx(long_edge.coords[-1], abs=1e-9)
         assert tuple(long_edge.coords[1]) in [tuple(c) for c in coords]
 
+    def test_closed_loop_collapsing_under_the_cap_does_not_raise(self):
+        # CodeRabbit (PR #20): a CLOSED line (A-B-A, e.g. a small loop channel)
+        # whose entire length is under the cap leaves `kept` holding only the one
+        # shared start/end point once both walk passes agree it's unchanged --
+        # constructing a LineString from a single coordinate raises in Shapely
+        # 2.x, which used to abort the whole parse_shapefiles() call. Must
+        # preserve the original loop geometry instead of crashing.
+        loop = LineString([(3.70, 51.45), (3.701, 51.451), (3.70, 51.45)])
+        p = _pipeline(inland_resample_max_segment_m=100_000.0)
+        out = p._resample_inland_waterways(_gdf([loop]))  # must not raise
+        assert out.geometry.iloc[0].equals(loop)
+
     def test_endpoints_are_unchanged(self):
         p = _pipeline(inland_resample_max_segment_m=250.0)
         out = p._resample_inland_waterways(_gdf([DENSE_LINE]))
