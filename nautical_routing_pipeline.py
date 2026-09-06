@@ -1714,6 +1714,18 @@ class NauticalRoutingPipeline:
                 acc_m += step_m
             if kept[-1] != coords[-1]:
                 kept.append(coords[-1])
+            if len(kept) < 2:
+                # CodeRabbit (PR #20): a CLOSED line (coords[0] == coords[-1], e.g.
+                # a small loop channel) whose entire length collapses under one cap
+                # leaves `kept` holding only that single shared point --
+                # LineString(kept) would raise (Shapely 2.x rejects a 1-coordinate
+                # LineString) and abort the whole parse_shapefiles() call. Keep the
+                # original geometry rather than crash; a full-length loop under the
+                # cap isn't a case this consolidation can usefully collapse further
+                # anyway (there is no shorter closed shape a single chord could
+                # represent).
+                new_geoms.append(geom)
+                continue
             new_geoms.append(LineString(kept))
         out = inland_gdf.copy()
         out["geometry"] = new_geoms
