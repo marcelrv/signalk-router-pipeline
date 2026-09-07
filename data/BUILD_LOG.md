@@ -39,6 +39,7 @@ Nodes/Edges delta.
 | 12 | 2026-09-04 | this commit, same as #11 but a smaller cap | `data/zeeland_fresh_clip` | same as #10 plus `--inland-resample-max-segment-m 100.0` | Same idea, more conservative cap -- STILL regressed (9 named POIs lost, incl. Middelburg harbours), not deployed | 31,457 | 68,884 | 0 | 14 | 0 | no -- regressed |
 | 13 | 2026-09-06 | `8652bda` | `data/geojson/ct_reclip` (re-derived via `data/raw/us-east-coast/CT`) | Zeeland build #10's tuning config (`--sagitta-cap 250.0 --max-segment-m 2000 --axis-dedup-cap 100.0 --axis-dedup-floor-m 100.0 --min-navmesh-radius-m 1200.0 --connector-merge-m 5.0 --inland-densify-max-segment-m 120.0 --pass2-max-fanin-per-node 6 --pass0-target-fanin-cap 4 --node-merge-m 5.0`) applied to US East Coast region `us_east_ct_stitched` | Roll out Zeeland's verified density-tuning config to US East Coast regions | 20,359 | 47,902 | 0 | 19 | 0 | **YES** |
 | 14 | 2026-09-06 | `708de40` | `data/geojson/de_reclip` (re-derived via `data/raw/us-east-coast/DE`) | same tuning config as #13, applied to `us_east_de_stitched` | Roll out Zeeland's tuning config, region 2/19 | 19,420 | 45,378 | 0 | 16 | 0 | **YES** |
+| 15 | 2026-09-07 | `8f60b9e` | `data/geojson/fl_atl_n1a_reclip` (re-derived via `data/raw/us-east-coast/FL`) | same tuning config as #13, applied to `us_east_fl_atl_n1a_stitched` | Roll out Zeeland's tuning config, region 3/19 | n/a | n/a | n/a | n/a | n/a | **FAILED — OOM-killed twice, not deployed** |
 
 **Row #1 is not a valid comparison baseline** — its input clip/flags are unknown, so
 its counts cannot be attributed to any specific configuration. It's recorded because
@@ -527,6 +528,43 @@ investigation.
   No errors/tracebacks in the build log; 0 hubs, 0 crosses_land.
 - **Installed live**: deferred to the end-of-rollout batch deploy (see #13).
 - **Logs**: `data/us_east_de_stitched_v2_run.log`, `data/us_east_de_stitched_v2_build.log`.
+
+### #15 — `us_east_fl_atl_n1a_stitched_v2.sqlite` — FAILED, OOM-killed twice, NOT deployed
+
+```
+./build_region.sh us-east-fl-atl-n1a-stitched-v2 --states FL --source-region us-east-coast \
+  --clip-bbox "-81.91000000000001,29.79,-79.39,30.71" --overlap-deg 0.01 \
+  --stitch-registry data/seam_registry.sqlite \
+  --extra-pipeline-args "--sagitta-cap 250.0 --max-segment-m 2000 --axis-dedup-cap 100.0 --axis-dedup-floor-m 100.0 --min-navmesh-radius-m 1200.0 --connector-merge-m 5.0 --inland-densify-max-segment-m 120.0 --pass2-max-fanin-per-node 6 --pass0-target-fanin-cap 4 --node-merge-m 5.0"
+```
+
+- **Purpose**: region 3/19 of the US East Coast tuning rollout (see #13).
+- **Attempt 1**: `free -h` showed ~11GB available before launch. Killed (SIGKILL,
+  exit 137) ~2m18s in, during "Building base network topology" (the
+  `_build_inland_network`/densify/skeleton stage). No output `.sqlite` produced.
+- **Attempt 2 (the one retry allowed per this task's brief)**: `free -h` showed
+  ~11-12GB available before relaunch. Killed again (exit 137), this time even
+  earlier (~1m20s in), same "Building base network topology" stage. No output
+  `.sqlite` produced.
+- **Decision**: two failures — per this task's operational constraint, do not
+  retry a third time. Logged as failed, moving on to the next region. The
+  currently-live `signalk-routeiq/data/us_east_fl_atl_n1a_stitched.sqlite` is left
+  untouched (not backed up, not replaced).
+- **Not yet root-caused**: unlike Zeeland's own single OOM incident (#10's
+  operational note — resolved by dialing `--axis-dedup-cap` back from 150 to 100),
+  this region hit the SAME exact flag values that worked fine on CT (#13) and DE
+  (#14) and on all of Zeeland's builds. FL's raw per-state ENC data is
+  substantially larger than CT/DE's (live `us_east_fl_atl_n1a_stitched.sqlite` is
+  comparable in size to CT/DE's, but the clip covers a busier stretch of Florida
+  coast with more `land`/`coastal_water`/`obstacles` features feeding the
+  topology-build stage) — plausibly just a bigger peak-RSS working set for this
+  particular clip's raster/skeleton step colliding with other live services'
+  memory usage on this shared host at the time. Left as an open follow-up if this
+  region needs the tuning applied later (e.g. retry at a quieter time, or
+  investigate whether `--min-navmesh-radius-m`/tiling behaves worse on this
+  clip's geometry).
+- **Logs**: `data/us_east_fl_atl_n1a_stitched_v2_run.log` (both attempts
+  overwrite the same file; only the second/final attempt's content survives).
 
 ## Resolved: why the live db (#1) had only 5 hubs when #2-#6 had 56-231
 
