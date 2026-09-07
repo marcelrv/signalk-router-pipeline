@@ -55,6 +55,7 @@ Nodes/Edges delta.
 | 28 | 2026-09-07 | `aff449d` | `data/geojson/ny_reclip` (re-derived via `data/raw/us-east-coast/NY`) | same tuning config as #13, applied to `us_east_ny_stitched` | Roll out Zeeland's tuning config, region 16/19 | 19,250 | 48,046 | 0 | 26 | 0 | **YES** |
 | 29 | 2026-09-07 | `5e4f530` | `data/geojson/ri_reclip` (re-derived via `data/raw/us-east-coast/RI`) | same tuning config as #13, applied to `us_east_ri_stitched` | Roll out Zeeland's tuning config, region 17/19 | 12,818 | 27,514 | 0 | 18 | 0 | **YES** |
 | 30 | 2026-09-07 | `273b563` | `data/geojson/sc_ga_reclip` (re-derived via `data/raw/us-east-coast/SC,GA`) | same tuning config as #13, applied to `us_east_sc_ga_stitched` | Roll out Zeeland's tuning config, region 18/19 | 35,438 | 87,245 | 0 | 15 | 0 | **YES** |
+| 31 | 2026-09-07 | `eeb3fed` | `data/geojson/va_reclip` (re-derived via `data/raw/us-east-coast/VA`) | same tuning config as #13, applied to `us_east_va_stitched` | Roll out Zeeland's tuning config, region 19/19 (final) | 59,443 | 143,046 | 0 | 17 | 0 | **YES** |
 
 **Row #1 is not a valid comparison baseline** — its input clip/flags are unknown, so
 its counts cannot be attributed to any specific configuration. It's recorded because
@@ -995,6 +996,62 @@ investigation.
   No errors/tracebacks in the build log.
 - **Installed live**: deferred to the end-of-rollout batch deploy (see #13).
 - **Logs**: `data/us_east_sc_ga_stitched_v2_run.log`, `data/us_east_sc_ga_stitched_v2_build.log`.
+
+### #31 — `us_east_va_stitched_v2.sqlite` — Zeeland's verified tuning config, rolled out to US East Coast/VA (FINAL region, 19/19)
+
+```
+./build_region.sh us-east-va-stitched-v2 --states VA --source-region us-east-coast \
+  --clip-bbox "-77.61,36.39,-75.19,37.96" --overlap-deg 0.01 \
+  --stitch-registry data/seam_registry.sqlite \
+  --extra-pipeline-args "--sagitta-cap 250.0 --max-segment-m 2000 --axis-dedup-cap 100.0 --axis-dedup-floor-m 100.0 --min-navmesh-radius-m 1200.0 --connector-merge-m 5.0 --inland-densify-max-segment-m 120.0 --pass2-max-fanin-per-node 6 --pass0-target-fanin-cap 4 --node-merge-m 5.0"
+```
+
+- **Purpose**: region 19/19 (final) of the US East Coast tuning rollout (see #13).
+  Clean build — no hub-count anomaly (0 hubs, max out-deg 17).
+- **Result vs currently-live** (`signalk-routeiq/data/us_east_va_stitched.sqlite`,
+  original build recipe/commit unknown/unreproduced):
+
+  | build | nodes | edges | hubs (od>30) | max out-deg | crosses_land |
+  |---|---|---|---|---|---|
+  | live (pre-tuning, unknown recipe) | 97,820 | 222,859 | n/a | n/a | n/a |
+  | **v2 (this build, tuning applied)** | **59,443** | **143,046** | **0** | **17** | **0** |
+
+  No errors/tracebacks in the build log.
+- **Installed live**: deferred to the end-of-rollout batch deploy (see below).
+- **Logs**: `data/us_east_va_stitched_v2_run.log`, `data/us_east_va_stitched_v2_build.log`.
+
+### Rollout summary — US East Coast tuning rollout (builds #13-#31, 2026-09-06/07)
+
+19 regions attempted, applying Zeeland build #10's exact verified-safe tuning
+config via the new `build_region.sh --extra-pipeline-args` passthrough (`8652bda`).
+**18/19 succeeded, 1 failed** (`fl_atl_n1a`, #15, OOM-killed twice — see that
+entry; live file left untouched, not deployed).
+
+Two regions (`fl_atl_s` #18, `fl_gulf_sw` #21) show a hub-count anomaly (4 and 3
+hubs respectively, max out-degree up to 138) traced to the same real-world
+location (Key West, where their clip bboxes genuinely overlap) — a
+`navmesh_boundary` fan-in pattern not seen anywhere else in this rollout or in
+any Zeeland build. Both still have `crosses_land=0` and were deployed per this
+task's success criteria (build succeeded, land-safe); flagged as an open
+follow-up. All other 16 successful regions show 0 hubs, matching Zeeland's own
+best builds (#7-#10).
+
+**Aggregate node/edge counts across the 18 successfully-rebuilt regions**
+(live/pre-tuning vs v2/tuning-applied; `fl_atl_n1a` excluded from both sides since
+it wasn't rebuilt):
+
+| | nodes | edges |
+|---|---|---|
+| live (18 regions, pre-tuning) | 986,204 | 2,357,006 |
+| v2 (18 regions, tuning applied) | 576,734 | 1,367,338 |
+| delta | −409,470 (−41.5%) | −989,668 (−42.0%) |
+
+This ~42% edge-count reduction is consistent with the reduction seen on Zeeland
+between its own pre-tuning and post-tuning (#7-#10) builds, and with every
+individual region above — every successful region's v2 build has fewer nodes/
+edges than its live counterpart except `nh` (small enough that the unknown live
+recipe's own baseline was likely built differently; not a controlled comparison,
+same caveat as row #1).
 
 ## Resolved: why the live db (#1) had only 5 hubs when #2-#6 had 56-231
 
