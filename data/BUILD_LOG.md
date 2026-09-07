@@ -43,6 +43,7 @@ Nodes/Edges delta.
 | 16 | 2026-09-07 | `f5994a5` | `data/geojson/fl_atl_n1b_reclip` (re-derived via `data/raw/us-east-coast/FL`) | same tuning config as #13, applied to `us_east_fl_atl_n1b_stitched` | Roll out Zeeland's tuning config, region 4/19 | 9,358 | 17,441 | 0 | 15 | 0 | **YES** |
 | 17 | 2026-09-07 | `3f0d5c6` | `data/geojson/fl_atl_n2_reclip` (re-derived via `data/raw/us-east-coast/FL`) | same tuning config as #13, applied to `us_east_fl_atl_n2_stitched` | Roll out Zeeland's tuning config, region 5/19 | 29,242 | 67,761 | 0 | 16 | 0 | **YES** |
 | 18 | 2026-09-07 | `fd316bf` | `data/geojson/fl_atl_s_reclip` (re-derived via `data/raw/us-east-coast/FL`) | same tuning config as #13, applied to `us_east_fl_atl_s_stitched` | Roll out Zeeland's tuning config, region 6/19 | 56,301 | 135,182 | **4** | **138** | 0 | **YES (see hub-count caveat in Details)** |
+| 19 | 2026-09-07 | `19df1ef` | `data/geojson/fl_gulf_mid_reclip` (re-derived via `data/raw/us-east-coast/FL`) | same tuning config as #13, applied to `us_east_fl_gulf_mid_stitched` | Roll out Zeeland's tuning config, region 7/19 | 36,755 | 87,270 | 0 | 14 | 0 | **YES** |
 
 **Row #1 is not a valid comparison baseline** — its input clip/flags are unknown, so
 its counts cannot be attributed to any specific configuration. It's recorded because
@@ -671,6 +672,29 @@ investigation.
   other large-open-water FL/Gulf regions.
 - **Installed live**: deferred to the end-of-rollout batch deploy (see #13).
 - **Logs**: `data/us_east_fl_atl_s_stitched_v2_run.log`, `data/us_east_fl_atl_s_stitched_v2_build.log`.
+
+### #19 — `us_east_fl_gulf_mid_stitched_v2.sqlite` — Zeeland's verified tuning config, rolled out to US East Coast/FL (gulf_mid)
+
+```
+./build_region.sh us-east-fl-gulf-mid-stitched-v2 --states FL --source-region us-east-coast \
+  --clip-bbox "-83.81,27.189999999999998,-82.19,29.21" --overlap-deg 0.01 \
+  --stitch-registry data/seam_registry.sqlite \
+  --extra-pipeline-args "--sagitta-cap 250.0 --max-segment-m 2000 --axis-dedup-cap 100.0 --axis-dedup-floor-m 100.0 --min-navmesh-radius-m 1200.0 --connector-merge-m 5.0 --inland-densify-max-segment-m 120.0 --pass2-max-fanin-per-node 6 --pass0-target-fanin-cap 4 --node-merge-m 5.0"
+```
+
+- **Purpose**: region 7/19 of the US East Coast tuning rollout (see #13). Clean
+  build — no hub-count anomaly (0 hubs, max out-deg 14), unlike #18.
+- **Result vs currently-live** (`signalk-routeiq/data/us_east_fl_gulf_mid_stitched.sqlite`,
+  original build recipe/commit unknown/unreproduced):
+
+  | build | nodes | edges | hubs (od>30) | max out-deg | crosses_land |
+  |---|---|---|---|---|---|
+  | live (pre-tuning, unknown recipe) | 68,876 | 170,296 | n/a | n/a | n/a |
+  | **v2 (this build, tuning applied)** | **36,755** | **87,270** | **0** | **14** | **0** |
+
+  No errors/tracebacks in the build log.
+- **Installed live**: deferred to the end-of-rollout batch deploy (see #13).
+- **Logs**: `data/us_east_fl_gulf_mid_stitched_v2_run.log`, `data/us_east_fl_gulf_mid_stitched_v2_build.log`.
 
 ## Resolved: why the live db (#1) had only 5 hubs when #2-#6 had 56-231
 
