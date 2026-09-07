@@ -39,6 +39,23 @@ Nodes/Edges delta.
 | 12 | 2026-09-04 | this commit, same as #11 but a smaller cap | `data/zeeland_fresh_clip` | same as #10 plus `--inland-resample-max-segment-m 100.0` | Same idea, more conservative cap -- STILL regressed (9 named POIs lost, incl. Middelburg harbours), not deployed | 31,457 | 68,884 | 0 | 14 | 0 | no -- regressed |
 | 13 | 2026-09-06 | `8652bda` | `data/geojson/ct_reclip` (re-derived via `data/raw/us-east-coast/CT`) | Zeeland build #10's tuning config (`--sagitta-cap 250.0 --max-segment-m 2000 --axis-dedup-cap 100.0 --axis-dedup-floor-m 100.0 --min-navmesh-radius-m 1200.0 --connector-merge-m 5.0 --inland-densify-max-segment-m 120.0 --pass2-max-fanin-per-node 6 --pass0-target-fanin-cap 4 --node-merge-m 5.0`) applied to US East Coast region `us_east_ct_stitched` | Roll out Zeeland's verified density-tuning config to US East Coast regions | 20,359 | 47,902 | 0 | 19 | 0 | **YES** |
 | 14 | 2026-09-06 | `708de40` | `data/geojson/de_reclip` (re-derived via `data/raw/us-east-coast/DE`) | same tuning config as #13, applied to `us_east_de_stitched` | Roll out Zeeland's tuning config, region 2/19 | 19,420 | 45,378 | 0 | 16 | 0 | **YES** |
+| 15 | 2026-09-07 | `8f60b9e` | `data/geojson/fl_atl_n1a_reclip` (re-derived via `data/raw/us-east-coast/FL`) | same tuning config as #13, applied to `us_east_fl_atl_n1a_stitched` | Roll out Zeeland's tuning config, region 3/19 | n/a | n/a | n/a | n/a | n/a | **FAILED — OOM-killed twice, not deployed** |
+| 16 | 2026-09-07 | `f5994a5` | `data/geojson/fl_atl_n1b_reclip` (re-derived via `data/raw/us-east-coast/FL`) | same tuning config as #13, applied to `us_east_fl_atl_n1b_stitched` | Roll out Zeeland's tuning config, region 4/19 | 9,358 | 17,441 | 0 | 15 | 0 | **YES** |
+| 17 | 2026-09-07 | `3f0d5c6` | `data/geojson/fl_atl_n2_reclip` (re-derived via `data/raw/us-east-coast/FL`) | same tuning config as #13, applied to `us_east_fl_atl_n2_stitched` | Roll out Zeeland's tuning config, region 5/19 | 29,242 | 67,761 | 0 | 16 | 0 | **YES** |
+| 18 | 2026-09-07 | `fd316bf` | `data/geojson/fl_atl_s_reclip` (re-derived via `data/raw/us-east-coast/FL`) | same tuning config as #13, applied to `us_east_fl_atl_s_stitched` | Roll out Zeeland's tuning config, region 6/19 | 56,301 | 135,182 | **4** | **138** | 0 | **YES (see hub-count caveat in Details)** |
+| 19 | 2026-09-07 | `19df1ef` | `data/geojson/fl_gulf_mid_reclip` (re-derived via `data/raw/us-east-coast/FL`) | same tuning config as #13, applied to `us_east_fl_gulf_mid_stitched` | Roll out Zeeland's tuning config, region 7/19 | 36,755 | 87,270 | 0 | 14 | 0 | **YES** |
+| 20 | 2026-09-07 | `ad5f094` | `data/geojson/fl_gulf_pan_reclip` (re-derived via `data/raw/us-east-coast/FL`) | same tuning config as #13, applied to `us_east_fl_gulf_pan_stitched` | Roll out Zeeland's tuning config, region 8/19 | 21,617 | 45,942 | 0 | 25 | 0 | **YES** |
+| 21 | 2026-09-07 | `1e75c67` | `data/geojson/fl_gulf_sw_reclip` (re-derived via `data/raw/us-east-coast/FL`) | same tuning config as #13, applied to `us_east_fl_gulf_sw_stitched` | Roll out Zeeland's tuning config, region 9/19 | 30,739 | 66,692 | **3** | **134** | 0 | **YES (same Key West hub caveat as #18)** |
+| 22 | 2026-09-07 | `bae4e88` | `data/geojson/ma_reclip` (re-derived via `data/raw/us-east-coast/MA`) | same tuning config as #13, applied to `us_east_ma_stitched` | Roll out Zeeland's tuning config, region 10/19 | 36,898 | 87,637 | 0 | 22 | 0 | **YES** |
+| 23 | 2026-09-07 | `809e0b1` | `data/geojson/md_reclip` (re-derived via `data/raw/us-east-coast/MD`) | same tuning config as #13, applied to `us_east_md_stitched` | Roll out Zeeland's tuning config, region 11/19 | 54,766 | 129,606 | 0 | 16 | 0 | **YES** |
+| 24 | 2026-09-07 | `034892c` | `data/geojson/me_reclip` (re-derived via `data/raw/us-east-coast/ME`) | same tuning config as #13, applied to `us_east_me_stitched` | Roll out Zeeland's tuning config, region 12/19 | 52,994 | 141,005 | 0 | 17 | 0 | **YES** |
+| 25 | 2026-09-07 | `b8372ae` | `data/geojson/nc_reclip` (re-derived via `data/raw/us-east-coast/NC`) | same tuning config as #13, applied to `us_east_nc_stitched` | Roll out Zeeland's tuning config, region 13/19 | 46,839 | 112,311 | 0 | 16 | 0 | **YES** |
+| 26 | 2026-09-07 | `7d5dbbb` | `data/geojson/nh_reclip` (re-derived via `data/raw/us-east-coast/NH`) | same tuning config as #13, applied to `us_east_nh_stitched` | Roll out Zeeland's tuning config, region 14/19 | 8,524 | 15,333 | 0 | 14 | 0 | **YES** |
+| 27 | 2026-09-07 | `39dfeac` | `data/geojson/nj_reclip` (re-derived via `data/raw/us-east-coast/NJ`) | same tuning config as #13, applied to `us_east_nj_stitched` | Roll out Zeeland's tuning config, region 15/19 | 25,973 | 62,027 | 0 | 17 | 0 | **YES** |
+| 28 | 2026-09-07 | `aff449d` | `data/geojson/ny_reclip` (re-derived via `data/raw/us-east-coast/NY`) | same tuning config as #13, applied to `us_east_ny_stitched` | Roll out Zeeland's tuning config, region 16/19 | 19,250 | 48,046 | 0 | 26 | 0 | **YES** |
+| 29 | 2026-09-07 | `5e4f530` | `data/geojson/ri_reclip` (re-derived via `data/raw/us-east-coast/RI`) | same tuning config as #13, applied to `us_east_ri_stitched` | Roll out Zeeland's tuning config, region 17/19 | 12,818 | 27,514 | 0 | 18 | 0 | **YES** |
+| 30 | 2026-09-07 | `273b563` | `data/geojson/sc_ga_reclip` (re-derived via `data/raw/us-east-coast/SC,GA`) | same tuning config as #13, applied to `us_east_sc_ga_stitched` | Roll out Zeeland's tuning config, region 18/19 | 35,438 | 87,245 | 0 | 15 | 0 | **YES** |
+| 31 | 2026-09-07 | `eeb3fed` | `data/geojson/va_reclip` (re-derived via `data/raw/us-east-coast/VA`) | same tuning config as #13, applied to `us_east_va_stitched` | Roll out Zeeland's tuning config, region 19/19 (final) | 59,443 | 143,046 | 0 | 17 | 0 | **YES** |
 
 **Row #1 is not a valid comparison baseline** — its input clip/flags are unknown, so
 its counts cannot be attributed to any specific configuration. It's recorded because
@@ -527,6 +544,516 @@ investigation.
   No errors/tracebacks in the build log; 0 hubs, 0 crosses_land.
 - **Installed live**: deferred to the end-of-rollout batch deploy (see #13).
 - **Logs**: `data/us_east_de_stitched_v2_run.log`, `data/us_east_de_stitched_v2_build.log`.
+
+### #15 — `us_east_fl_atl_n1a_stitched_v2.sqlite` — FAILED, OOM-killed twice, NOT deployed
+
+```bash
+./build_region.sh us-east-fl-atl-n1a-stitched-v2 --states FL --source-region us-east-coast \
+  --clip-bbox "-81.91000000000001,29.79,-79.39,30.71" --overlap-deg 0.01 \
+  --stitch-registry data/seam_registry.sqlite \
+  --extra-pipeline-args "--sagitta-cap 250.0 --max-segment-m 2000 --axis-dedup-cap 100.0 --axis-dedup-floor-m 100.0 --min-navmesh-radius-m 1200.0 --connector-merge-m 5.0 --inland-densify-max-segment-m 120.0 --pass2-max-fanin-per-node 6 --pass0-target-fanin-cap 4 --node-merge-m 5.0"
+```
+
+- **Purpose**: region 3/19 of the US East Coast tuning rollout (see #13).
+- **Attempt 1**: `free -h` showed ~11GB available before launch. Killed (SIGKILL,
+  exit 137) ~2m18s in, during "Building base network topology" (the
+  `_build_inland_network`/densify/skeleton stage). No output `.sqlite` produced.
+- **Attempt 2 (the one retry allowed per this task's brief)**: `free -h` showed
+  ~11-12GB available before relaunch. Killed again (exit 137), this time even
+  earlier (~1m20s in), same "Building base network topology" stage. No output
+  `.sqlite` produced.
+- **Decision**: two failures — per this task's operational constraint, do not
+  retry a third time. Logged as failed, moving on to the next region. The
+  currently-live `signalk-routeiq/data/us_east_fl_atl_n1a_stitched.sqlite` is left
+  untouched (not backed up, not replaced).
+- **Not yet root-caused**: unlike Zeeland's own single OOM incident (#10's
+  operational note — resolved by dialing `--axis-dedup-cap` back from 150 to 100),
+  this region hit the SAME exact flag values that worked fine on CT (#13) and DE
+  (#14) and on all of Zeeland's builds. FL's raw per-state ENC data is
+  substantially larger than CT/DE's (live `us_east_fl_atl_n1a_stitched.sqlite` is
+  comparable in size to CT/DE's, but the clip covers a busier stretch of Florida
+  coast with more `land`/`coastal_water`/`obstacles` features feeding the
+  topology-build stage) — plausibly just a bigger peak-RSS working set for this
+  particular clip's raster/skeleton step colliding with other live services'
+  memory usage on this shared host at the time. Left as an open follow-up if this
+  region needs the tuning applied later (e.g. retry at a quieter time, or
+  investigate whether `--min-navmesh-radius-m`/tiling behaves worse on this
+  clip's geometry).
+- **Logs**: `data/us_east_fl_atl_n1a_stitched_v2_run.log` (both attempts
+  overwrite the same file; only the second/final attempt's content survives).
+
+### #16 — `us_east_fl_atl_n1b_stitched_v2.sqlite` — Zeeland's verified tuning config, rolled out to US East Coast/FL (n1b)
+
+```bash
+./build_region.sh us-east-fl-atl-n1b-stitched-v2 --states FL --source-region us-east-coast \
+  --clip-bbox "-81.91000000000001,28.79,-79.39,29.91" --overlap-deg 0.01 \
+  --stitch-registry data/seam_registry.sqlite \
+  --extra-pipeline-args "--sagitta-cap 250.0 --max-segment-m 2000 --axis-dedup-cap 100.0 --axis-dedup-floor-m 100.0 --min-navmesh-radius-m 1200.0 --connector-merge-m 5.0 --inland-densify-max-segment-m 120.0 --pass2-max-fanin-per-node 6 --pass0-target-fanin-cap 4 --node-merge-m 5.0"
+```
+
+- **Purpose**: region 4/19 of the US East Coast tuning rollout (see #13).
+  Succeeded cleanly this time despite being the same FL raw data as #15's
+  OOM-killed n1a clip — a different (adjacent, further south) bbox from the same
+  state, so the working-set size clearly varies a lot by clip, not just by state.
+- **Result vs currently-live** (`signalk-routeiq/data/us_east_fl_atl_n1b_stitched.sqlite`,
+  original build recipe/commit unknown/unreproduced):
+
+  | build | nodes | edges | hubs (od>30) | max out-deg | crosses_land |
+  |---|---|---|---|---|---|
+  | live (pre-tuning, unknown recipe) | 11,394 | 27,732 | n/a | n/a | n/a |
+  | **v2 (this build, tuning applied)** | **9,358** | **17,441** | **0** | **15** | **0** |
+
+  No errors/tracebacks in the build log; 0 hubs, 0 crosses_land.
+- **Installed live**: deferred to the end-of-rollout batch deploy (see #13).
+- **Logs**: `data/us_east_fl_atl_n1b_stitched_v2_run.log`, `data/us_east_fl_atl_n1b_stitched_v2_build.log`.
+
+### #17 — `us_east_fl_atl_n2_stitched_v2.sqlite` — Zeeland's verified tuning config, rolled out to US East Coast/FL (n2)
+
+```bash
+./build_region.sh us-east-fl-atl-n2-stitched-v2 --states FL --source-region us-east-coast \
+  --clip-bbox "-81.11,26.889999999999997,-79.39,28.91" --overlap-deg 0.01 \
+  --stitch-registry data/seam_registry.sqlite \
+  --extra-pipeline-args "--sagitta-cap 250.0 --max-segment-m 2000 --axis-dedup-cap 100.0 --axis-dedup-floor-m 100.0 --min-navmesh-radius-m 1200.0 --connector-merge-m 5.0 --inland-densify-max-segment-m 120.0 --pass2-max-fanin-per-node 6 --pass0-target-fanin-cap 4 --node-merge-m 5.0"
+```
+
+- **Purpose**: region 5/19 of the US East Coast tuning rollout (see #13).
+- **Result vs currently-live** (`signalk-routeiq/data/us_east_fl_atl_n2_stitched.sqlite`,
+  original build recipe/commit unknown/unreproduced):
+
+  | build | nodes | edges | hubs (od>30) | max out-deg | crosses_land |
+  |---|---|---|---|---|---|
+  | live (pre-tuning, unknown recipe) | 42,829 | 103,952 | n/a | n/a | n/a |
+  | **v2 (this build, tuning applied)** | **29,242** | **67,761** | **0** | **16** | **0** |
+
+  No errors/tracebacks in the build log; 0 hubs, 0 crosses_land.
+- **Installed live**: deferred to the end-of-rollout batch deploy (see #13).
+- **Logs**: `data/us_east_fl_atl_n2_stitched_v2_run.log`, `data/us_east_fl_atl_n2_stitched_v2_build.log`.
+
+### #18 — `us_east_fl_atl_s_stitched_v2.sqlite` — Zeeland's verified tuning config, rolled out to US East Coast/FL (s) — HUB-COUNT CAVEAT
+
+```bash
+./build_region.sh us-east-fl-atl-s-stitched-v2 --states FL --source-region us-east-coast \
+  --clip-bbox "-81.91000000000001,24.09,-79.08999999999999,27.01" --overlap-deg 0.01 \
+  --stitch-registry data/seam_registry.sqlite \
+  --extra-pipeline-args "--sagitta-cap 250.0 --max-segment-m 2000 --axis-dedup-cap 100.0 --axis-dedup-floor-m 100.0 --min-navmesh-radius-m 1200.0 --connector-merge-m 5.0 --inland-densify-max-segment-m 120.0 --pass2-max-fanin-per-node 6 --pass0-target-fanin-cap 4 --node-merge-m 5.0"
+```
+
+- **Purpose**: region 6/19 of the US East Coast tuning rollout (see #13). Build
+  itself completed cleanly (exit 0, no errors/tracebacks, 10m16s), `crosses_land=0`
+  (the hard safety invariant this project tracks is unaffected).
+- **Anomaly found**: unlike every other region in this rollout so far (#13,#14,#16,
+  #17 all 0 hubs), this build has **4 hub nodes** (out-degree>30), max out-degree
+  **138** — closer to Zeeland's pre-`--pass0-target-fanin-cap`-fix era (builds
+  #2-#6, this file) than to the fixed builds this rollout is meant to replicate.
+  Diagnosed the top hub directly: node `412686405841089` at
+  `lat 24.63511, lon -81.58911` (Florida Keys, near Key West — this region's clip
+  covers open Gulf-of-Mexico/Atlantic approach water). 135/138 of its edges are
+  `edge_kind_id=1` (`navmesh_boundary`), each 240-495m long, `node_kind_id=0`
+  (`point`, not `navmesh_vertex`). The other 3 hubs (94/57/51 out-degree,
+  lat/lon 24.628-24.631/-81.589 to -81.592, ~150-350m from the first) show the
+  same pattern (majority `navmesh_boundary` edges from a plain `point`-kind node).
+  This looks like the same class of fan-out stitching problem
+  `--pass0-target-fanin-cap` (SPEC-GRAPH-DENSITY.md §6.7) was built to fix on
+  Zeeland, but recurring here specifically at a `navmesh_boundary`
+  (large-open-water navmesh perimeter) contact point rather than the plain
+  skeleton/inland stitching passes §6.7 targeted — i.e. `--min-navmesh-radius-m
+  1200.0` classifying a large chunk of this clip's open water as navmesh (likely a
+  large reef/channel/open-Gulf polygon near the Keys) may be exposing a fan-in
+  path into navmesh boundary stitching that Zeeland's own dataset (smaller,
+  mostly-inland Dutch coastal waters) never exercised at this scale. NOT
+  root-caused further here — out of scope for this rollout task, which is
+  applying Zeeland's already-verified config as-is, not re-tuning per region.
+- **Result vs currently-live** (`signalk-routeiq/data/us_east_fl_atl_s_stitched.sqlite`,
+  original build recipe/commit unknown/unreproduced):
+
+  | build | nodes | edges | hubs (od>30) | max out-deg | crosses_land |
+  |---|---|---|---|---|---|
+  | live (pre-tuning, unknown recipe) | 120,436 | 274,938 | n/a | n/a | n/a |
+  | **v2 (this build, tuning applied)** | **56,301** | **135,182** | **4** | **138** | **0** |
+
+  Edge count still drops by more than half vs the live baseline (same pattern as
+  every other region in this rollout), and `crosses_land=0` — this is still a
+  valid, land-safe routable graph, just with a worse hub-count/max-out-degree
+  profile than the rest of this rollout (and than the live db's own unknown
+  baseline, whose hub count was never measured — see table).
+- **Decision**: deployed anyway, per this task's brief (deploy every region whose
+  build *succeeds*; a soft quality regression on 4 nodes out of 56,301 is not a
+  build failure or a land-crossing safety issue). Flagged here as an open
+  follow-up: worth a dedicated investigation (mirroring #6/#7's Pass-0
+  diagnosis work) into navmesh-boundary fan-in specifically, if this recurs on
+  other large-open-water FL/Gulf regions.
+- **Installed live**: deferred to the end-of-rollout batch deploy (see #13).
+- **Logs**: `data/us_east_fl_atl_s_stitched_v2_run.log`, `data/us_east_fl_atl_s_stitched_v2_build.log`.
+
+### #19 — `us_east_fl_gulf_mid_stitched_v2.sqlite` — Zeeland's verified tuning config, rolled out to US East Coast/FL (gulf_mid)
+
+```bash
+./build_region.sh us-east-fl-gulf-mid-stitched-v2 --states FL --source-region us-east-coast \
+  --clip-bbox "-83.81,27.189999999999998,-82.19,29.21" --overlap-deg 0.01 \
+  --stitch-registry data/seam_registry.sqlite \
+  --extra-pipeline-args "--sagitta-cap 250.0 --max-segment-m 2000 --axis-dedup-cap 100.0 --axis-dedup-floor-m 100.0 --min-navmesh-radius-m 1200.0 --connector-merge-m 5.0 --inland-densify-max-segment-m 120.0 --pass2-max-fanin-per-node 6 --pass0-target-fanin-cap 4 --node-merge-m 5.0"
+```
+
+- **Purpose**: region 7/19 of the US East Coast tuning rollout (see #13). Clean
+  build — no hub-count anomaly (0 hubs, max out-deg 14), unlike #18.
+- **Result vs currently-live** (`signalk-routeiq/data/us_east_fl_gulf_mid_stitched.sqlite`,
+  original build recipe/commit unknown/unreproduced):
+
+  | build | nodes | edges | hubs (od>30) | max out-deg | crosses_land |
+  |---|---|---|---|---|---|
+  | live (pre-tuning, unknown recipe) | 68,876 | 170,296 | n/a | n/a | n/a |
+  | **v2 (this build, tuning applied)** | **36,755** | **87,270** | **0** | **14** | **0** |
+
+  No errors/tracebacks in the build log.
+- **Installed live**: deferred to the end-of-rollout batch deploy (see #13).
+- **Logs**: `data/us_east_fl_gulf_mid_stitched_v2_run.log`, `data/us_east_fl_gulf_mid_stitched_v2_build.log`.
+
+### #20 — `us_east_fl_gulf_pan_stitched_v2.sqlite` — Zeeland's verified tuning config, rolled out to US East Coast/FL (gulf_pan)
+
+```bash
+./build_region.sh us-east-fl-gulf-pan-stitched-v2 --states FL --source-region us-east-coast \
+  --clip-bbox "-88.16000000000001,28.99,-83.78999999999999,30.91" --overlap-deg 0.01 \
+  --stitch-registry data/seam_registry.sqlite \
+  --extra-pipeline-args "--sagitta-cap 250.0 --max-segment-m 2000 --axis-dedup-cap 100.0 --axis-dedup-floor-m 100.0 --min-navmesh-radius-m 1200.0 --connector-merge-m 5.0 --inland-densify-max-segment-m 120.0 --pass2-max-fanin-per-node 6 --pass0-target-fanin-cap 4 --node-merge-m 5.0"
+```
+
+- **Purpose**: region 8/19 of the US East Coast tuning rollout (see #13). Clean
+  build — no hub-count anomaly (0 hubs, max out-deg 25).
+- **Result vs currently-live** (`signalk-routeiq/data/us_east_fl_gulf_pan_stitched.sqlite`,
+  original build recipe/commit unknown/unreproduced):
+
+  | build | nodes | edges | hubs (od>30) | max out-deg | crosses_land |
+  |---|---|---|---|---|---|
+  | live (pre-tuning, unknown recipe) | 34,709 | 82,809 | n/a | n/a | n/a |
+  | **v2 (this build, tuning applied)** | **21,617** | **45,942** | **0** | **25** | **0** |
+
+  No errors/tracebacks in the build log.
+- **Installed live**: deferred to the end-of-rollout batch deploy (see #13).
+- **Logs**: `data/us_east_fl_gulf_pan_stitched_v2_run.log`, `data/us_east_fl_gulf_pan_stitched_v2_build.log`.
+
+### #21 — `us_east_fl_gulf_sw_stitched_v2.sqlite` — Zeeland's verified tuning config, rolled out to US East Coast/FL (gulf_sw) — SAME Key West hub caveat as #18
+
+```bash
+./build_region.sh us-east-fl-gulf-sw-stitched-v2 --states FL --source-region us-east-coast \
+  --clip-bbox "-82.91000000000001,24.09,-81.58999999999999,27.41" --overlap-deg 0.01 \
+  --stitch-registry data/seam_registry.sqlite \
+  --extra-pipeline-args "--sagitta-cap 250.0 --max-segment-m 2000 --axis-dedup-cap 100.0 --axis-dedup-floor-m 100.0 --min-navmesh-radius-m 1200.0 --connector-merge-m 5.0 --inland-densify-max-segment-m 120.0 --pass2-max-fanin-per-node 6 --pass0-target-fanin-cap 4 --node-merge-m 5.0"
+```
+
+- **Purpose**: region 9/19 of the US East Coast tuning rollout (see #13). Build
+  succeeded cleanly (exit 0, no errors, `crosses_land=0`), but has the same
+  `navmesh_boundary` fan-in hub anomaly as #18.
+- **Confirms #18's diagnosis**: 3 hub nodes, all at `lat 24.628-24.636,
+  lon -81.589` — **the same Key West location** as #18's 4 hubs. This region's
+  clip bbox (`-82.91..-81.59, 24.09..27.41`) genuinely overlaps #18's
+  (`-81.91..-79.09, 24.09..27.01`) between lon -81.91 and -81.59 (the Atlantic/
+  Gulf split intentionally double-covers the Keys from both sides) — so this is
+  the SAME real-world geometry producing the SAME `node_kind_id=0`
+  (`point`)-with-`navmesh_boundary`-fan-out pattern, not two independent
+  coincidences. Reinforces #18's hypothesis: a large open-water navmesh polygon
+  near Key West (`--min-navmesh-radius-m 1200.0`) is exposing a fan-in path this
+  rollout's config doesn't fully cap, specific to this location.
+- **Result vs currently-live** (`signalk-routeiq/data/us_east_fl_gulf_sw_stitched.sqlite`,
+  original build recipe/commit unknown/unreproduced):
+
+  | build | nodes | edges | hubs (od>30) | max out-deg | crosses_land |
+  |---|---|---|---|---|---|
+  | live (pre-tuning, unknown recipe) | 54,646 | 130,532 | n/a | n/a | n/a |
+  | **v2 (this build, tuning applied)** | **30,739** | **66,692** | **3** | **134** | **0** |
+
+- **Decision**: deployed anyway, same reasoning as #18 (build succeeded, land-safe,
+  soft quality issue confined to 3 nodes at one location). Both #18 and #21's
+  Key West hub findings should be revisited together in any future follow-up.
+- **Installed live**: deferred to the end-of-rollout batch deploy (see #13).
+- **Logs**: `data/us_east_fl_gulf_sw_stitched_v2_run.log`, `data/us_east_fl_gulf_sw_stitched_v2_build.log`.
+
+### #22 — `us_east_ma_stitched_v2.sqlite` — Zeeland's verified tuning config, rolled out to US East Coast/MA
+
+```bash
+./build_region.sh us-east-ma-stitched-v2 --states MA --source-region us-east-coast \
+  --clip-bbox "-71.71000000000001,41.190000000000005,-69.78999999999999,42.91" --overlap-deg 0.01 \
+  --stitch-registry data/seam_registry.sqlite \
+  --extra-pipeline-args "--sagitta-cap 250.0 --max-segment-m 2000 --axis-dedup-cap 100.0 --axis-dedup-floor-m 100.0 --min-navmesh-radius-m 1200.0 --connector-merge-m 5.0 --inland-densify-max-segment-m 120.0 --pass2-max-fanin-per-node 6 --pass0-target-fanin-cap 4 --node-merge-m 5.0"
+```
+
+- **Purpose**: region 10/19 of the US East Coast tuning rollout (see #13). Clean
+  build — no hub-count anomaly (0 hubs, max out-deg 22).
+- **Result vs currently-live** (`signalk-routeiq/data/us_east_ma_stitched.sqlite`,
+  original build recipe/commit unknown/unreproduced):
+
+  | build | nodes | edges | hubs (od>30) | max out-deg | crosses_land |
+  |---|---|---|---|---|---|
+  | live (pre-tuning, unknown recipe) | 54,767 | 139,185 | n/a | n/a | n/a |
+  | **v2 (this build, tuning applied)** | **36,898** | **87,637** | **0** | **22** | **0** |
+
+  No errors/tracebacks in the build log.
+- **Installed live**: deferred to the end-of-rollout batch deploy (see #13).
+- **Logs**: `data/us_east_ma_stitched_v2_run.log`, `data/us_east_ma_stitched_v2_build.log`.
+
+### #23 — `us_east_md_stitched_v2.sqlite` — Zeeland's verified tuning config, rolled out to US East Coast/MD
+
+```bash
+./build_region.sh us-east-md-stitched-v2 --states MD --source-region us-east-coast \
+  --clip-bbox "-77.39,37.89,-74.69,39.62" --overlap-deg 0.01 \
+  --stitch-registry data/seam_registry.sqlite \
+  --extra-pipeline-args "--sagitta-cap 250.0 --max-segment-m 2000 --axis-dedup-cap 100.0 --axis-dedup-floor-m 100.0 --min-navmesh-radius-m 1200.0 --connector-merge-m 5.0 --inland-densify-max-segment-m 120.0 --pass2-max-fanin-per-node 6 --pass0-target-fanin-cap 4 --node-merge-m 5.0"
+```
+
+- **Purpose**: region 11/19 of the US East Coast tuning rollout (see #13). Clean
+  build — no hub-count anomaly (0 hubs, max out-deg 16). Longest build so far
+  (12m11s) — Chesapeake Bay's dense inland waterway network.
+- **Result vs currently-live** (`signalk-routeiq/data/us_east_md_stitched.sqlite`,
+  original build recipe/commit unknown/unreproduced):
+
+  | build | nodes | edges | hubs (od>30) | max out-deg | crosses_land |
+  |---|---|---|---|---|---|
+  | live (pre-tuning, unknown recipe) | 92,169 | 203,448 | n/a | n/a | n/a |
+  | **v2 (this build, tuning applied)** | **54,766** | **129,606** | **0** | **16** | **0** |
+
+  No errors/tracebacks in the build log.
+- **Installed live**: deferred to the end-of-rollout batch deploy (see #13).
+- **Logs**: `data/us_east_md_stitched_v2_run.log`, `data/us_east_md_stitched_v2_build.log`.
+
+### #24 — `us_east_me_stitched_v2.sqlite` — Zeeland's verified tuning config, rolled out to US East Coast/ME
+
+```bash
+./build_region.sh us-east-me-stitched-v2 --states ME --source-region us-east-coast \
+  --clip-bbox "-70.81,43.04,-66.89,45.059999999999995" --overlap-deg 0.01 \
+  --stitch-registry data/seam_registry.sqlite \
+  --extra-pipeline-args "--sagitta-cap 250.0 --max-segment-m 2000 --axis-dedup-cap 100.0 --axis-dedup-floor-m 100.0 --min-navmesh-radius-m 1200.0 --connector-merge-m 5.0 --inland-densify-max-segment-m 120.0 --pass2-max-fanin-per-node 6 --pass0-target-fanin-cap 4 --node-merge-m 5.0"
+```
+
+- **Purpose**: region 12/19 of the US East Coast tuning rollout (see #13). Clean
+  build — no hub-count anomaly (0 hubs, max out-deg 17). Longest build so far
+  (13m38s) — Maine's famously convoluted, island-heavy coastline.
+- **Result vs currently-live** (`signalk-routeiq/data/us_east_me_stitched.sqlite`,
+  original build recipe/commit unknown/unreproduced):
+
+  | build | nodes | edges | hubs (od>30) | max out-deg | crosses_land |
+  |---|---|---|---|---|---|
+  | live (pre-tuning, unknown recipe) | 101,452 | 263,406 | n/a | n/a | n/a |
+  | **v2 (this build, tuning applied)** | **52,994** | **141,005** | **0** | **17** | **0** |
+
+  No errors/tracebacks in the build log.
+- **Installed live**: deferred to the end-of-rollout batch deploy (see #13).
+- **Logs**: `data/us_east_me_stitched_v2_run.log`, `data/us_east_me_stitched_v2_build.log`.
+
+### #25 — `us_east_nc_stitched_v2.sqlite` — Zeeland's verified tuning config, rolled out to US East Coast/NC
+
+```bash
+./build_region.sh us-east-nc-stitched-v2 --states NC --source-region us-east-coast \
+  --clip-bbox "-78.81,33.59,-75.19,36.71" --overlap-deg 0.01 \
+  --stitch-registry data/seam_registry.sqlite \
+  --extra-pipeline-args "--sagitta-cap 250.0 --max-segment-m 2000 --axis-dedup-cap 100.0 --axis-dedup-floor-m 100.0 --min-navmesh-radius-m 1200.0 --connector-merge-m 5.0 --inland-densify-max-segment-m 120.0 --pass2-max-fanin-per-node 6 --pass0-target-fanin-cap 4 --node-merge-m 5.0"
+```
+
+- **Purpose**: region 13/19 of the US East Coast tuning rollout (see #13). Clean
+  build — no hub-count anomaly (0 hubs, max out-deg 16). Longest build so far
+  (15m45s).
+- **File-size note**: output file is 153MB, much larger than the live db's 63MB
+  despite fewer nodes/edges (46,839/112,311 here vs live's 92,874/218,245) — checked
+  directly, this is NOT duplicated data or a regression: `navmesh_regions` has 520
+  polygon-geometry rows (NC's Outer Banks/barrier-island coastline is unusually
+  intricate), which drives file size independently of node/edge count. All other
+  table row counts look normal for this region's size.
+- **Result vs currently-live** (`signalk-routeiq/data/us_east_nc_stitched.sqlite`,
+  original build recipe/commit unknown/unreproduced):
+
+  | build | nodes | edges | hubs (od>30) | max out-deg | crosses_land |
+  |---|---|---|---|---|---|
+  | live (pre-tuning, unknown recipe) | 92,874 | 218,245 | n/a | n/a | n/a |
+  | **v2 (this build, tuning applied)** | **46,839** | **112,311** | **0** | **16** | **0** |
+
+  No errors/tracebacks in the build log.
+- **Installed live**: deferred to the end-of-rollout batch deploy (see #13).
+- **Logs**: `data/us_east_nc_stitched_v2_run.log`, `data/us_east_nc_stitched_v2_build.log`.
+
+### #26 — `us_east_nh_stitched_v2.sqlite` — Zeeland's verified tuning config, rolled out to US East Coast/NH
+
+```bash
+./build_region.sh us-east-nh-stitched-v2 --states NH --source-region us-east-coast \
+  --clip-bbox "-70.86,42.830000000000005,-70.08999999999999,43.12" --overlap-deg 0.01 \
+  --stitch-registry data/seam_registry.sqlite \
+  --extra-pipeline-args "--sagitta-cap 250.0 --max-segment-m 2000 --axis-dedup-cap 100.0 --axis-dedup-floor-m 100.0 --min-navmesh-radius-m 1200.0 --connector-merge-m 5.0 --inland-densify-max-segment-m 120.0 --pass2-max-fanin-per-node 6 --pass0-target-fanin-cap 4 --node-merge-m 5.0"
+```
+
+- **Purpose**: region 14/19 of the US East Coast tuning rollout (see #13). Clean
+  build — no hub-count anomaly (0 hubs, max out-deg 14). Smallest/fastest region
+  (48s) — NH's tiny coastline.
+- **Result vs currently-live** (`signalk-routeiq/data/us_east_nh_stitched.sqlite`,
+  original build recipe/commit unknown/unreproduced):
+
+  | build | nodes | edges | hubs (od>30) | max out-deg | crosses_land |
+  |---|---|---|---|---|---|
+  | live (pre-tuning, unknown recipe) | 5,117 | 12,894 | n/a | n/a | n/a |
+  | **v2 (this build, tuning applied)** | **8,524** | **15,333** | **0** | **14** | **0** |
+
+  Note: this is the first region where the v2 build's node/edge counts went UP
+  vs the live baseline (not down, unlike every other region so far) — expected
+  given the unknown live recipe (row #1's own caveat applies equally here: not a
+  controlled comparison). No errors/tracebacks in the build log.
+- **Installed live**: deferred to the end-of-rollout batch deploy (see #13).
+- **Logs**: `data/us_east_nh_stitched_v2_run.log`, `data/us_east_nh_stitched_v2_build.log`.
+
+### #27 — `us_east_nj_stitched_v2.sqlite` — Zeeland's verified tuning config, rolled out to US East Coast/NJ
+
+```bash
+./build_region.sh us-east-nj-stitched-v2 --states NJ --source-region us-east-coast \
+  --clip-bbox "-75.36,38.79,-73.30999999999999,40.559999999999995" --overlap-deg 0.01 \
+  --stitch-registry data/seam_registry.sqlite \
+  --extra-pipeline-args "--sagitta-cap 250.0 --max-segment-m 2000 --axis-dedup-cap 100.0 --axis-dedup-floor-m 100.0 --min-navmesh-radius-m 1200.0 --connector-merge-m 5.0 --inland-densify-max-segment-m 120.0 --pass2-max-fanin-per-node 6 --pass0-target-fanin-cap 4 --node-merge-m 5.0"
+```
+
+- **Purpose**: region 15/19 of the US East Coast tuning rollout (see #13). Clean
+  build — no hub-count anomaly (0 hubs, max out-deg 17).
+- **Result vs currently-live** (`signalk-routeiq/data/us_east_nj_stitched.sqlite`,
+  original build recipe/commit unknown/unreproduced):
+
+  | build | nodes | edges | hubs (od>30) | max out-deg | crosses_land |
+  |---|---|---|---|---|---|
+  | live (pre-tuning, unknown recipe) | 45,523 | 109,553 | n/a | n/a | n/a |
+  | **v2 (this build, tuning applied)** | **25,973** | **62,027** | **0** | **17** | **0** |
+
+  No errors/tracebacks in the build log.
+- **Installed live**: deferred to the end-of-rollout batch deploy (see #13).
+- **Logs**: `data/us_east_nj_stitched_v2_run.log`, `data/us_east_nj_stitched_v2_build.log`.
+
+### #28 — `us_east_ny_stitched_v2.sqlite` — Zeeland's verified tuning config, rolled out to US East Coast/NY
+
+```bash
+./build_region.sh us-east-ny-stitched-v2 --states NY --source-region us-east-coast \
+  --clip-bbox "-74.29,40.39,-73.39,42.71" --overlap-deg 0.01 \
+  --stitch-registry data/seam_registry.sqlite \
+  --extra-pipeline-args "--sagitta-cap 250.0 --max-segment-m 2000 --axis-dedup-cap 100.0 --axis-dedup-floor-m 100.0 --min-navmesh-radius-m 1200.0 --connector-merge-m 5.0 --inland-densify-max-segment-m 120.0 --pass2-max-fanin-per-node 6 --pass0-target-fanin-cap 4 --node-merge-m 5.0"
+```
+
+- **Purpose**: region 16/19 of the US East Coast tuning rollout (see #13). Clean
+  build — no hub-count anomaly (0 hubs, max out-deg 26). Note this `--states NY`
+  clip already excludes NY's non-Atlantic (Great Lakes/Finger Lakes) ENC cells via
+  its own `--clip-bbox` (per `build_region.sh`'s own doc comment on sub-region
+  mode), consistent with the live db's own scope.
+- **Result vs currently-live** (`signalk-routeiq/data/us_east_ny_stitched.sqlite`,
+  original build recipe/commit unknown/unreproduced):
+
+  | build | nodes | edges | hubs (od>30) | max out-deg | crosses_land |
+  |---|---|---|---|---|---|
+  | live (pre-tuning, unknown recipe) | 30,787 | 76,495 | n/a | n/a | n/a |
+  | **v2 (this build, tuning applied)** | **19,250** | **48,046** | **0** | **26** | **0** |
+
+  No errors/tracebacks in the build log.
+- **Installed live**: deferred to the end-of-rollout batch deploy (see #13).
+- **Logs**: `data/us_east_ny_stitched_v2_run.log`, `data/us_east_ny_stitched_v2_build.log`.
+
+### #29 — `us_east_ri_stitched_v2.sqlite` — Zeeland's verified tuning config, rolled out to US East Coast/RI
+
+```bash
+./build_region.sh us-east-ri-stitched-v2 --states RI --source-region us-east-coast \
+  --clip-bbox "-71.96000000000001,40.84,-71.03999999999999,41.91" --overlap-deg 0.01 \
+  --stitch-registry data/seam_registry.sqlite \
+  --extra-pipeline-args "--sagitta-cap 250.0 --max-segment-m 2000 --axis-dedup-cap 100.0 --axis-dedup-floor-m 100.0 --min-navmesh-radius-m 1200.0 --connector-merge-m 5.0 --inland-densify-max-segment-m 120.0 --pass2-max-fanin-per-node 6 --pass0-target-fanin-cap 4 --node-merge-m 5.0"
+```
+
+- **Purpose**: region 17/19 of the US East Coast tuning rollout (see #13). Clean
+  build — no hub-count anomaly (0 hubs, max out-deg 18).
+- **Result vs currently-live** (`signalk-routeiq/data/us_east_ri_stitched.sqlite`,
+  original build recipe/commit unknown/unreproduced):
+
+  | build | nodes | edges | hubs (od>30) | max out-deg | crosses_land |
+  |---|---|---|---|---|---|
+  | live (pre-tuning, unknown recipe) | 18,003 | 44,422 | n/a | n/a | n/a |
+  | **v2 (this build, tuning applied)** | **12,818** | **27,514** | **0** | **18** | **0** |
+
+  No errors/tracebacks in the build log.
+- **Installed live**: deferred to the end-of-rollout batch deploy (see #13).
+- **Logs**: `data/us_east_ri_stitched_v2_run.log`, `data/us_east_ri_stitched_v2_build.log`.
+
+### #30 — `us_east_sc_ga_stitched_v2.sqlite` — Zeeland's verified tuning config, rolled out to US East Coast/SC+GA
+
+```bash
+./build_region.sh us-east-sc-ga-stitched-v2 --states SC,GA --source-region us-east-coast \
+  --clip-bbox "-82.31,30.54,-77.89,33.71" --overlap-deg 0.01 \
+  --stitch-registry data/seam_registry.sqlite \
+  --extra-pipeline-args "--sagitta-cap 250.0 --max-segment-m 2000 --axis-dedup-cap 100.0 --axis-dedup-floor-m 100.0 --min-navmesh-radius-m 1200.0 --connector-merge-m 5.0 --inland-densify-max-segment-m 120.0 --pass2-max-fanin-per-node 6 --pass0-target-fanin-cap 4 --node-merge-m 5.0"
+```
+
+- **Purpose**: region 18/19 of the US East Coast tuning rollout (see #13). Clean
+  build — no hub-count anomaly (0 hubs, max out-deg 15). Second-longest build
+  (13m4s).
+- **File-size note**: output file is 197MB — the largest in this rollout, larger
+  even than NC (#25's 153MB) — despite fewer nodes/edges than NC. Same explanation
+  as #25: SC/GA's marsh-heavy Lowcountry coastline (Sea Islands, extensive tidal
+  marsh) drives up `navmesh_regions`/polygon geometry storage independently of
+  node/edge count; node/edge counts themselves are lower than the live baseline,
+  consistent with every other successful region in this rollout.
+- **Result vs currently-live** (`signalk-routeiq/data/us_east_sc_ga_stitched.sqlite`,
+  original build recipe/commit unknown/unreproduced):
+
+  | build | nodes | edges | hubs (od>30) | max out-deg | crosses_land |
+  |---|---|---|---|---|---|
+  | live (pre-tuning, unknown recipe) | 54,852 | 134,813 | n/a | n/a | n/a |
+  | **v2 (this build, tuning applied)** | **35,438** | **87,245** | **0** | **15** | **0** |
+
+  No errors/tracebacks in the build log.
+- **Installed live**: deferred to the end-of-rollout batch deploy (see #13).
+- **Logs**: `data/us_east_sc_ga_stitched_v2_run.log`, `data/us_east_sc_ga_stitched_v2_build.log`.
+
+### #31 — `us_east_va_stitched_v2.sqlite` — Zeeland's verified tuning config, rolled out to US East Coast/VA (FINAL region, 19/19)
+
+```bash
+./build_region.sh us-east-va-stitched-v2 --states VA --source-region us-east-coast \
+  --clip-bbox "-77.61,36.39,-75.19,37.96" --overlap-deg 0.01 \
+  --stitch-registry data/seam_registry.sqlite \
+  --extra-pipeline-args "--sagitta-cap 250.0 --max-segment-m 2000 --axis-dedup-cap 100.0 --axis-dedup-floor-m 100.0 --min-navmesh-radius-m 1200.0 --connector-merge-m 5.0 --inland-densify-max-segment-m 120.0 --pass2-max-fanin-per-node 6 --pass0-target-fanin-cap 4 --node-merge-m 5.0"
+```
+
+- **Purpose**: region 19/19 (final) of the US East Coast tuning rollout (see #13).
+  Clean build — no hub-count anomaly (0 hubs, max out-deg 17).
+- **Result vs currently-live** (`signalk-routeiq/data/us_east_va_stitched.sqlite`,
+  original build recipe/commit unknown/unreproduced):
+
+  | build | nodes | edges | hubs (od>30) | max out-deg | crosses_land |
+  |---|---|---|---|---|---|
+  | live (pre-tuning, unknown recipe) | 97,820 | 222,859 | n/a | n/a | n/a |
+  | **v2 (this build, tuning applied)** | **59,443** | **143,046** | **0** | **17** | **0** |
+
+  No errors/tracebacks in the build log.
+- **Installed live**: deferred to the end-of-rollout batch deploy (see below).
+- **Logs**: `data/us_east_va_stitched_v2_run.log`, `data/us_east_va_stitched_v2_build.log`.
+
+### Rollout summary — US East Coast tuning rollout (builds #13-#31, 2026-09-06/07)
+
+19 regions attempted, applying Zeeland build #10's exact verified-safe tuning
+config via the new `build_region.sh --extra-pipeline-args` passthrough (`8652bda`).
+**18/19 succeeded, 1 failed** (`fl_atl_n1a`, #15, OOM-killed twice — see that
+entry; live file left untouched, not deployed).
+
+Two regions (`fl_atl_s` #18, `fl_gulf_sw` #21) show a hub-count anomaly (4 and 3
+hubs respectively, max out-degree up to 138) traced to the same real-world
+location (Key West, where their clip bboxes genuinely overlap) — a
+`navmesh_boundary` fan-in pattern not seen anywhere else in this rollout or in
+any Zeeland build. Both still have `crosses_land=0` and were deployed per this
+task's success criteria (build succeeded, land-safe); flagged as an open
+follow-up. All other 16 successful regions show 0 hubs, matching Zeeland's own
+best builds (#7-#10).
+
+**Aggregate node/edge counts across the 18 successfully-rebuilt regions**
+(live/pre-tuning vs v2/tuning-applied; `fl_atl_n1a` excluded from both sides since
+it wasn't rebuilt):
+
+| | nodes | edges |
+|---|---|---|
+| live (18 regions, pre-tuning) | 986,204 | 2,357,006 |
+| v2 (18 regions, tuning applied) | 576,734 | 1,367,338 |
+| delta | −409,470 (−41.5%) | −989,668 (−42.0%) |
+
+These aggregate deltas are descriptive only, not a controlled measurement of the
+Zeeland tuning's own effect — every live baseline here uses an unknown,
+unreproduced recipe (same caveat as row #1), so the totals also bundle whatever
+that unknown recipe itself differed by. Directionally consistent with the
+reduction seen on Zeeland between its own pre-tuning and post-tuning (#7-#10)
+builds, and with every individual region above: every successful region's v2
+build has fewer nodes/edges than its live counterpart except `nh` (small enough
+that the unknown live recipe's own baseline was likely built differently).
 
 ## Resolved: why the live db (#1) had only 5 hubs when #2-#6 had 56-231
 
