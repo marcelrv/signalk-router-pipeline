@@ -51,6 +51,7 @@ Nodes/Edges delta.
 | 24 | 2026-09-07 | `034892c` | `data/geojson/me_reclip` (re-derived via `data/raw/us-east-coast/ME`) | same tuning config as #13, applied to `us_east_me_stitched` | Roll out Zeeland's tuning config, region 12/19 | 52,994 | 141,005 | 0 | 17 | 0 | **YES** |
 | 25 | 2026-09-07 | `b8372ae` | `data/geojson/nc_reclip` (re-derived via `data/raw/us-east-coast/NC`) | same tuning config as #13, applied to `us_east_nc_stitched` | Roll out Zeeland's tuning config, region 13/19 | 46,839 | 112,311 | 0 | 16 | 0 | **YES** |
 | 26 | 2026-09-07 | `7d5dbbb` | `data/geojson/nh_reclip` (re-derived via `data/raw/us-east-coast/NH`) | same tuning config as #13, applied to `us_east_nh_stitched` | Roll out Zeeland's tuning config, region 14/19 | 8,524 | 15,333 | 0 | 14 | 0 | **YES** |
+| 27 | 2026-09-07 | `39dfeac` | `data/geojson/nj_reclip` (re-derived via `data/raw/us-east-coast/NJ`) | same tuning config as #13, applied to `us_east_nj_stitched` | Roll out Zeeland's tuning config, region 15/19 | 25,973 | 62,027 | 0 | 17 | 0 | **YES** |
 
 **Row #1 is not a valid comparison baseline** — its input clip/flags are unknown, so
 its counts cannot be attributed to any specific configuration. It's recorded because
@@ -889,6 +890,29 @@ investigation.
   controlled comparison). No errors/tracebacks in the build log.
 - **Installed live**: deferred to the end-of-rollout batch deploy (see #13).
 - **Logs**: `data/us_east_nh_stitched_v2_run.log`, `data/us_east_nh_stitched_v2_build.log`.
+
+### #27 — `us_east_nj_stitched_v2.sqlite` — Zeeland's verified tuning config, rolled out to US East Coast/NJ
+
+```
+./build_region.sh us-east-nj-stitched-v2 --states NJ --source-region us-east-coast \
+  --clip-bbox "-75.36,38.79,-73.30999999999999,40.559999999999995" --overlap-deg 0.01 \
+  --stitch-registry data/seam_registry.sqlite \
+  --extra-pipeline-args "--sagitta-cap 250.0 --max-segment-m 2000 --axis-dedup-cap 100.0 --axis-dedup-floor-m 100.0 --min-navmesh-radius-m 1200.0 --connector-merge-m 5.0 --inland-densify-max-segment-m 120.0 --pass2-max-fanin-per-node 6 --pass0-target-fanin-cap 4 --node-merge-m 5.0"
+```
+
+- **Purpose**: region 15/19 of the US East Coast tuning rollout (see #13). Clean
+  build — no hub-count anomaly (0 hubs, max out-deg 17).
+- **Result vs currently-live** (`signalk-routeiq/data/us_east_nj_stitched.sqlite`,
+  original build recipe/commit unknown/unreproduced):
+
+  | build | nodes | edges | hubs (od>30) | max out-deg | crosses_land |
+  |---|---|---|---|---|---|
+  | live (pre-tuning, unknown recipe) | 45,523 | 109,553 | n/a | n/a | n/a |
+  | **v2 (this build, tuning applied)** | **25,973** | **62,027** | **0** | **17** | **0** |
+
+  No errors/tracebacks in the build log.
+- **Installed live**: deferred to the end-of-rollout batch deploy (see #13).
+- **Logs**: `data/us_east_nj_stitched_v2_run.log`, `data/us_east_nj_stitched_v2_build.log`.
 
 ## Resolved: why the live db (#1) had only 5 hubs when #2-#6 had 56-231
 
