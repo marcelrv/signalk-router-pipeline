@@ -40,6 +40,7 @@ Nodes/Edges delta.
 | 13 | 2026-09-06 | `8652bda` | `data/geojson/ct_reclip` (re-derived via `data/raw/us-east-coast/CT`) | Zeeland build #10's tuning config (`--sagitta-cap 250.0 --max-segment-m 2000 --axis-dedup-cap 100.0 --axis-dedup-floor-m 100.0 --min-navmesh-radius-m 1200.0 --connector-merge-m 5.0 --inland-densify-max-segment-m 120.0 --pass2-max-fanin-per-node 6 --pass0-target-fanin-cap 4 --node-merge-m 5.0`) applied to US East Coast region `us_east_ct_stitched` | Roll out Zeeland's verified density-tuning config to US East Coast regions | 20,359 | 47,902 | 0 | 19 | 0 | **YES** |
 | 14 | 2026-09-06 | `708de40` | `data/geojson/de_reclip` (re-derived via `data/raw/us-east-coast/DE`) | same tuning config as #13, applied to `us_east_de_stitched` | Roll out Zeeland's tuning config, region 2/19 | 19,420 | 45,378 | 0 | 16 | 0 | **YES** |
 | 15 | 2026-09-07 | `8f60b9e` | `data/geojson/fl_atl_n1a_reclip` (re-derived via `data/raw/us-east-coast/FL`) | same tuning config as #13, applied to `us_east_fl_atl_n1a_stitched` | Roll out Zeeland's tuning config, region 3/19 | n/a | n/a | n/a | n/a | n/a | **FAILED — OOM-killed twice, not deployed** |
+| 16 | 2026-09-07 | `f5994a5` | `data/geojson/fl_atl_n1b_reclip` (re-derived via `data/raw/us-east-coast/FL`) | same tuning config as #13, applied to `us_east_fl_atl_n1b_stitched` | Roll out Zeeland's tuning config, region 4/19 | 9,358 | 17,441 | 0 | 15 | 0 | **YES** |
 
 **Row #1 is not a valid comparison baseline** — its input clip/flags are unknown, so
 its counts cannot be attributed to any specific configuration. It's recorded because
@@ -565,6 +566,31 @@ investigation.
   clip's geometry).
 - **Logs**: `data/us_east_fl_atl_n1a_stitched_v2_run.log` (both attempts
   overwrite the same file; only the second/final attempt's content survives).
+
+### #16 — `us_east_fl_atl_n1b_stitched_v2.sqlite` — Zeeland's verified tuning config, rolled out to US East Coast/FL (n1b)
+
+```
+./build_region.sh us-east-fl-atl-n1b-stitched-v2 --states FL --source-region us-east-coast \
+  --clip-bbox "-81.91000000000001,28.79,-79.39,29.91" --overlap-deg 0.01 \
+  --stitch-registry data/seam_registry.sqlite \
+  --extra-pipeline-args "--sagitta-cap 250.0 --max-segment-m 2000 --axis-dedup-cap 100.0 --axis-dedup-floor-m 100.0 --min-navmesh-radius-m 1200.0 --connector-merge-m 5.0 --inland-densify-max-segment-m 120.0 --pass2-max-fanin-per-node 6 --pass0-target-fanin-cap 4 --node-merge-m 5.0"
+```
+
+- **Purpose**: region 4/19 of the US East Coast tuning rollout (see #13).
+  Succeeded cleanly this time despite being the same FL raw data as #15's
+  OOM-killed n1a clip — a different (adjacent, further south) bbox from the same
+  state, so the working-set size clearly varies a lot by clip, not just by state.
+- **Result vs currently-live** (`signalk-routeiq/data/us_east_fl_atl_n1b_stitched.sqlite`,
+  original build recipe/commit unknown/unreproduced):
+
+  | build | nodes | edges | hubs (od>30) | max out-deg | crosses_land |
+  |---|---|---|---|---|---|
+  | live (pre-tuning, unknown recipe) | 11,394 | 27,732 | n/a | n/a | n/a |
+  | **v2 (this build, tuning applied)** | **9,358** | **17,441** | **0** | **15** | **0** |
+
+  No errors/tracebacks in the build log; 0 hubs, 0 crosses_land.
+- **Installed live**: deferred to the end-of-rollout batch deploy (see #13).
+- **Logs**: `data/us_east_fl_atl_n1b_stitched_v2_run.log`, `data/us_east_fl_atl_n1b_stitched_v2_build.log`.
 
 ## Resolved: why the live db (#1) had only 5 hubs when #2-#6 had 56-231
 
