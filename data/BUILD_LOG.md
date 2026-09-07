@@ -56,6 +56,7 @@ Nodes/Edges delta.
 | 29 | 2026-09-07 | `5e4f530` | `data/geojson/ri_reclip` (re-derived via `data/raw/us-east-coast/RI`) | same tuning config as #13, applied to `us_east_ri_stitched` | Roll out Zeeland's tuning config, region 17/19 | 12,818 | 27,514 | 0 | 18 | 0 | **YES** |
 | 30 | 2026-09-07 | `273b563` | `data/geojson/sc_ga_reclip` (re-derived via `data/raw/us-east-coast/SC,GA`) | same tuning config as #13, applied to `us_east_sc_ga_stitched` | Roll out Zeeland's tuning config, region 18/19 | 35,438 | 87,245 | 0 | 15 | 0 | **YES** |
 | 31 | 2026-09-07 | `eeb3fed` | `data/geojson/va_reclip` (re-derived via `data/raw/us-east-coast/VA`) | same tuning config as #13, applied to `us_east_va_stitched` | Roll out Zeeland's tuning config, region 19/19 (final) | 59,443 | 143,046 | 0 | 17 | 0 | **YES** |
+| 32 | 2026-09-07 | `453586c` (PR #22, `_safe_negative_buffer` fix) | `data/geojson/fl_atl_n1a_reclip` (re-derived via `data/raw/us-east-coast/FL`) | same tuning config as #13, run under `ulimit -v 11GB` | `fl_atl_n1a` retry after root-causing and fixing its OOM (see Details) | 12,207 | 31,491 | 0 | 16 | 0 | **YES** |
 
 **Row #1 is not a valid comparison baseline** — its input clip/flags are unknown, so
 its counts cannot be attributed to any specific configuration. It's recorded because
@@ -1054,6 +1055,74 @@ reduction seen on Zeeland between its own pre-tuning and post-tuning (#7-#10)
 builds, and with every individual region above: every successful region's v2
 build has fewer nodes/edges than its live counterpart except `nh` (small enough
 that the unknown live recipe's own baseline was likely built differently).
+
+### #32 — `us_east_fl_atl_n1a_stitched.sqlite` — `fl_atl_n1a` OOM root-caused and fixed (PR #22)
+
+```bash
+ulimit -v $((11*1024*1024))  # 11GB virtual-memory cap -- see "why the ulimit
+                              # matters" below; without it this build is a race
+                              # against the host's OOM-killer, not a fix.
+./build_region.sh us-east-fl-atl-n1a-retry2 --states FL --source-region us-east-coast \
+  --clip-bbox "-81.91000000000001,29.79,-79.39,30.71" --overlap-deg 0.01 \
+  --stitch-registry data/seam_registry.sqlite \
+  --extra-pipeline-args "--sagitta-cap 250.0 --max-segment-m 2000 --axis-dedup-cap 100.0 --axis-dedup-floor-m 100.0 --min-navmesh-radius-m 1200.0 --connector-merge-m 5.0 --inland-densify-max-segment-m 120.0 --pass2-max-fanin-per-node 6 --pass0-target-fanin-cap 4 --node-merge-m 5.0"
+```
+
+- **Root cause** (see PR #22 for the full investigation): `_split_wide_narrow`'s
+  `cleaned.buffer(-1200.0, quad_segs=16)` (the `--min-navmesh-radius-m` erosion
+  step) raises `GEOSException: std::bad_alloc` on this region's single
+  ~45k-vertex connected `coastal_water` component (this clip's entire water
+  area merges into one giant polygon). Confirmed via `dmesg`: both original
+  attempts show the `python3` process at ~14.7-14.8GB RSS at the moment of
+  kill. **Not a scale problem** -- `fl_atl_n1a`'s raw feature/vertex counts are
+  smaller than several regions (`fl_atl_s`, `sc_ga`, `nc`, builds #18/#30/#25)
+  that built successfully with no issue; it's a specific GEOS pathology on this
+  one polygon's geometry, reproduced directly and isolated outside the pipeline
+  (memory-capped, to avoid risking this shared host while investigating).
+- **Fix**: `_safe_negative_buffer` (`nautical_routing_pipeline.py`) retries a
+  failed negative buffer with progressively coarser simplification (50m, then
+  100m -- smaller tolerances were measured to be insufficient for this real
+  case) before giving up, with an explicit `gc.collect()` between attempts
+  (measured directly: without it, even a tolerance that succeeds in isolation
+  kept failing when tried right after a failed attempt in the same process --
+  glibc/GEOS's allocator doesn't reliably return freed memory to the OS after a
+  failed huge allocation). Only activates after the unmodified `buffer()` call
+  actually raises, so every other currently-working build is byte-for-byte
+  unaffected.
+- **Why the `ulimit` matters -- a second, independent finding.** The fix alone
+  was NOT sufficient on the first retry attempt (`us-east-fl-atl-n1a-retry`,
+  no `ulimit`): it OOM-killed again, this time triggered by a DIFFERENT process
+  (`claude`, not `python3`) once overall system memory (not just this one
+  process) ran low on this shared, multi-service host -- the Linux OOM-killer
+  sends an uncatchable `SIGKILL` once the whole system is critically low,
+  which no amount of Python/GEOS exception handling can intercept, regardless
+  of how well `_safe_negative_buffer` itself is written. Wrapping the build in
+  `ulimit -v 11GB` converts that race into a clean, catchable
+  `GEOSException`/`MemoryError` *for this process specifically*, well before
+  the host-wide OOM-killer would otherwise strike unpredictably -- confirmed:
+  the exact same code failed once without the `ulimit` and succeeded with it,
+  on the same host, minutes apart. **Open follow-up**: `build_region.sh` does
+  not set any per-build memory ceiling today; every other region in this
+  rollout happened not to need one, but a future large/complex region could
+  hit the same unpredictable-OOM-killer race. Worth considering a default
+  `ulimit -v` in `build_region.sh` itself -- not done here since it changes
+  behavior for every future build on this shared host, a decision left open
+  rather than made unilaterally.
+- **Result**: 0 hubs, max out-degree 16, `crosses_land=0` -- clean, matching
+  every other successfully-tuned region in this rollout. Edges 33,400 (live,
+  pre-tuning) -> 31,491 (a smaller ~5.7% reduction than most other regions,
+  consistent with this region's water being mostly open-water/navmesh rather
+  than dense skeleton/inland channel -- not a red flag, no controlled-comparison
+  claim intended here either, same caveat as row #1).
+- **Regression coverage**: `tests/test_safe_negative_buffer.py` (7 tests).
+  Full suite: 273/273 passing.
+- **Installed live** 2026-09-07 (`signalk-routeiq/data/us_east_fl_atl_n1a_stitched.sqlite`,
+  previous live db -- the original, never-superseded pre-rollout file --
+  backed up to `us_east_fl_atl_n1a_stitched_pre_zeelandtuning.sqlite.bak`;
+  `signalk-server` restarted).
+- **Logs**: `data/us_east_fl_atl_n1a_retry2_run.log`. (The two failed attempts'
+  logs, `data/us_east_fl_atl_n1a_stitched_v2_run.log` and
+  `data/us_east_fl_atl_n1a_retry_run.log`, are kept for the record.)
 
 ## Resolved: why the live db (#1) had only 5 hubs when #2-#6 had 56-231
 
