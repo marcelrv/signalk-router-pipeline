@@ -14,6 +14,7 @@
 #   ./build_region.sh <name> --states ME,NH,MA,RI,CT [--source-region us-east-coast]
 #                      [--clip-bbox "min_lon,min_lat,max_lon,max_lat"] [--overlap-deg 0.02]
 #                      [--stitch-registry data/seam_registry.sqlite]
+#                      [--extra-pipeline-args "--sagitta-cap 250.0 --node-merge-m 5.0"]
 #
 # Round 25 cross-database seam stitching: pass --stitch-registry to adopt/publish
 # shared seam nodes against a global-node registry SQLite (see STITCHING_DESIGN.md
@@ -22,6 +23,12 @@
 # by --overlap-deg -- the same expansion clip_pilot_data.py itself applies, so it
 # matches the actual clipped data extent. Omit --stitch-registry entirely for
 # unchanged single-region behavior.
+#
+# --extra-pipeline-args "..." passes its value through verbatim (word-split) to
+# the nautical_routing_pipeline.py invocation in step 3/3, appended after this
+# script's own flags -- e.g. the density-tuning flags
+# (--sagitta-cap/--axis-dedup-cap/--node-merge-m/etc., see SPEC-GRAPH-DENSITY.md)
+# without hand-editing this script per run.
 #
 # Examples:
 #   ./build_region.sh us-east-coast
@@ -37,7 +44,7 @@ cd "$BACKEND_DIR"
 
 if [ $# -lt 1 ]; then
     echo "Usage: $0 <region> [--force] [--name \"Human Name\"] [--depth-ceiling 6.0]" >&2
-    echo "       $0 <name> --states ST1,ST2 [--source-region us-east-coast] [--clip-bbox \"min_lon,min_lat,max_lon,max_lat\"] [--overlap-deg 0.02]" >&2
+    echo "       $0 <name> --states ST1,ST2 [--source-region us-east-coast] [--clip-bbox \"min_lon,min_lat,max_lon,max_lat\"] [--overlap-deg 0.02] [--extra-pipeline-args \"...\"]" >&2
     echo "Run scripts/download_noaa.py --list-regions to see available region keys." >&2
     exit 1
 fi
@@ -54,6 +61,7 @@ OVERLAP_DEG=""
 STITCH_REGISTRY=""
 STITCH_BAND_M=""
 STITCH_RADIUS_M=""
+EXTRA_PIPELINE_ARGS=""
 while [ $# -gt 0 ]; do
     case "$1" in
         --force) FORCE="--force"; shift ;;
@@ -66,6 +74,7 @@ while [ $# -gt 0 ]; do
         --stitch-registry) STITCH_REGISTRY="$2"; shift 2 ;;
         --stitch-band-m) STITCH_BAND_M="$2"; shift 2 ;;
         --stitch-radius-m) STITCH_RADIUS_M="$2"; shift 2 ;;
+        --extra-pipeline-args) EXTRA_PIPELINE_ARGS="$2"; shift 2 ;;
         *) echo "Unknown option: $1" >&2; exit 1 ;;
     esac
 done
@@ -168,6 +177,14 @@ PYEOF
     fi
 fi
 
+EXTRA_PIPELINE_ARGS_ARR=()
+if [ -n "$EXTRA_PIPELINE_ARGS" ]; then
+    # Word-split on purpose (like $FORCE above) -- this is a plain space-
+    # separated list of flags/values (e.g. "--sagitta-cap 250.0 --node-merge-m
+    # 5.0"), not a single token, so it must NOT be double-quoted below.
+    read -ra EXTRA_PIPELINE_ARGS_ARR <<< "$EXTRA_PIPELINE_ARGS"
+fi
+
 step "3/3 build routing graph -> $OUTPUT"
 time "$PYTHON" nautical_routing_pipeline.py \
     --input-dir "$GEOJSON_DIR" \
@@ -181,6 +198,7 @@ time "$PYTHON" nautical_routing_pipeline.py \
     --copyright "NOAA Office of Coast Survey" \
     --depth-ceiling "$DEPTH_CEILING" \
     "${STITCH_ARGS[@]}" \
+    "${EXTRA_PIPELINE_ARGS_ARR[@]}" \
     2>&1 | tee "${LOG_PREFIX}_build.log"
 
 echo
