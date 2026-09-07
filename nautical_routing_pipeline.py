@@ -1,4 +1,5 @@
 import os
+import gc
 import math
 import bisect
 import inspect
@@ -21,6 +22,7 @@ import shapely
 from shapely.geometry import Point, LineString, Polygon, MultiPoint, MultiLineString, MultiPolygon, mapping, box
 from shapely.ops import triangulate, unary_union, polygonize
 from shapely.validation import make_valid
+from shapely.errors import GEOSException
 from pyproj import Geod
 
 # Phase 0 navmesh-hybrid skeleton extraction (Step C). Hard deps per requirements.txt.
@@ -2075,12 +2077,63 @@ class NauticalRoutingPipeline:
         coordinates (avoids precision drift if recomputed independently later).
         """
         cleaned = poly_m.buffer(0).simplify(simplify_tol_m)
-        eroded = cleaned.buffer(-radius_m, quad_segs=16)
+        eroded = self._safe_negative_buffer(cleaned, radius_m)
         wide = eroded.buffer(radius_m, quad_segs=16).buffer(0).intersection(cleaned)
         narrow = cleaned.difference(wide).buffer(0)
         wide, narrow = self._clean_polygonal(wide), self._clean_polygonal(narrow)
         seam = wide.boundary.intersection(narrow.boundary)
         return wide, narrow, seam
+
+    def _safe_negative_buffer(self, geom, radius_m: float, quad_segs: int = 16):
+        """SPEC-GRAPH-DENSITY.md: `geom.buffer(-radius_m)` on an unusually large,
+        highly complex polygon can exhaust GEOS's own working memory during the
+        offset-curve computation -- confirmed directly: a real ~45k-vertex
+        `coastal_water` connected component (a whole region's water merged into
+        one piece, us-east-fl-atl-n1a) raised `GEOSException: std::bad_alloc` at
+        `--min-navmesh-radius-m 1200.0`, twice OOM-killing the whole build before
+        this even ran (the exception itself was never reached -- the process died
+        first). Reproduced directly, memory-capped, outside the pipeline: still
+        failed after `_split_wide_narrow`'s existing 1.0m pre-simplify, and even
+        at 10m/25m tolerance -- only 50m+ reliably succeeded, so the ladder below
+        starts there rather than wasting attempts on tolerances already known to
+        be insufficient for a genuinely pathological polygon.
+
+        Each failed attempt's `gc.collect()` is not cosmetic: measured directly,
+        chaining escalating tolerances WITHOUT it (even ones individually
+        verified to succeed in isolation) kept failing in sequence within the
+        same process -- glibc/GEOS's own allocator does not necessarily return
+        freed memory to the OS after a failed huge allocation, so a prior
+        failed attempt can "poison" a later one that would otherwise fit.
+        `gc.collect()` between attempts is what makes the later, larger-
+        tolerance attempt actually succeed reliably.
+
+        Falls back to progressively coarser simplification ONLY after the plain
+        call actually fails -- every currently-working build's geometry is
+        untouched (this never runs unless the unmodified buffer already raised),
+        so it's a pure safety net, not a change to normal wide/narrow
+        classification precision. Matches this file's established "degrade
+        gracefully instead of crashing the whole build" convention (see
+        `_rasterize_water_polygon`'s pixel-enlarging fallback for the same
+        pattern applied to raster size instead of buffer complexity).
+        """
+        try:
+            return geom.buffer(-radius_m, quad_segs=quad_segs)
+        except (GEOSException, MemoryError):
+            pass
+        gc.collect()
+        for tol_m in (50.0, 100.0):
+            try:
+                result = geom.simplify(tol_m).buffer(-radius_m, quad_segs=quad_segs)
+            except (GEOSException, MemoryError):
+                gc.collect()
+                continue
+            logger.warning(f"  Negative buffer (-{radius_m:.0f}m) failed on the full-detail "
+                            f"polygon; succeeded after simplifying to {tol_m:.0f}m tolerance "
+                            f"first (wide/narrow split boundary here is coarser than usual).")
+            return result
+        raise GEOSException(
+            f"Negative buffer (-{radius_m:.0f}m) failed even after simplifying up to 100m "
+            f"tolerance -- polygon is too large/complex for this operation.")
 
     def _clean_polygonal(self, geom) -> Polygon:
         """Keep only a geometry's polygonal parts, re-unioned into one clean
