@@ -45,6 +45,7 @@ Nodes/Edges delta.
 | 18 | 2026-09-07 | `fd316bf` | `data/geojson/fl_atl_s_reclip` (re-derived via `data/raw/us-east-coast/FL`) | same tuning config as #13, applied to `us_east_fl_atl_s_stitched` | Roll out Zeeland's tuning config, region 6/19 | 56,301 | 135,182 | **4** | **138** | 0 | **YES (see hub-count caveat in Details)** |
 | 19 | 2026-09-07 | `19df1ef` | `data/geojson/fl_gulf_mid_reclip` (re-derived via `data/raw/us-east-coast/FL`) | same tuning config as #13, applied to `us_east_fl_gulf_mid_stitched` | Roll out Zeeland's tuning config, region 7/19 | 36,755 | 87,270 | 0 | 14 | 0 | **YES** |
 | 20 | 2026-09-07 | `ad5f094` | `data/geojson/fl_gulf_pan_reclip` (re-derived via `data/raw/us-east-coast/FL`) | same tuning config as #13, applied to `us_east_fl_gulf_pan_stitched` | Roll out Zeeland's tuning config, region 8/19 | 21,617 | 45,942 | 0 | 25 | 0 | **YES** |
+| 21 | 2026-09-07 | `1e75c67` | `data/geojson/fl_gulf_sw_reclip` (re-derived via `data/raw/us-east-coast/FL`) | same tuning config as #13, applied to `us_east_fl_gulf_sw_stitched` | Roll out Zeeland's tuning config, region 9/19 | 30,739 | 66,692 | **3** | **134** | 0 | **YES (same Key West hub caveat as #18)** |
 
 **Row #1 is not a valid comparison baseline** — its input clip/flags are unknown, so
 its counts cannot be attributed to any specific configuration. It's recorded because
@@ -719,6 +720,42 @@ investigation.
   No errors/tracebacks in the build log.
 - **Installed live**: deferred to the end-of-rollout batch deploy (see #13).
 - **Logs**: `data/us_east_fl_gulf_pan_stitched_v2_run.log`, `data/us_east_fl_gulf_pan_stitched_v2_build.log`.
+
+### #21 — `us_east_fl_gulf_sw_stitched_v2.sqlite` — Zeeland's verified tuning config, rolled out to US East Coast/FL (gulf_sw) — SAME Key West hub caveat as #18
+
+```
+./build_region.sh us-east-fl-gulf-sw-stitched-v2 --states FL --source-region us-east-coast \
+  --clip-bbox "-82.91000000000001,24.09,-81.58999999999999,27.41" --overlap-deg 0.01 \
+  --stitch-registry data/seam_registry.sqlite \
+  --extra-pipeline-args "--sagitta-cap 250.0 --max-segment-m 2000 --axis-dedup-cap 100.0 --axis-dedup-floor-m 100.0 --min-navmesh-radius-m 1200.0 --connector-merge-m 5.0 --inland-densify-max-segment-m 120.0 --pass2-max-fanin-per-node 6 --pass0-target-fanin-cap 4 --node-merge-m 5.0"
+```
+
+- **Purpose**: region 9/19 of the US East Coast tuning rollout (see #13). Build
+  succeeded cleanly (exit 0, no errors, `crosses_land=0`), but has the same
+  `navmesh_boundary` fan-in hub anomaly as #18.
+- **Confirms #18's diagnosis**: 3 hub nodes, all at `lat 24.628-24.636,
+  lon -81.589` — **the same Key West location** as #18's 4 hubs. This region's
+  clip bbox (`-82.91..-81.59, 24.09..27.41`) genuinely overlaps #18's
+  (`-81.91..-79.09, 24.09..27.01`) between lon -81.91 and -81.59 (the Atlantic/
+  Gulf split intentionally double-covers the Keys from both sides) — so this is
+  the SAME real-world geometry producing the SAME `node_kind_id=0`
+  (`point`)-with-`navmesh_boundary`-fan-out pattern, not two independent
+  coincidences. Reinforces #18's hypothesis: a large open-water navmesh polygon
+  near Key West (`--min-navmesh-radius-m 1200.0`) is exposing a fan-in path this
+  rollout's config doesn't fully cap, specific to this location.
+- **Result vs currently-live** (`signalk-routeiq/data/us_east_fl_gulf_sw_stitched.sqlite`,
+  original build recipe/commit unknown/unreproduced):
+
+  | build | nodes | edges | hubs (od>30) | max out-deg | crosses_land |
+  |---|---|---|---|---|---|
+  | live (pre-tuning, unknown recipe) | 54,646 | 130,532 | n/a | n/a | n/a |
+  | **v2 (this build, tuning applied)** | **30,739** | **66,692** | **3** | **134** | **0** |
+
+- **Decision**: deployed anyway, same reasoning as #18 (build succeeded, land-safe,
+  soft quality issue confined to 3 nodes at one location). Both #18 and #21's
+  Key West hub findings should be revisited together in any future follow-up.
+- **Installed live**: deferred to the end-of-rollout batch deploy (see #13).
+- **Logs**: `data/us_east_fl_gulf_sw_stitched_v2_run.log`, `data/us_east_fl_gulf_sw_stitched_v2_build.log`.
 
 ## Resolved: why the live db (#1) had only 5 hubs when #2-#6 had 56-231
 
