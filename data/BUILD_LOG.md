@@ -547,7 +547,7 @@ investigation.
 
 ### #15 — `us_east_fl_atl_n1a_stitched_v2.sqlite` — FAILED, OOM-killed twice, NOT deployed
 
-```
+```bash
 ./build_region.sh us-east-fl-atl-n1a-stitched-v2 --states FL --source-region us-east-coast \
   --clip-bbox "-81.91000000000001,29.79,-79.39,30.71" --overlap-deg 0.01 \
   --stitch-registry data/seam_registry.sqlite \
@@ -584,7 +584,7 @@ investigation.
 
 ### #16 — `us_east_fl_atl_n1b_stitched_v2.sqlite` — Zeeland's verified tuning config, rolled out to US East Coast/FL (n1b)
 
-```
+```bash
 ./build_region.sh us-east-fl-atl-n1b-stitched-v2 --states FL --source-region us-east-coast \
   --clip-bbox "-81.91000000000001,28.79,-79.39,29.91" --overlap-deg 0.01 \
   --stitch-registry data/seam_registry.sqlite \
@@ -609,7 +609,7 @@ investigation.
 
 ### #17 — `us_east_fl_atl_n2_stitched_v2.sqlite` — Zeeland's verified tuning config, rolled out to US East Coast/FL (n2)
 
-```
+```bash
 ./build_region.sh us-east-fl-atl-n2-stitched-v2 --states FL --source-region us-east-coast \
   --clip-bbox "-81.11,26.889999999999997,-79.39,28.91" --overlap-deg 0.01 \
   --stitch-registry data/seam_registry.sqlite \
@@ -631,7 +631,7 @@ investigation.
 
 ### #18 — `us_east_fl_atl_s_stitched_v2.sqlite` — Zeeland's verified tuning config, rolled out to US East Coast/FL (s) — HUB-COUNT CAVEAT
 
-```
+```bash
 ./build_region.sh us-east-fl-atl-s-stitched-v2 --states FL --source-region us-east-coast \
   --clip-bbox "-81.91000000000001,24.09,-79.08999999999999,27.01" --overlap-deg 0.01 \
   --stitch-registry data/seam_registry.sqlite \
@@ -687,7 +687,7 @@ investigation.
 
 ### #19 — `us_east_fl_gulf_mid_stitched_v2.sqlite` — Zeeland's verified tuning config, rolled out to US East Coast/FL (gulf_mid)
 
-```
+```bash
 ./build_region.sh us-east-fl-gulf-mid-stitched-v2 --states FL --source-region us-east-coast \
   --clip-bbox "-83.81,27.189999999999998,-82.19,29.21" --overlap-deg 0.01 \
   --stitch-registry data/seam_registry.sqlite \
@@ -710,7 +710,7 @@ investigation.
 
 ### #20 — `us_east_fl_gulf_pan_stitched_v2.sqlite` — Zeeland's verified tuning config, rolled out to US East Coast/FL (gulf_pan)
 
-```
+```bash
 ./build_region.sh us-east-fl-gulf-pan-stitched-v2 --states FL --source-region us-east-coast \
   --clip-bbox "-88.16000000000001,28.99,-83.78999999999999,30.91" --overlap-deg 0.01 \
   --stitch-registry data/seam_registry.sqlite \
@@ -733,7 +733,7 @@ investigation.
 
 ### #21 — `us_east_fl_gulf_sw_stitched_v2.sqlite` — Zeeland's verified tuning config, rolled out to US East Coast/FL (gulf_sw) — SAME Key West hub caveat as #18
 
-```
+```bash
 ./build_region.sh us-east-fl-gulf-sw-stitched-v2 --states FL --source-region us-east-coast \
   --clip-bbox "-82.91000000000001,24.09,-81.58999999999999,27.41" --overlap-deg 0.01 \
   --stitch-registry data/seam_registry.sqlite \
@@ -769,7 +769,7 @@ investigation.
 
 ### #22 — `us_east_ma_stitched_v2.sqlite` — Zeeland's verified tuning config, rolled out to US East Coast/MA
 
-```
+```bash
 ./build_region.sh us-east-ma-stitched-v2 --states MA --source-region us-east-coast \
   --clip-bbox "-71.71000000000001,41.190000000000005,-69.78999999999999,42.91" --overlap-deg 0.01 \
   --stitch-registry data/seam_registry.sqlite \
@@ -792,7 +792,7 @@ investigation.
 
 ### #23 — `us_east_md_stitched_v2.sqlite` — Zeeland's verified tuning config, rolled out to US East Coast/MD
 
-```
+```bash
 ./build_region.sh us-east-md-stitched-v2 --states MD --source-region us-east-coast \
   --clip-bbox "-77.39,37.89,-74.69,39.62" --overlap-deg 0.01 \
   --stitch-registry data/seam_registry.sqlite \
@@ -816,7 +816,7 @@ investigation.
 
 ### #24 — `us_east_me_stitched_v2.sqlite` — Zeeland's verified tuning config, rolled out to US East Coast/ME
 
-```
+```bash
 ./build_region.sh us-east-me-stitched-v2 --states ME --source-region us-east-coast \
   --clip-bbox "-70.81,43.04,-66.89,45.059999999999995" --overlap-deg 0.01 \
   --stitch-registry data/seam_registry.sqlite \
@@ -840,7 +840,7 @@ investigation.
 
 ### #25 — `us_east_nc_stitched_v2.sqlite` — Zeeland's verified tuning config, rolled out to US East Coast/NC
 
-```
+```bash
 ./build_region.sh us-east-nc-stitched-v2 --states NC --source-region us-east-coast \
   --clip-bbox "-78.81,33.59,-75.19,36.71" --overlap-deg 0.01 \
   --stitch-registry data/seam_registry.sqlite \
@@ -870,7 +870,7 @@ investigation.
 
 ### #26 — `us_east_nh_stitched_v2.sqlite` — Zeeland's verified tuning config, rolled out to US East Coast/NH
 
-```
+```bash
 ./build_region.sh us-east-nh-stitched-v2 --states NH --source-region us-east-coast \
   --clip-bbox "-70.86,42.830000000000005,-70.08999999999999,43.12" --overlap-deg 0.01 \
   --stitch-registry data/seam_registry.sqlite \
@@ -897,7 +897,7 @@ investigation.
 
 ### #27 — `us_east_nj_stitched_v2.sqlite` — Zeeland's verified tuning config, rolled out to US East Coast/NJ
 
-```
+```bash
 ./build_region.sh us-east-nj-stitched-v2 --states NJ --source-region us-east-coast \
   --clip-bbox "-75.36,38.79,-73.30999999999999,40.559999999999995" --overlap-deg 0.01 \
   --stitch-registry data/seam_registry.sqlite \
@@ -920,7 +920,7 @@ investigation.
 
 ### #28 — `us_east_ny_stitched_v2.sqlite` — Zeeland's verified tuning config, rolled out to US East Coast/NY
 
-```
+```bash
 ./build_region.sh us-east-ny-stitched-v2 --states NY --source-region us-east-coast \
   --clip-bbox "-74.29,40.39,-73.39,42.71" --overlap-deg 0.01 \
   --stitch-registry data/seam_registry.sqlite \
@@ -946,7 +946,7 @@ investigation.
 
 ### #29 — `us_east_ri_stitched_v2.sqlite` — Zeeland's verified tuning config, rolled out to US East Coast/RI
 
-```
+```bash
 ./build_region.sh us-east-ri-stitched-v2 --states RI --source-region us-east-coast \
   --clip-bbox "-71.96000000000001,40.84,-71.03999999999999,41.91" --overlap-deg 0.01 \
   --stitch-registry data/seam_registry.sqlite \
@@ -969,7 +969,7 @@ investigation.
 
 ### #30 — `us_east_sc_ga_stitched_v2.sqlite` — Zeeland's verified tuning config, rolled out to US East Coast/SC+GA
 
-```
+```bash
 ./build_region.sh us-east-sc-ga-stitched-v2 --states SC,GA --source-region us-east-coast \
   --clip-bbox "-82.31,30.54,-77.89,33.71" --overlap-deg 0.01 \
   --stitch-registry data/seam_registry.sqlite \
@@ -999,7 +999,7 @@ investigation.
 
 ### #31 — `us_east_va_stitched_v2.sqlite` — Zeeland's verified tuning config, rolled out to US East Coast/VA (FINAL region, 19/19)
 
-```
+```bash
 ./build_region.sh us-east-va-stitched-v2 --states VA --source-region us-east-coast \
   --clip-bbox "-77.61,36.39,-75.19,37.96" --overlap-deg 0.01 \
   --stitch-registry data/seam_registry.sqlite \
@@ -1046,12 +1046,14 @@ it wasn't rebuilt):
 | v2 (18 regions, tuning applied) | 576,734 | 1,367,338 |
 | delta | −409,470 (−41.5%) | −989,668 (−42.0%) |
 
-This ~42% edge-count reduction is consistent with the reduction seen on Zeeland
-between its own pre-tuning and post-tuning (#7-#10) builds, and with every
-individual region above — every successful region's v2 build has fewer nodes/
-edges than its live counterpart except `nh` (small enough that the unknown live
-recipe's own baseline was likely built differently; not a controlled comparison,
-same caveat as row #1).
+These aggregate deltas are descriptive only, not a controlled measurement of the
+Zeeland tuning's own effect — every live baseline here uses an unknown,
+unreproduced recipe (same caveat as row #1), so the totals also bundle whatever
+that unknown recipe itself differed by. Directionally consistent with the
+reduction seen on Zeeland between its own pre-tuning and post-tuning (#7-#10)
+builds, and with every individual region above: every successful region's v2
+build has fewer nodes/edges than its live counterpart except `nh` (small enough
+that the unknown live recipe's own baseline was likely built differently).
 
 ## Resolved: why the live db (#1) had only 5 hubs when #2-#6 had 56-231
 
