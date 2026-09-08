@@ -11,9 +11,18 @@ found while investigating a US East Coast (Potomac River) screenshot showing a d
 "bowtie" tangle in water the user identified as genuinely deep and open: Pass 0 (the
 very first stitching pass) has no fan-in cap at all, unlike every other pass in this
 family, and `_split_wide_narrow` has no size/isolation-aware fold-back for scattered
-narrow slivers, unlike its siblings `_split_deep_shallow`/`_tile_navmesh_piece`. See
-`data/BUILD_LOG.md` for every real build's measured effect before assuming any of
-these should ship enabled by default.
+narrow slivers, unlike its siblings `_split_deep_shallow`/`_tile_navmesh_piece`.
+**§8.6: real-build verification found neither §8.2 nor §8.3 actually fixes the
+Potomac/Coltons Point case that motivated them** — that location's density is a
+different mechanism, root-caused and fixed in §9: `build_skeleton_network` never
+simplifies a water polygon's boundary before rasterizing/skeletonizing it, so fine
+ENC/chart digitization noise (one real connected water body measured at 494,363
+vertices) spawns spurious medial-axis junctions. §9 (implemented, NOT yet verified
+against a real build) fixes this via `skeleton_boundary_simplify_m`, validated
+directly against real geometry (piece-level, not yet a full region rebuild) before
+implementation: 17-35% node reduction in the affected area. See `data/BUILD_LOG.md`
+for every real build's measured effect before assuming any of these should ship
+enabled by default.
 Complements: `SPEC-RECOMMENDED-TRACK.md`, `SPEC-FAIRWAY-HARMONIZATION.md`
 Scope: `nautical_routing_pipeline.py` (`build_skeleton_network`, `_resample_long_skeleton_edges`, `_skeleton_raster_to_graph`, `ClassificationConfig`)
 Measured against: `data/zeeland_full.sqlite` (48,553 nodes / 137,718 directed edges), RWS source GeoJSON
@@ -1434,3 +1443,136 @@ not a substitute for a real rebuild.** Before enabling any of these by default:
   counts (both logged at the end of `build_network`/`_ensure_coastal_connectivity`,
   matching this file's established per-mechanism logging convention) in the
   `data/BUILD_LOG.md` entry for whichever build first exercises this.
+
+### 8.6 Real-build verification (2026-09-08): §8.2/§8.3 do NOT fix the motivating case
+
+Rebuilt both `data/zeeland_fresh_clip` (`--narrow-fragment-reclass-max-fraction 0.5
+--pass0-fanin-cap 6 --pass0-cross-type-first`, on top of Zeeland's own verified
+tuning config) and the MD region (`us-east-md-stitched-v3`, same additions on top
+of the rollout's tuning config) — both clean (`crosses_land=0`, 0 hubs), matching
+§8.5's first gate. But the second gate — did it actually fix the motivating Potomac/
+Coltons Point case — **failed**:
+
+- Zeeland: 42,092/124,679 nodes/edges vs. baseline 42,092/124,689 — byte-similar,
+  and `--narrow-fragment-reclass-max-fraction` found **zero** candidate fragments
+  the entire build (no log line at all — `fragments_checked` stayed 0).
+- MD: 55,074/129,976 vs. baseline 54,766/129,606 — **more** nodes/edges, not fewer.
+  In the Coltons Point bounding box specifically: 20,249/48,560 vs. 19,997/48,192
+  before — no improvement. `--narrow-fragment-reclass-max-fraction` found 240
+  candidates but **folded 0**; Pass 0's `fanin_capped` counter never fired in
+  either build.
+
+**Root cause of the miss, confirmed by directly inspecting the live area**: of the
+~20,000 nodes in that bounding box, 18,602 are skeleton points
+(`node_kind_id=0`), only 1,647 are navmesh-boundary vertices, and the wider
+50km-ish surrounding region has very few navmesh nodes at all (this build's
+`--min-navmesh-radius-m 1200` means no nearby water qualifies as "wide" in the
+first place) — so §8.2's fold-back had no adjacent wide region to fold candidates
+into, regardless of tuning. The out-degree histogram in that area is overwhelmingly
+2-3 (ordinary chain/junction topology, no real hub), so §8.3's Pass 0 cap had
+nothing to cap either. **Both mechanisms target a fragmented-classification/
+stitching-crisscross failure mode that this specific location does not have** — its
+density is a different mechanism entirely, root-caused in §9 below. §8.2/§8.3
+remain real, independently-useful fixes for the failure mode they DO target
+(confirmed safe and inert here), just not this one — kept in the codebase,
+default off, not deployed to production off the back of this investigation alone.
+
+## 9. The actual mechanism: unsimplified boundary noise inflates medial-axis junction density
+
+### 9.1 Symptom and root cause, confirmed on real geometry
+
+Following §8.6's negative result, re-investigated the Coltons Point area directly
+rather than continuing to guess from the screenshot. Sampled 2,000 short (10-50m)
+skeleton edges in the affected bounding box: **92% carry exactly 2 raw
+`width_profile` points** — i.e. they are literal, un-splittable junction-to-junction
+segments, not multi-point raster chains a resampler failed to simplify. This rules
+out `--sagitta-cap`/§4.1/§4.2-class fixes: there is nothing left in these edges for
+a resampler to simplify away. The density is **topological junction count**, not
+under-simplified chain geometry.
+
+Traced further: `build_skeleton_network` (`nautical_routing_pipeline.py`) rasterizes
+and skeletonizes the water polygon with **no boundary simplification at all** —
+straight from the source `coastal_water` layer's own ENC/chart digitization detail.
+The single connected water body containing Coltons Point carries **494,363
+vertices** (confirmed directly, `_connected_water_polygons` against the real MD
+clip). A medial axis is, by definition, sensitive to every boundary feature: any
+small digitized wiggle — a cove, a point, a single surveyed notch in a tidal
+marsh's edge — spawns its own tiny branch, producing exactly the dense tangle of
+short junction-to-junction edges the screenshot showed. `_split_wide_narrow`
+already simplifies its own input (`simplify_tol_m=1.0`) before eroding, for a
+different reason (GEOS erosion cost/robustness); `build_skeleton_network` has no
+equivalent step before rasterizing.
+
+### 9.2 Validated directly against real geometry before implementing
+
+Learning from §8.6's cost (two real builds, one deployed, before discovering
+neither mechanism applied here), this was validated on real data *before*
+writing the fix. Extracted the actual narrow-water piece covering Coltons Point
+via the real pipeline logic (`_connected_water_polygons` → `_split_wide_narrow` at
+this build's own `--min-navmesh-radius-m 1200`, windowed to a ~3km buffer around
+the target area to keep the piece tractable while preserving real local shape —
+not an arbitrary bbox clip, which was tried first and found to corrupt the
+geometry with artificial straight-cut edges, giving a false/inverted result).
+Ran `build_skeleton_network` on this real piece with a boundary simplify at
+several tolerances, counting nodes landing inside the original tight
+bounding box (to exclude edge effects from the buffer window's own cut):
+
+| boundary simplify | nodes in target area | vs. raw |
+|---|---|---|
+| none (today's behavior) | 181 | — |
+| 5m | 150 | −17% |
+| 15m | 133 | −27% |
+| 30m | 118 | −35% |
+| 50m | 118 | −35% (plateaus) |
+
+A real, substantial, monotonic reduction, plateauing past ~30m.
+
+### 9.3 Fix: `skeleton_boundary_simplify_m` — IMPLEMENTED
+
+`ClassificationConfig.skeleton_boundary_simplify_m` (`--skeleton-boundary-simplify-m`,
+default `0.0` = disabled, matching this file's established convention). In
+`build_skeleton_network`, immediately after the polygon is reprojected to its
+local metric CRS and before pixel-size/rasterization: `poly_m =
+poly_m.simplify(cfg.skeleton_boundary_simplify_m, preserve_topology=True)` when
+the tolerance is `> 0.0`. `SKELETON_BOUNDARY_SIMPLIFY_MAX_M = 200.0` bounds it —
+measured gains plateau at ~30m, and a much larger value risks eroding real
+channel shape rather than just digitization noise.
+
+**Land-crossing safety is structural, not dependent on this simplify being
+"correct"**: `_rasterize_water_polygon` always re-intersects the rasterized water
+mask against a land mask rasterized separately from the *unmodified* land layer,
+after this simplify runs. A simplified water boundary that bulges slightly into
+what should be land can never produce a routable pixel there — the land mask is
+the actual safety gate, unaffected by this polygon's own precision. The residual
+risk is purely topological (a narrow real gap simplified into an accidental merge,
+or the reverse), the same class of approximation `_split_wide_narrow`'s own
+pre-erosion simplify already accepts.
+
+Verified with a synthetic real-geometry fixture (`tests/test_skeleton_boundary_simplify.py`,
+11 tests): a long channel with a sawtooth-notched edge (standing in for
+fine-grained chart-digitization noise) drops from 86 to 24 nodes at a 15m
+tolerance in this fixture; `0.0` reproduces today's skeleton output byte-for-byte
+(including against the same polygon built with the parameter entirely omitted);
+validation rejects out-of-range/NaN/infinite values. Full suite: 300/300 passing.
+
+### 9.4 Verification plan (pending — not yet run against a real build)
+
+Same discipline as §8.5, not yet executed:
+
+- Rebuild `data/zeeland_clip` at `0.0` (byte-identical check) and at a real value
+  (e.g. 15-30m) to measure the effect on Zeeland's own dense areas (Krammersluizen,
+  Vossemeersebrug — both previously investigated in this file for the same kind of
+  visual density, never from this specific mechanism).
+- Rebuild the MD/Coltons Point clip at a real value; visually confirm (same
+  rendering method as the original screenshot) the tangle is thinned, and
+  specifically re-run this section's own bounding-box node-count query to confirm
+  the real build matches the piece-level measurement in §9.2 (some divergence is
+  expected — the real build's stitching passes and other already-enabled tuning
+  interact with this piece differently than in isolation).
+- Same five-gate discipline as every prior round: `crosses_land` stays 0;
+  connectivity by edge length, not node count; POI-pair reachability zero-loss;
+  counts against the *original* baseline; report `skeleton_boundary_simplify_stats`
+  (logged at the end of `build_network`) in the `data/BUILD_LOG.md` entry.
+- Given §8.6's lesson, do not deploy off the strength of a clean build alone —
+  confirm the specific motivating location actually improved before replacing any
+  live database.
