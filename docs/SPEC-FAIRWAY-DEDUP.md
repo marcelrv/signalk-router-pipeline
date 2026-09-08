@@ -1,6 +1,12 @@
 # Spec: Fairway/Dredged-Area Boundary Preference — Reducing Medial-Axis Density Near a Marked Channel
 
-Status: Draft — analysis only, no code changes. Written as a standalone document rather
+Status: Draft — analysis only, no code changes. **§6.1's split+reunion mechanism, as
+written, has a confirmed geometric flaw (see §6.1's own correction note and §10 item 3):
+it does not reduce density for a fairway that sits wholly interior to a piece, and any
+change it does produce there is a seam artifact rather than legitimate simplification.
+The next session should start by prototyping the single-pass, vertex-weighted-simplify
+alternative §10 item 3 already names, not by implementing §6.1 as currently sketched.**
+Written as a standalone document rather
 than a new section of `SPEC-FAIRWAY-HARMONIZATION.md`: that spec is about depth/cost/
 classification signal (what `min_depth`/`cost_factor`/`laned` a fairway contributes to an
 edge *after* the graph exists); this spec is about graph *topology generation* itself —
@@ -345,6 +351,35 @@ In `build_skeleton_network`, immediately after §9's existing (uniform)
    `remainder_m` is left as `poly_m` already stands (i.e. as already processed by §9's
    uniform tolerance, if any).
 5. `candidate_m = unary_union([covered_simplified_m, remainder_m])`.
+
+   **Correction (confirmed geometric flaw, found in review before implementation —
+   see §10 item 3 for the recommended alternative):** when `fairway_near_m` sits wholly
+   *inside* `poly_m` — never touching `poly_m`'s own exterior ring, e.g. a fairway
+   narrower than the charted water it runs through — `remainder_m` (`poly_m.difference(
+   fairway_near_m)`) keeps `poly_m`'s ENTIRE exterior ring unchanged; only an interior
+   hole is cut out of it. `candidate_m`'s own exterior ring after the reunion is
+   therefore identical to `poly_m`'s original exterior ring (step 4 only simplifies the
+   *interior* `covered_m` piece, and step 5 just fills that interior hole back in with
+   the simplified version) — meaning this specific, common case (a fairway that doesn't
+   reach the piece's own banks) yields **no boundary-vertex reduction at all**, since the
+   coastline vertices actually driving medial-axis junction density (§9's own root
+   cause) live on the exterior ring, not inside it. Any raster/skeleton change §9's
+   mechanism would then observe from this step, for a wholly-interior fairway, comes
+   from a seam gap/overlap/accidental hole at the `covered_m`/`remainder_m` cut (§6.2's
+   own named risk) rather than legitimate simplification — i.e. exactly the failure mode
+   §6.2 already flags as a risk, but here it would be the ONLY source of any observed
+   effect, not just noise on top of a real one. This mechanism, as sketched, therefore
+   only has a legitimate density-reduction path for a fairway that DOES touch/cross
+   `poly_m`'s own exterior boundary (a fairway spanning bank-to-bank) — it needs either
+   (a) an explicit precondition checking `covered_m` actually includes part of `poly_m`'s
+   exterior ring before attempting this reunion at all, discarding/no-op'ing the
+   wholly-interior case, or (b) replacing this split+reunion approach entirely with the
+   single-pass, vertex-weighted-simplify alternative §10 item 3 already names, which
+   does not have this failure mode by construction (there is no seam, and every vertex
+   on the real exterior ring is considered, wholly-interior fairway coverage or not).
+   **Recommendation: do not implement the split+reunion approach as written; prototype
+   (b) first.**
+
 6. **Validate before accepting** (see §6.2 — this is the load-bearing safety step): if
    `candidate_m` fails validation, discard it and fall back to `poly_m` (today's/§9's
    already-shipped output) for this piece, unchanged. Never risk correctness for this
@@ -517,14 +552,20 @@ document only.
    study (distance from real skeleton nodes to the nearest fairway/dredged polygon edge,
    in water genuinely the same channel vs. genuinely different, mirroring §4.3.1's
    width-band table) against real MD or NL data before recommending anything but `0.0`.
-3. **The seam-reunion validity risk (§6.2, §8) is the central unresolved implementation
-   question.** A single-pass, vertex-weighted Douglas-Peucker (simplify the whole ring at
-   once, with a *per-vertex* tolerance that varies by fairway proximity, rather than
-   independently simplifying and reuniting two sub-polygons) would sidestep the seam
-   hazard entirely but is materially more implementation work than reusing `shapely.
-   simplify()` twice — worth prototyping both against a real noisy piece (e.g. the same
-   Coltons Point piece §9.2 already extracted) before committing to the split+reunion
-   approach this document sketches, purely for engineering-cost reasons.
+3. **The split+reunion approach in §6.1 is confirmed broken for the wholly-interior-
+   fairway case, not merely seam-risky (§6.1's own correction note, found in review
+   before implementation).** When a fairway doesn't touch `poly_m`'s own exterior ring,
+   the reunion yields zero real boundary-vertex reduction, and any observed effect is a
+   seam artifact rather than legitimate simplification. This elevates the single-pass,
+   vertex-weighted Douglas-Peucker alternative (simplify the whole ring at once, with a
+   *per-vertex* tolerance that varies by fairway proximity, rather than independently
+   simplifying and reuniting two sub-polygons) from "worth prototyping for engineering-
+   cost reasons" to the design the next session should very likely start with — it has
+   no seam hazard AND correctly handles wholly-interior fairway coverage by construction
+   (every exterior-ring vertex is considered directly, no split). Prototype it against a
+   real noisy piece (e.g. the same Coltons Point piece §9.2 already extracted) before
+   writing any CLI flag or shipping code; do not implement §6.1's split+reunion sketch
+   as a starting point.
 4. **Should `DRGARE`'s own `DRVAL1` (maintained depth) factor into which fairway
    candidates get the stronger tolerance?** This document treats `fairways_unified`
    uniformly, matching every other consumer of that layer (§3). A `DRGARE` polygon with a

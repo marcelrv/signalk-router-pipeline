@@ -1255,7 +1255,7 @@ skip re-preprocessing/re-clipping.)
   real-geometry fixtures). Full suite: 300/300 passing. PR: #23.
 - **Logs**: `data/us_east_md_stitched_v4_build.log`.
 
-### #35 — `zeeland_skeletonsimplify_v2.sqlite` — `skeleton_boundary_simplify_m` applied to Zeeland
+### #35 — `zeeland_skeletonsimplify_v2.sqlite` — combined tuning (incl. `skeleton_boundary_simplify_m`) applied to Zeeland
 
 ```bash
 ulimit -v $((11*1024*1024))
@@ -1287,12 +1287,20 @@ ulimit -v $((11*1024*1024))
   from) and a measurement of the new `--skeleton-boundary-simplify-m` flag's own
   effect here.
 - **Result vs. build #10 baseline** (`zeeland_axisdedup_wide.sqlite`, 42,092/124,689,
-  the currently-live recipe minus the three new flags):
+  the currently-live recipe minus the four new flags). **This is a COMBINED-tuning
+  result, not `--skeleton-boundary-simplify-m` in isolation**: #35 adds all four of
+  `--narrow-fragment-reclass-max-fraction`, `--pass0-fanin-cap`,
+  `--pass0-cross-type-first`, and `--skeleton-boundary-simplify-m` on top of #10 in
+  one build, so the delta below cannot be attributed to any one flag alone -- no
+  matched #10-plus-`skeleton-boundary-simplify-m`-only ablation build was run on
+  Zeeland (unlike Maryland's #33/#34 pair, which does isolate it: #33 has the first
+  three flags without boundary-simplify, #34 adds boundary-simplify on top, so #34
+  minus #33 IS an isolated measurement of `--skeleton-boundary-simplify-m` there):
 
   | build | nodes | edges | crosses_land | hubs | max out-deg |
   |---|---|---|---|---|---|
   | #10 (live baseline) | 42,092 | 124,689 | 0 | 0 | 14 |
-  | **#35 (this build)** | **40,433 (-3.9%)** | **120,485 (-3.4%)** | **0** | **0** | **14** |
+  | **#35 (this build, combined tuning)** | **40,433 (-3.9%)** | **120,485 (-3.4%)** | **0** | **0** | **14** |
 
   `Skeleton boundary simplify: 412 pieces, 125851 -> 50472 boundary vertices (59.9%
   reduction)` per the build's own diagnostic log line — a much larger raw boundary-

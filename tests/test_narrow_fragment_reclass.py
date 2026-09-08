@@ -169,7 +169,7 @@ class TestGenuineNarrowChannelAndCornersNeverFolded:
         p.classification_config = cfg
         water = _island_cluster_water_with_short_channel()
 
-        wide, narrow, seam = p._split_wide_narrow(water, RADIUS_M, simplify_tol_m=1.0)
+        _, narrow, _ = p._split_wide_narrow(water, RADIUS_M, simplify_tol_m=1.0)
 
         # Reached the geometric test (i.e. wasn't excluded by size alone) --
         # confirms this fixture actually exercises what it claims to.
