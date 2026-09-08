@@ -63,6 +63,57 @@ def _hub_and_spokes_graph(pipeline, n_spokes=5, radius_deg=0.001):
     return hub_id, spoke_ids
 
 
+def _spoke_with_satellites_graph(pipeline, n_satellites=5, n_decoys=6,
+                                  hub_radius_deg=0.003, sat_offset_deg=0.0001):
+    """Isolates fan-in on a SPOKE (not the hub) specifically -- the
+    `_hub_and_spokes_graph` fixture above only ever exercises the cap on the
+    literal hub, because in a small pool (few total nodes) the hub's own k=6
+    nearest-neighbor list covers the ENTIRE pool, so the hub's single Pass 0
+    iteration absorbs every other node into one union-find group before any
+    other node gets its own turn -- confirmed directly while designing this
+    fixture: without decoys, a "busy" node placed like a second hub still only
+    ever accumulates 1 real connection regardless of cap, because the true hub
+    always beats it to every satellite first.
+
+    `n_decoys` nodes sit a few metres from the hub H -- far closer than the
+    busy spoke B, so H's own k=6 nearest-neighbor list is entirely decoys (H
+    never even considers B or its satellites in its own iteration), while still
+    being beyond `snap_radius_m` so they contribute no real edges of their own
+    (radius-rejected, harmless). B sits `hub_radius_deg` from H, with
+    `n_satellites` further nodes clustered `sat_offset_deg` around B (<<
+    `hub_radius_deg`, so B is unambiguously each satellite's own nearest
+    neighbor). This leaves B to independently accumulate its OWN Pass 0
+    connections to its satellites, exactly the scenario `pass0_fanin_cap` is
+    meant to bound on any node, not just a designated "hub".
+
+    Verified directly: with `pass0_fanin_cap` disabled, B accumulates all
+    `n_satellites` connections (matching `_hub_and_spokes_graph`'s own
+    uncapped-baseline behavior); with a cap of N, B accumulates exactly N.
+    The decoys MUST be included in the caller's own `ids` list passed to
+    `_stitch_component_pieces` (returned here for that reason) -- Pass 0's
+    KD-tree is built only from whatever `ids` it's given, so a decoy that
+    exists in the graph but isn't part of `ids` does nothing to distract H.
+
+    Returns (hub_id, decoy_ids, busy_id, [satellite_ids...]).
+    """
+    hub_id = pipeline._get_or_create_node(BASE_LON, BASE_LAT, "coastal", context="test")
+    decoy_ids = []
+    for i in range(n_decoys):
+        theta = 2 * math.pi * i / n_decoys
+        lon = BASE_LON + 0.00001 * math.cos(theta)
+        lat = BASE_LAT + 0.00001 * math.sin(theta)
+        decoy_ids.append(pipeline._get_or_create_node(lon, lat, "coastal", context="test"))
+    busy_lon, busy_lat = BASE_LON + hub_radius_deg, BASE_LAT
+    busy_id = pipeline._get_or_create_node(busy_lon, busy_lat, "coastal", context="test")
+    satellite_ids = []
+    for i in range(n_satellites):
+        theta = 2 * math.pi * i / n_satellites
+        lon = busy_lon + sat_offset_deg * math.cos(theta)
+        lat = busy_lat + sat_offset_deg * math.sin(theta)
+        satellite_ids.append(pipeline._get_or_create_node(lon, lat, "coastal", context="test"))
+    return hub_id, decoy_ids, busy_id, satellite_ids
+
+
 def _covering_component_polygon():
     return box(BASE_LON - 0.01, BASE_LAT - 0.01, BASE_LON + 0.01, BASE_LAT + 0.01)
 
@@ -106,6 +157,18 @@ class TestDisabledByDefaultReproducesUnlimitedPass0FanIn:
         assert p._stitch_diag["pass0"].get("fanin_capped", 0) == 0
         assert _connected_components(p, ids) == 1
 
+    def test_spoke_accumulates_every_satellite_when_cap_is_zero(self):
+        p = _pipeline(pass0_fanin_cap=0)
+        hub_id, decoy_ids, busy_id, satellite_ids = _spoke_with_satellites_graph(p)
+        ids = [hub_id] + decoy_ids + [busy_id] + satellite_ids
+
+        p._stitch_component_pieces(ids, _covering_component_polygon(), snap_radius_m=SNAP_RADIUS_M)
+
+        satellite_edges = sum(1 for s in satellite_ids
+                               if p.graph.has_edge(busy_id, s) or p.graph.has_edge(s, busy_id))
+        assert satellite_edges == len(satellite_ids)
+        assert p._stitch_diag["pass0"].get("fanin_capped", 0) == 0
+
 
 class TestCapEnabledBoundsPass0HubFanIn:
     def test_hub_out_degree_never_exceeds_the_cap(self):
@@ -133,20 +196,40 @@ class TestCapEnabledBoundsPass0HubFanIn:
 
         assert _connected_components(p, ids) == 1
 
-    def test_cap_applies_symmetrically_to_a_spoke_too(self):
+    def test_cap_applies_to_a_spoke_receiving_independent_fan_in_too(self):
         # Pass 0 has no source/target direction (unlike pass0_target_fanin_cap's
         # target-only asymmetry) -- a spoke that is itself the nearer neighbor for
-        # several OTHER spokes must also be capped, not just the geometric hub.
-        cap = 1
+        # several OTHER nodes must also be capped, not just a designated "hub".
+        # Uses _spoke_with_satellites_graph, not _hub_and_spokes_graph: in a small
+        # pool, the hub's own single Pass 0 iteration absorbs every other node
+        # before a plain spoke ever gets independent fan-in of its own to test --
+        # confirmed directly while designing this fixture (see its own docstring).
+        cap = 2
         p = _pipeline(pass0_fanin_cap=cap)
-        hub_id, spoke_ids = _hub_and_spokes_graph(p, n_spokes=5)
-        ids = [hub_id] + spoke_ids
+        hub_id, decoy_ids, busy_id, satellite_ids = _spoke_with_satellites_graph(p)
+        ids = [hub_id] + decoy_ids + [busy_id] + satellite_ids
 
         p._stitch_component_pieces(ids, _covering_component_polygon(), snap_radius_m=SNAP_RADIUS_M)
 
-        for n in ids:
-            assert p.graph.out_degree(n) <= cap + 2  # + slack for Pass 1/Pass 2 fallback edges
-        assert p.graph.out_degree(hub_id) <= cap
+        # Exact bound on the busy spoke's own satellite connections specifically
+        # (not its total out-degree, which could also pick up an unrelated edge
+        # to the hub) -- isolates Pass 0's own capped contribution from any
+        # fallback-pass edge that would make a looser total-degree bound pass
+        # even if the cap itself were broken.
+        satellite_edges = sum(1 for s in satellite_ids
+                               if p.graph.has_edge(busy_id, s) or p.graph.has_edge(s, busy_id))
+        assert satellite_edges == cap
+        assert p._stitch_diag["pass0"]["fanin_capped"] > 0
+
+    def test_every_satellite_still_ends_up_connected_despite_the_spoke_cap(self):
+        cap = 2
+        p = _pipeline(pass0_fanin_cap=cap)
+        hub_id, decoy_ids, busy_id, satellite_ids = _spoke_with_satellites_graph(p)
+        ids = [hub_id] + decoy_ids + [busy_id] + satellite_ids
+
+        p._stitch_component_pieces(ids, _covering_component_polygon(), snap_radius_m=SNAP_RADIUS_M)
+
+        assert _connected_components(p, ids) == 1
 
 
 class TestPass0FaninCapIndependentOfPass0TargetFaninCap:
