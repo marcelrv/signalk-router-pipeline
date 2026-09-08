@@ -75,7 +75,13 @@ STITCH_REGISTRY=""
 STITCH_BAND_M=""
 STITCH_RADIUS_M=""
 EXTRA_PIPELINE_ARGS=""
-BUILD_MEM_LIMIT_GB="${SK_ROUTING_BUILD_MEM_LIMIT_GB:-11}"
+BUILD_MEM_LIMIT_GB="${SK_ROUTING_BUILD_MEM_LIMIT_GB-11}"  # unset (no colon) -- an
+                                                           # explicitly empty env var
+                                                           # override means "disabled",
+                                                           # same as an explicitly empty
+                                                           # --build-mem-limit-gb; only
+                                                           # a genuinely UNSET var falls
+                                                           # back to the 11GB default.
 while [ $# -gt 0 ]; do
     case "$1" in
         --force) FORCE="--force"; shift ;;
@@ -190,6 +196,24 @@ PYEOF
     if [ -n "$STITCH_RADIUS_M" ]; then
         STITCH_ARGS+=(--stitch-radius-m "$STITCH_RADIUS_M")
     fi
+fi
+
+# Validate before it ever reaches Bash arithmetic ($(( )) below): an unvalidated
+# value there is evaluated as an ARITHMETIC EXPRESSION, not just a number (e.g.
+# "1+2" silently becomes a 3GB limit), and a malformed one (empty already handled
+# above, but e.g. non-numeric or negative) can abort the whole step-3 subshell
+# under `set -euo pipefail` with a cryptic error instead of a clear one. Empty
+# and "0" are the two valid "disabled" spellings already handled by the `-n`/
+# `!= "0"` checks below; anything else must be a plain non-negative integer.
+if [ -n "$BUILD_MEM_LIMIT_GB" ] && [ "$BUILD_MEM_LIMIT_GB" != "0" ]; then
+    case "$BUILD_MEM_LIMIT_GB" in
+        ''|*[!0-9]*)
+            echo "Error: --build-mem-limit-gb/SK_ROUTING_BUILD_MEM_LIMIT_GB must be a" >&2
+            echo "  plain non-negative integer (GB), or empty/0 to disable the ceiling" >&2
+            echo "  (got: '$BUILD_MEM_LIMIT_GB')." >&2
+            exit 1
+            ;;
+    esac
 fi
 
 EXTRA_PIPELINE_ARGS_ARR=()

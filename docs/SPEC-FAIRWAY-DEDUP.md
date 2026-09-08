@@ -298,15 +298,31 @@ tracking, per-line reconnect caps, tie-break edge cases) for a mechanism that, p
 itself, took three follow-on rounds (§6.3.2, §6.3.6, §6.3.7) to close real gaps in. Not
 worth it when Option 3 needs none of it.
 
-### 5.3 Option 3 — fairway-scoped stronger boundary simplification, no water removed: CHOSEN
+### 5.3 Option 3 — fairway-scoped stronger boundary simplification: CHOSEN IN PRINCIPLE, its §6.1 split+reunion IMPLEMENTATION IS DEFERRED
+
+**Status correction (found in review, before implementation): the specific
+split+reunion mechanism §6.1 originally sketched for this option is confirmed broken
+for a fairway that sits wholly interior to a piece (§6.1's own correction note, §10
+item 3) — it is DEFERRED, not ready to build. The general APPROACH below (a second,
+fairway-scoped simplification tolerance) is still the right direction; what's deferred
+is specifically the split-then-reunite construction, in favour of the single-pass
+vertex-weighted alternative §10 item 3 names. §7's CLI flag proposal describes the
+deferred mechanism's intended contract, for whoever designs its replacement — it is
+not ready to implement as written either.**
 
 Extend `SPEC-GRAPH-DENSITY.md` §9's already-shipped mechanism
 (`skeleton_boundary_simplify_m`, a flat Douglas-Peucker tolerance applied to the whole
 piece before rasterizing) with a **second, stronger tolerance that applies only to the
-sub-boundary lying within (a small buffer of) `fairways_unified` coverage.** No water is
-added or removed — this only changes how many vertices survive along the portion of the
-piece's *own real boundary* that an authoritative fairway/dredged polygon already
-independently confirms is the marked channel. Because no water moves, this needs **no
+sub-boundary lying within (a small buffer of) `fairways_unified` coverage.** The INTENT
+is that no water is added or removed — this should only change how many vertices
+survive along the portion of the piece's *own real boundary* that an authoritative
+fairway/dredged polygon already independently confirms is the marked channel. §6.1's
+split+reunion construction does not actually guarantee that intent on its own (see
+§6.2's own risk list and §6.1's correction note: a seam gap, overlap, or accidental
+interior hole can change area, connectivity, or rasterized water pixels) — it is only
+as safe as §6.2's validation checks make it, which is why those checks are load-bearing
+rather than defensive padding. Because the INTENDED effect never moves water, this
+needs (once a construction is found that actually delivers that intent) **no
 carve-reconnect, no dead-end tracking, no new topology injection, and no interaction with
 the `crosses_land` safety gate beyond what §9 already established** (the land mask is
 rasterized separately from the unmodified land layer and re-intersected after any
@@ -430,6 +446,13 @@ the same reason: extend to navmesh only if a real build shows navmesh pieces ove
 fairway coverage still carry excess density after this ships, not speculatively now.
 
 ## 7. CLI flag proposal
+
+**This section describes the flag contract for §6.1's deferred split+reunion
+mechanism (see §5.3's correction) — it is a target shape for whoever designs the
+replacement, not a ready-to-implement proposal.** The flag NAME/convention below would
+likely carry over to a vertex-weighted-simplify replacement largely unchanged (same
+tolerance semantics from the caller's point of view); the mechanism it configures is
+what's deferred.
 
 Following this file's established convention (§4.1/§4.3/§6.4-§6.8: a numeric tolerance,
 default `0.0` = disabled, a piece with no fairway candidate nearby is a no-op regardless

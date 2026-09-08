@@ -18,12 +18,14 @@ Potomac/Coltons Point case that motivated them** — that location's density is 
 different mechanism, root-caused and fixed in §9: `build_skeleton_network` never
 simplifies a water polygon's boundary before rasterizing/skeletonizing it, so fine
 ENC/chart digitization noise (one real connected water body measured at 494,363
-vertices) spawns spurious medial-axis junctions. §9 (implemented, NOT yet verified
-against a real build) fixes this via `skeleton_boundary_simplify_m`, validated
-directly against real geometry (piece-level, not yet a full region rebuild) before
-implementation: 17-35% node reduction in the affected area. See `data/BUILD_LOG.md`
-for every real build's measured effect before assuming any of these should ship
-enabled by default.
+vertices) spawns spurious medial-axis junctions. §9 (implemented, real-build
+verification COMPLETE — `data/BUILD_LOG.md` #34) fixes this via
+`skeleton_boundary_simplify_m`, validated first against real geometry (piece-level,
+17-35% node reduction) and then against a full region rebuild (72.7% boundary-vertex
+reduction, 10.4%/10.9% node/edge reduction in the reported area, `crosses_land=0`).
+See §10.1 for the caveat that a second, different location nearby is NOT fixed by
+this mechanism. See `data/BUILD_LOG.md` for every real build's measured effect
+before assuming any of these should ship enabled by default.
 Complements: `SPEC-RECOMMENDED-TRACK.md`, `SPEC-FAIRWAY-HARMONIZATION.md`
 Scope: `nautical_routing_pipeline.py` (`build_skeleton_network`, `_resample_long_skeleton_edges`, `_skeleton_raster_to_graph`, `ClassificationConfig`)
 Measured against: `data/zeeland_full.sqlite` (48,553 nodes / 137,718 directed edges), RWS source GeoJSON
@@ -1556,24 +1558,33 @@ tolerance in this fixture; `0.0` reproduces today's skeleton output byte-for-byt
 (including against the same polygon built with the parameter entirely omitted);
 validation rejects out-of-range/NaN/infinite values. Full suite: 300/300 passing.
 
-### 9.4 Verification plan (pending — not yet run against a real build)
+### 9.4 Verification plan — PARTIALLY EXECUTED (real builds done; full five-gate discipline not)
 
-Same discipline as §8.5, not yet executed:
+Same discipline as §8.5. Status per item, updated against `data/BUILD_LOG.md` #33-35:
 
-- Rebuild `data/zeeland_clip` at `0.0` (byte-identical check) and at a real value
-  (e.g. 15-30m) to measure the effect on Zeeland's own dense areas (Krammersluizen,
-  Vossemeersebrug — both previously investigated in this file for the same kind of
-  visual density, never from this specific mechanism).
-- Rebuild the MD/Coltons Point clip at a real value; visually confirm (same
-  rendering method as the original screenshot) the tangle is thinned, and
-  specifically re-run this section's own bounding-box node-count query to confirm
-  the real build matches the piece-level measurement in §9.2 (some divergence is
-  expected — the real build's stitching passes and other already-enabled tuning
-  interact with this piece differently than in isolation).
-- Same five-gate discipline as every prior round: `crosses_land` stays 0;
-  connectivity by edge length, not node count; POI-pair reachability zero-loss;
-  counts against the *original* baseline; report `skeleton_boundary_simplify_stats`
-  (logged at the end of `build_network`) in the `data/BUILD_LOG.md` entry.
+- **Done**: rebuilt `data/zeeland_fresh_clip` at a real value (20m, build #35) and
+  spot-checked Zeeland's own dense areas (Krammersluizen, Vossemeersebrug) — both
+  essentially flat, as expected (real lock/bridge topology, not chart-noise, so this
+  mechanism correctly doesn't move them). **Not done**: a matched `0.0` byte-identical
+  rebuild of the same clip (the unit-test suite's disabled-by-default coverage is a
+  necessary but not sufficient substitute for this, per this file's own established
+  discipline).
+- **Done**: rebuilt the MD/Coltons Point clip at a real value (20m, build #34) and
+  confirmed the real build's bounding-box node/edge counts (17,911/42,934) against
+  the piece-level measurement in §9.2 — real-build effect is smaller in relative
+  terms than the isolated piece-level measurement predicted (10.4%/10.9% vs.
+  17-35%), consistent with other already-enabled tuning and stitching interacting
+  with this piece differently in the full build than in isolation, exactly as this
+  bullet anticipated. **Not done**: visual re-rendering against the original
+  screenshot (§10.1's follow-up screenshot IS a real visual check, but of a
+  *different* nearby location this mechanism does not fix, not a re-check of the
+  original Coltons Point tangle this fix targets).
+- **Partially done**: `crosses_land` confirmed 0 on both builds; node/edge/hub counts
+  reported against the original baseline (not just the immediately-prior build).
+  **Not done**: connectivity measured by edge length (not node count) and POI-pair
+  reachability were NOT run for either build — only count/crosses_land/hub-count
+  checks were. `skeleton_boundary_simplify_stats` IS reported in both BUILD_LOG.md
+  entries.
 - Given §8.6's lesson, do not deploy off the strength of a clean build alone —
   confirm the specific motivating location actually improved before replacing any
   live database.

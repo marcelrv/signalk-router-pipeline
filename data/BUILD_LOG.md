@@ -1158,8 +1158,8 @@ ulimit -v $((11*1024*1024))
   the pre-existing `us_east_md_stitched_v2.sqlite` baseline's 54,766/129,606 (slightly
   more, not fewer). In the Coltons Point bounding box specifically (lon -76.885 to
   -76.815, lat 38.255 to 38.285): 20,249/48,560 vs. 19,997/48,192 before — no
-  improvement. `narrow_fragment_reclass_max_fraction` found 0 candidate fragments;
-  Pass 0's `fanin_capped` counter never fired.
+  improvement. `narrow_fragment_reclass_max_fraction` found 240 candidate fragments
+  but folded 0 of them; Pass 0's `fanin_capped` counter never fired.
 - **Root cause of the miss**: directly inspecting the live area, ~92% of the ~20,000
   nodes there are skeleton points (`node_kind_id=0`), only a small minority are
   navmesh-boundary vertices, and the wider surrounding region has very few navmesh
