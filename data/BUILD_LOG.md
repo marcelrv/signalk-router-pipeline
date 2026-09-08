@@ -1124,6 +1124,83 @@ ulimit -v $((11*1024*1024))  # 11GB virtual-memory cap -- see "why the ulimit
   logs, `data/us_east_fl_atl_n1a_stitched_v2_run.log` and
   `data/us_east_fl_atl_n1a_retry_run.log`, are kept for the record.)
 
+### #33 — `zeeland_skeletonsimplify_v2.sqlite` — Zeeland rebuild with `--skeleton-boundary-simplify-m` (PR #23)
+
+```bash
+(
+ulimit -v $((11*1024*1024))
+.venv/bin/python3 nautical_routing_pipeline.py \
+  --input-dir data/zeeland_fresh_clip \
+  --output data/zeeland_skeletonsimplify_v2.sqlite \
+  --country NL --name "Zeeland" \
+  --description "Zeeland province and approaches (Westerschelde, Oosterschelde, Veerse Meer, Grevelingen, Haringvliet, North Sea approach), based on Rijkswaterstaat IENC / ENC data" \
+  --tags '["ienc","rws","coastal","inland"]' \
+  --url "https://github.com/marcelrv/signalk-router-data" \
+  --license "Public Domain (Rijkswaterstaat)" --copyright "Rijkswaterstaat" \
+  --depth-ceiling 6.0 \
+  --sagitta-cap 250.0 --max-segment-m 2000 \
+  --axis-dedup-cap 100.0 --axis-dedup-floor-m 100.0 \
+  --min-navmesh-radius-m 1200.0 \
+  --connector-merge-m 5.0 \
+  --inland-densify-max-segment-m 120.0 \
+  --pass2-max-fanin-per-node 6 \
+  --pass0-target-fanin-cap 4 \
+  --node-merge-m 5.0 \
+  --narrow-fragment-reclass-max-fraction 0.5 \
+  --pass0-fanin-cap 6 \
+  --pass0-cross-type-first \
+  --skeleton-boundary-simplify-m 20.0
+) 2>&1 | tee data/zeeland_skeletonsimplify_v2_build.log
+```
+
+- **Purpose**: roll `--skeleton-boundary-simplify-m` -- this session's validated
+  fix for chart-digitization-noise-driven medial-axis junction bloat (confirmed
+  on a real Maryland region rebuild: 72.7% boundary-vertex reduction, 10.4%
+  node / 10.9% edge reduction in the specific dense area, `crosses_land`
+  unaffected) -- out to Zeeland, on top of #10's still-current baseline tuning
+  config. `--narrow-fragment-reclass-max-fraction` and `--pass0-fanin-cap`/
+  `--pass0-cross-type-first` (this session's other two new flags) are included
+  for consistency with every other build in this rollout, even though §8.6 of
+  `docs/SPEC-GRAPH-DENSITY.md` found them NOT to help the specific Maryland
+  case they were tested against -- they were still measured real and safe
+  there, and might help Zeeland's own previously-documented dense spots
+  (Krammersluizen/Vossemeersebrug, §6.8/§6.9 above) that neither this build nor
+  the boundary-simplify fix specifically targets.
+- **Result vs. #10 baseline** (`zeeland_axisdedup_wide.sqlite`, same input clip,
+  same tuning config plus the three new flags):
+
+  | build | nodes | edges | crosses_land | hubs (od>30) | max fanin |
+  |---|---|---|---|---|---|
+  | #10 (baseline) | 42,092 | 124,689 | 0 | 0 | 14 |
+  | **#33** | **40,433** | **120,485** | **0** | **0** | **14** |
+
+  Nodes -3.94%, edges -3.37%, clean (`crosses_land=0`, 0 hubs), max fanin
+  unchanged. Build log's own diagnostic: `Skeleton boundary simplify: 412
+  pieces, 125851 -> 50472 boundary vertices (59.9% reduction) before
+  rasterizing (--skeleton-boundary-simplify-m=20.0)` -- a large boundary-vertex
+  cut, in the same direction as the Maryland case, though this run does not
+  isolate how much of the net node/edge delta traces to boundary-simplify
+  specifically vs. the other two flags (no A/B rebuild done here).
+- **Spot-check at the two previously-documented dense spots** (outgoing-edge
+  count from nodes in each bbox, #10 vs #33): Krammersluizen (`lat
+  51.657-51.667, lon 4.158-4.166`): 95 nodes/263 edges -> 97 nodes/273 edges;
+  Vossemeersebrug (`lat 51.578-51.590, lon 4.192-4.211`): 30 nodes/85 edges ->
+  32 nodes/92 edges. Both essentially flat (slightly up, not down) -- consistent
+  with §8.6's finding that these two flags don't help this class of location;
+  these two junctions were already cleaned up by #10's own axis-dedup-floor fix
+  and are lock/bridge junctions with genuine topology, not chart-noise
+  artifacts, so `--skeleton-boundary-simplify-m` was not expected to move them
+  either. The net global reduction above is coming from elsewhere in the
+  region.
+- **Installed** 2026-09-08 (`signalk-routeiq/data/zeeland_skeletonsimplify_v2.sqlite`,
+  deployed as an ADDITIONAL file alongside the existing live
+  `signalk-routeiq/data/zeeland.sqlite` -- NOT overwriting it, matching this
+  session's practice of deploying new builds alongside the original for
+  comparison; `signalk-server` restarted, logs confirm the new database was
+  peeked with no errors -- only the pre-existing empty `europe.sqlite`/
+  `netherlands.sqlite` placeholders were skipped as invalid).
+- **Log**: `data/zeeland_skeletonsimplify_v2_build.log`.
+
 ## Resolved: why the live db (#1) had only 5 hubs when #2-#6 had 56-231
 
 Traced across #2-#7 (2026-09-04 session): `_ensure_coastal_connectivity`'s Pass 2 was
