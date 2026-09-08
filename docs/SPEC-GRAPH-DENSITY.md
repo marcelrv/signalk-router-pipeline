@@ -5,7 +5,13 @@ Status: §4.1 implemented and verified. §4.1.2, §4.1.3, §5.1 and §6.1 fixed.
 density regression §6.3+§6.4 compounded; §6.6 (Pass 2 fan-in) and §6.7 (Pass 0c/0d
 Direction-A target fan-in) are two independent fixes for residual hub-fanout §6.5
 alone did not resolve — §6.7 is the one a real build confirmed as the actual dominant
-cause (§6.6's own real-build verification found Pass 2 was NOT it). See
+cause (§6.6's own real-build verification found Pass 2 was NOT it). §8 (implemented,
+NOT yet verified against a real build) covers two further, independent mechanisms
+found while investigating a US East Coast (Potomac River) screenshot showing a dense
+"bowtie" tangle in water the user identified as genuinely deep and open: Pass 0 (the
+very first stitching pass) has no fan-in cap at all, unlike every other pass in this
+family, and `_split_wide_narrow` has no size/isolation-aware fold-back for scattered
+narrow slivers, unlike its siblings `_split_deep_shallow`/`_tile_navmesh_piece`. See
 `data/BUILD_LOG.md` for every real build's measured effect before assuming any of
 these should ship enabled by default.
 Complements: `SPEC-RECOMMENDED-TRACK.md`, `SPEC-FAIRWAY-HARMONIZATION.md`
@@ -1280,3 +1286,151 @@ investigation if the compounded footprint proves to matter in practice.
   before. Not expected to change carve *decisions* (segmentize doesn't move the line,
   only adds vertices along it), but re-run §6.3.4's gates when enabling both together
   rather than assuming independence.
+
+## 8. Pass 0's missing fan-in cap and `_split_wide_narrow`'s missing fold-back (follow-on)
+
+### 8.1 Symptom and root cause
+
+A rendered screenshot of a US East Coast region (Potomac River, near Coltons
+Point/St. Clements Island) showed a dense "bowtie"-shaped tangle of hundreds of
+crisscrossing straight edges between two node clusters, in a small area the router
+was forced to route through — instead of the sparse, regularly-triangulated navmesh
+covering the surrounding open water. The user's own diagnosis, confirmed by reading
+the code: this local water is genuinely deep and open; all of it could have connected
+directly into the surrounding regular mesh instead of generating this structure.
+
+Two independent, previously-undocumented gaps, traced directly in code (not this
+spec's earlier Zeeland-measured mechanisms, all of which are about hub fan-in on
+Pass 2/Pass 0c/0d, axis-dedup, or connector/node merge — none touch either gap below):
+
+1. **`_split_wide_narrow` (line ~2069) has no size/isolation-aware fold-back.**
+   Its erosion-based wide/narrow split has no equivalent of `_split_deep_shallow`'s
+   own re-filter or `_tile_navmesh_piece`'s `tile_reclassified` handling: a small,
+   isolated sliver that erodes away purely because of small-scale local detail near
+   it (a rock, a jetty, a digitization artifact) — not because the water itself is
+   narrow — becomes "narrow" and is routed to skeleton treatment even when embedded
+   in otherwise wide, deep water.
+2. **`_stitch_component_pieces`'s Pass 0 (the very first stitching pass) has no
+   fan-in/fan-out cap of any kind.** Confirmed by reading its full body: the
+   `pass0_target_fanin_cap` machinery (§6.7) is declared once, shared, but is only
+   ever wired into Pass 0c/0d — never Pass 0 itself. Once (1) above (or any other
+   mechanism) leaves a water body fragmented into many small disconnected pieces,
+   Pass 0's raw, type-blind, uncapped k=6 nearest-neighbor query independently
+   discovers and accepts a valid connector for many distinct fragment pairs before
+   Pass 0b's outward-biased cross-type matching gets a chance to dominate — producing
+   the dense crisscross tangle.
+
+Nothing in Pass 1/Pass 2/`_resolve_local_skeleton_gaps` is touched by either fix
+below — they remain the underlying connectivity *guarantee*, exactly as they already
+are the fallback for whatever Pass 0c/0d's own existing caps reject.
+
+### 8.2 Fix 1: fold isolated narrow slivers back into the wide/navmesh path — IMPLEMENTED
+
+`_reclassify_scattered_narrow_fragments`, called from `_split_wide_narrow`, gated by
+`narrow_fragment_reclass_max_fraction` (`--narrow-fragment-reclass-max-fraction`,
+default `0.0` = disabled, matching this spec's established convention). Two-part test
+per narrow fragment:
+
+1. **Size**: area below `fraction * pi * min_navmesh_radius_m**2`.
+2. **Geometric justification**: naively re-running `_split_wide_narrow`'s own
+   erode/dilate/intersect test on `wide` unioned with just the candidate fragment
+   **cannot ever recover it** — erosion is monotonic, so eroding any subset of the
+   original `cleaned` polygon (which `wide ∪ frag` always is) can only ever recover a
+   subset of what eroding the whole of `cleaned` already gave `wide`. That would be a
+   silent no-op (caught during implementation, before shipping, by direct
+   mathematical check — not assumed). Instead, a **morphological closing**
+   (`NARROW_FRAGMENT_RECLASS_CLOSING_M`, 50m, mirroring `_split_deep_shallow`'s own
+   established `DEPTH_SPLIT_CLOSING_RADIUS_M` pattern) is applied to `wide ∪ frag`
+   before the eligibility re-test. Closing is extensive (its output always contains
+   its input) and specifically smooths away small-scale boundary notches without
+   widening a genuinely narrow channel, whose width is a larger-scale property a
+   modest closing radius does not change. The closed shape is used only to decide
+   whether to fold `frag` in — the fold itself unions the real, unmodified `frag`
+   geometry into `wide`, so closing can never introduce closed-but-not-real water
+   into the actual output.
+
+Windowed to a local neighbourhood (`radius_m * 2`) per candidate fragment rather than
+the whole component, for cost; skipped entirely above
+`NARROW_FRAGMENT_RECLASS_MAX_COUNT` (500) fragments on one component, same
+degrade-gracefully convention as `_safe_negative_buffer`.
+
+Verified with synthetic real-geometry fixtures (`tests/test_narrow_fragment_reclass.py`):
+a cluster of tiny islands well inside otherwise-wide water (small enough that closing
+at 50m swallows the whole cluster) is correctly folded (~100% of each fragment's area
+recovered); a genuine narrow channel attached to the same water body, and the
+inherent corner-rounding artifact of eroding a plain right-angle corner, are both
+correctly left unfolded even at a generous fraction. `fraction == 0.0` reproduces
+`_split_wide_narrow`'s output byte-for-byte (12/12 tests pass, including this gate).
+
+### 8.3 Fix 2: cap Pass 0's fan-out and bias outward connections first — IMPLEMENTED
+
+Two independent, composable changes in `_stitch_component_pieces`, both gated off by
+default:
+
+**(a) `pass0_fanin_cap`** (`--pass0-fanin-cap`, default `0`) — a cap on Pass 0's own
+contribution, applied **symmetrically to both sides** of a candidate pair (unlike
+`pass0_target_fanin_cap`'s target-only asymmetry — Pass 0 has no source/target
+direction, either side of a same-type pair can become a hub). Deliberately a
+**separate** flag from `pass0_target_fanin_cap`, not a reinterpretation of it, since
+that flag stays scoped to Pass 0c/0d exactly as §6.7 documents.
+
+**(b) `pass0_cross_type_first`** (`--pass0-cross-type-first`, default `False`) — runs
+Pass 0b (cross-type k=6 NN, immune to Pass 0's same-type crowding by construction)
+*before* Pass 0 instead of after. Only the call order changes — no change to
+Pass 0/0b/0c/0d/Pass 1/Pass 2's own internal logic or caps. Verified
+(`tests/test_pass0_cross_type_first.py`) with a fixture where two tight >6-node
+same-type clusters share one reachable cross-type node: with the flag off, Pass 0
+claims the cluster-to-cross-type connectors (`pass0` diag shows successes,
+`pass0b` shows none); with it on, Pass 0b claims them instead (reversed); final
+connectivity (one component) is identical either way in both cases.
+
+`tests/test_pass0_fanin_cap.py` verifies (a) independently with a hub-and-spokes
+fixture (mirroring `tests/test_pass2_fanin_cap.py`'s own pattern): cap=0 reproduces
+today's unlimited fan-in; cap=N bounds the hub's Pass-0 out-degree at N while every
+spoke still ends up connected via the same union-find/Pass 1/Pass 2 fallback already
+relied on elsewhere in this file; the cap applies to a spoke acting as a local hub
+too, not just the geometric center. `pass0_fanin_cap == 0` and
+`pass0_cross_type_first == False` reproduce today's output byte-for-byte (full
+289-test suite green with both at their defaults).
+
+### 8.4 Also landed alongside: a default memory ceiling in `build_region.sh`
+
+Unrelated to graph density, but requested together: `data/BUILD_LOG.md` build #32
+root-caused a real OOM to `_split_wide_narrow`'s own erosion step on one region's huge
+single `coastal_water` component, fixed reactively via `_safe_negative_buffer`'s
+retry-with-simplification ladder — but a still-unbounded process can be killed by the
+Linux OOM-killer once whole-system memory runs low on a shared host, an uncatchable
+SIGKILL that can take down unrelated processes too, not just this build. `build_region.sh`
+now runs step 3/3 (the routing-graph build) under a default `ulimit -v` (11GB,
+matching the value that build #32 confirmed converts an uncatchable host-level kill
+into a clean, catchable `GEOSException`/`MemoryError` inside the pipeline's own retry
+ladder), overridable via `--build-mem-limit-gb`/`SK_ROUTING_BUILD_MEM_LIMIT_GB` (`0`
+disables it). Scoped to a subshell so only step 3/3 is bounded, not the whole script.
+
+### 8.5 Verification plan (pending — not yet run against a real build)
+
+Everything in §8.2/§8.3 is implemented and covered by synthetic unit tests (29 new
+tests total, full suite 289/289 green with all new flags at their defaults), but —
+per this spec's own repeatedly-learned lesson (§6.1, §6.5) — **synthetic fixtures are
+not a substitute for a real rebuild.** Before enabling any of these by default:
+
+- Rebuild `data/zeeland_clip` with every new flag at its default (`0`/`0.0`/`False`):
+  node/edge counts and the exported `.sqlite` must match a pre-change baseline
+  exactly (the unit suite's disabled-by-default tests are a necessary but not
+  sufficient substitute for this).
+- Rebuild the motivating Potomac/Coltons Point clip with the new flags enabled;
+  visually confirm (same rendering method as the original screenshot) the bowtie is
+  replaced by a normal triangulated mesh connecting directly to the surrounding
+  navmesh, and confirm any genuinely-shallow charted depth at that location still
+  gates correctly via `_split_deep_shallow` (§8.2 only reclassifies by
+  width/isolation, not depth).
+- Same five-gate discipline as every prior round in this file: `crosses_land` stays
+  0; connectivity measured by edge length, not node count (§6.1); POI-pair
+  reachability zero-loss; node/edge counts against the *original* baseline, not just
+  the immediately-prior build (§6.5's own hard-won lesson); a hub-count scan
+  (out-degree > 30) to confirm §8.3 actually reduces bowtie-class fan-out on a real
+  dataset, not just the synthetic fixtures above.
+- Report the new `narrow_fragment_reclass_stats`/Pass 0 `fanin_capped` diagnostic
+  counts (both logged at the end of `build_network`/`_ensure_coastal_connectivity`,
+  matching this file's established per-mechanism logging convention) in the
+  `data/BUILD_LOG.md` entry for whichever build first exercises this.
