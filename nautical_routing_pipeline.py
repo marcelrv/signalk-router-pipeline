@@ -635,6 +635,10 @@ NARROW_FRAGMENT_RECLASS_MAX_COUNT = 500  # _reclassify_scattered_narrow_fragment
                                           # degrade gracefully rather than pay unbounded per-
                                           # fragment re-erosion cost on a pathological input,
                                           # matching _safe_negative_buffer's own convention.
+SKELETON_BOUNDARY_SIMPLIFY_MAX_M = 200.0  # build_skeleton_network: ceiling on
+                                           # skeleton_boundary_simplify_m -- measured
+                                           # gains plateau well below this (~30m); a much
+                                           # larger value risks eroding real channel shape.
 NARROW_FRAGMENT_RECLASS_CLOSING_M = 50.0  # _reclassify_scattered_narrow_fragments: morphological
                                            # closing radius applied before the fold-back
                                            # eligibility re-test, smoothing away small-scale
@@ -1179,6 +1183,27 @@ class ClassificationConfig:
     # the call order changes -- no change to Pass 0/0b/0c/0d/Pass 1/Pass 2's own
     # internal logic or caps.
     pass0_cross_type_first: bool = False
+    # Follow-on to SPEC-GRAPH-DENSITY.md: build_skeleton_network rasterizes/
+    # skeletonizes the water polygon with NO boundary simplification at all --
+    # straight from the source layer's own ENC/chart digitization detail (a real
+    # complex tidal marsh/creek water body can carry hundreds of thousands of
+    # vertices). Every small boundary wiggle spawns its own tiny branch in the
+    # medial axis, producing a dense tangle of short junction-to-junction edges
+    # -- confirmed directly this is NOT a resampling artifact (those chains are
+    # already minimal, 2 raw points) but genuine junction-count density driven
+    # by boundary noise. 0.0 (default) disables this entirely -- the polygon fed
+    # to rasterization stays byte-identical to today's, matching every other
+    # flag's convention in this dataclass. > 0.0: simplify (preserve_topology=
+    # True) the metric-projected polygon by this many metres before rasterizing.
+    # Safe by construction against land-crossing: _rasterize_water_polygon always
+    # re-intersects against the land mask, rasterized separately from the
+    # unmodified land layer, AFTER this simplify -- a slightly-bulged water
+    # boundary can never produce a routable pixel over real land. Measured
+    # directly on a real narrow-water piece: node count in the affected area drops
+    # 17%/27%/35% at 5m/15m/30m, plateauing past ~30m -- see
+    # build_skeleton_network's own docstring/comment for the full measurement.
+    # Must be finite, >= 0.0, and < SKELETON_BOUNDARY_SIMPLIFY_MAX_M if enabled.
+    skeleton_boundary_simplify_m: float = 0.0
 
     def pixel_size_for(self, min_dimension_m: float) -> float:
         return float(np.clip(min_dimension_m / self.pixel_dim_divisor,
@@ -1426,7 +1451,8 @@ class NauticalRoutingPipeline:
                  node_merge_m: float = 0.0,
                  narrow_fragment_reclass_max_fraction: float = 0.0,
                  pass0_fanin_cap: int = 0,
-                 pass0_cross_type_first: bool = False):
+                 pass0_cross_type_first: bool = False,
+                 skeleton_boundary_simplify_m: float = 0.0):
         self.data_paths = data_paths
         self.db_path = db_path
         self.country = country
@@ -1450,7 +1476,8 @@ class NauticalRoutingPipeline:
                                                            node_merge_m=node_merge_m,
                                                            narrow_fragment_reclass_max_fraction=narrow_fragment_reclass_max_fraction,
                                                            pass0_fanin_cap=pass0_fanin_cap,
-                                                           pass0_cross_type_first=pass0_cross_type_first)
+                                                           pass0_cross_type_first=pass0_cross_type_first,
+                                                           skeleton_boundary_simplify_m=skeleton_boundary_simplify_m)
         if max_segment_m is not None:
             self.classification_config.max_segment_m = float(max_segment_m)
         self._validate_classification_overrides(axis_dedup_cap, axis_dedup_fraction,
@@ -1517,6 +1544,11 @@ class NauticalRoutingPipeline:
         # when the fraction is 0.0 (the code path that increments them is only
         # entered when the feature is on).
         self.narrow_fragment_reclass_stats = {"fragments_checked": 0, "fragments_folded": 0}
+        # Follow-on to SPEC-GRAPH-DENSITY.md: skeleton_boundary_simplify_m summary
+        # counters, logged once at the end of build_network. All stay 0 when the
+        # tolerance is 0.0 (the code path that increments them is only entered
+        # when the feature is on).
+        self.skeleton_boundary_simplify_stats = {"pieces": 0, "vertices_before": 0, "vertices_after": 0}
         # DIAGNOSTIC (connectivity-regression investigation, not shipped as a
         # feature): per-pass attempt/outcome counters for _stitch_component_pieces
         # and _resolve_local_skeleton_gaps, plus aggregate union-find group counts
@@ -1684,6 +1716,25 @@ class NauticalRoutingPipeline:
             raise ValueError(
                 f"narrow_fragment_reclass_max_fraction must be finite, >= 0.0, and <= 1.0 "
                 f"(got {fraction!r}).")
+
+    @staticmethod
+    def _validate_skeleton_boundary_simplify_m(tol_m):
+        """`skeleton_boundary_simplify_m == 0.0` (the default) disables the
+        pre-rasterization boundary simplify entirely -- no validation needed, same
+        convention as `connector_merge_m`/`node_merge_m`. `> 0.0` must be finite
+        and strictly less than `SKELETON_BOUNDARY_SIMPLIFY_MAX_M` -- measured gains
+        plateau well below that ceiling (~30m), and a much larger value risks
+        eroding real channel shape rather than just chart-digitization noise.
+        `NaN`/negative slip past a bare `<= 0.0` check (`NaN` comparisons are
+        always `False` in Python), so both are checked explicitly rather than
+        relying on that alone.
+        """
+        if tol_m == 0.0:
+            return
+        if not math.isfinite(tol_m) or tol_m < 0.0 or tol_m >= SKELETON_BOUNDARY_SIMPLIFY_MAX_M:
+            raise ValueError(
+                f"skeleton_boundary_simplify_m must be finite, >= 0.0, and < "
+                f"{SKELETON_BOUNDARY_SIMPLIFY_MAX_M:.0f}m (got {tol_m!r}).")
 
     @staticmethod
     def _validate_classification_overrides(axis_dedup_cap_m, axis_dedup_fraction,
@@ -1951,6 +2002,8 @@ class NauticalRoutingPipeline:
         self._validate_node_merge_m(self.classification_config.node_merge_m)
         self._validate_narrow_fragment_reclass_max_fraction(
             self.classification_config.narrow_fragment_reclass_max_fraction)
+        self._validate_skeleton_boundary_simplify_m(
+            self.classification_config.skeleton_boundary_simplify_m)
         # Inland waterway centerlines are unchanged (already vector line topology).
         if "inland_waterways" in self.gdfs and not self.gdfs["inland_waterways"].empty:
             self._build_inland_network()
@@ -2116,6 +2169,14 @@ class NauticalRoutingPipeline:
                         f"{nfrs['fragments_checked']} scattered narrow fragments folded back into "
                         f"the navmesh-eligible path (--narrow-fragment-reclass-max-fraction="
                         f"{self.classification_config.narrow_fragment_reclass_max_fraction:.3f}).")
+        sbs = self.skeleton_boundary_simplify_stats
+        if sbs["pieces"]:
+            pct = (100.0 * (1.0 - sbs["vertices_after"] / sbs["vertices_before"])
+                   if sbs["vertices_before"] else 0.0)
+            logger.info(f"Skeleton boundary simplify: {sbs['pieces']} pieces, "
+                        f"{sbs['vertices_before']} -> {sbs['vertices_after']} boundary vertices "
+                        f"({pct:.1f}% reduction) before rasterizing (--skeleton-boundary-simplify-m="
+                        f"{self.classification_config.skeleton_boundary_simplify_m:.1f}).")
         logger.info(f"Network built with {self.graph.number_of_nodes()} nodes and {self.graph.number_of_edges()} edges.")
 
     # ------------------------------------------------------------------
@@ -5634,6 +5695,41 @@ class NauticalRoutingPipeline:
         cfg = self.classification_config
         utm = self._local_utm_crs(polygon)
         poly_m = gpd.GeoSeries([polygon], crs="EPSG:4326").to_crs(utm).iloc[0]
+        # Follow-on to SPEC-GRAPH-DENSITY.md: unlike _split_wide_narrow (which
+        # simplifies its own input before eroding), this polygon reaches
+        # rasterization/skeletonization with NO simplification at all -- straight
+        # from the source layer's own digitization detail. A real, complex tidal
+        # marsh/creek water body carries hundreds of thousands of vertices from
+        # fine-grained ENC survey digitization; every small boundary wiggle
+        # (a cove, a point, a single surveyed notch) spawns its own tiny branch
+        # in the medial axis, producing a dense tangle of short junction-to-
+        # junction edges that _resample_long_skeleton_edges/sagitta resampling
+        # cannot help with -- those chains are already minimal (2 raw points),
+        # confirmed directly against a real build (92% of sampled 10-50m edges
+        # in one such area had exactly 2 width_profile points), so the density
+        # is topological (junction count), not a resampling artifact. Measured
+        # directly on the real narrow-water piece covering that same area: a
+        # boundary simplify before rasterizing cuts local node count 17%/27%/35%
+        # at 5m/15m/30m tolerance (diminishing returns past ~30m). 0.0 (default)
+        # disables this entirely -- poly_m stays byte-identical to today's,
+        # matching every other flag's convention in this file.
+        #
+        # Safety: `_rasterize_water_polygon` always re-intersects against `land_m`
+        # (rasterized separately from the authoritative, unmodified land layer)
+        # AFTER this simplify, so a simplified water boundary bulging slightly
+        # into what should be land can never produce a routable pixel there --
+        # the land mask is the actual safety gate, not this polygon's own
+        # precision. The risk this carries is purely topological (a narrow real
+        # gap simplified into a merge, or vice versa), the same class of
+        # approximation `_split_wide_narrow`'s own pre-erosion simplify already
+        # accepts -- not a land-crossing risk.
+        if cfg.skeleton_boundary_simplify_m > 0.0:
+            vertices_before = len(shapely.get_coordinates(poly_m))
+            poly_m = poly_m.simplify(cfg.skeleton_boundary_simplify_m, preserve_topology=True)
+            stats = self.skeleton_boundary_simplify_stats
+            stats["pieces"] += 1
+            stats["vertices_before"] += vertices_before
+            stats["vertices_after"] += len(shapely.get_coordinates(poly_m))
         b = poly_m.bounds
         min_dim = min(b[2] - b[0], b[3] - b[1])
         px = cfg.pixel_size_for(min_dim)
@@ -7618,6 +7714,26 @@ if __name__ == "__main__":
                              "fragment-to-fragment candidates are then rejected for free by the "
                              "existing already-connected check instead of firing. Default: off, "
                              "identical call order to today's (Pass 0, then Pass 0b).")
+    parser.add_argument("--skeleton-boundary-simplify-m", type=float, default=0.0,
+                        help="Simplify (preserve_topology=True) a water polygon's boundary by this "
+                             "many metres before rasterizing/skeletonizing it in "
+                             "build_skeleton_network. build_skeleton_network currently applies NO "
+                             "boundary simplification at all -- straight from the source layer's own "
+                             "ENC/chart digitization detail, which for a complex tidal marsh/creek "
+                             "water body can carry hundreds of thousands of vertices. Every small "
+                             "boundary wiggle spawns its own tiny branch in the medial axis, "
+                             "producing a dense tangle of short junction-to-junction edges that "
+                             "--sagitta-cap cannot help with (confirmed directly: those chains are "
+                             "already minimal, 2 raw points -- the density is topological junction "
+                             "count, not a resampling artifact). Safe by construction against "
+                             "land-crossing: _rasterize_water_polygon always re-intersects against "
+                             "the land mask, rasterized separately from the unmodified land layer, "
+                             "AFTER this simplify. Default 0.0 DISABLES this entirely and reproduces "
+                             "today's skeleton raster byte-for-byte. Measured directly on a real "
+                             "narrow-water piece: node count in the affected area dropped 17%%/27%%/"
+                             "35%% at 5m/15m/30m tolerance, plateauing past ~30m. Must be finite, "
+                             ">= 0.0, and < "
+                             f"{SKELETON_BOUNDARY_SIMPLIFY_MAX_M:.0f}m if enabled (raises otherwise).")
     parser.add_argument("--stitch-registry", nargs="?", const="data/seam_registry.sqlite", default="",
                         help="Enable Round 25 cross-database seam stitching (STITCHING_DESIGN.md "
                              "Section 3) against the shared global-node registry at this SQLite "
@@ -7662,6 +7778,11 @@ if __name__ == "__main__":
     if args.pass0_fanin_cap < 0:
         raise SystemExit(f"--pass0-fanin-cap must be >= 0 "
                           f"(got {args.pass0_fanin_cap!r}).")
+    try:
+        NauticalRoutingPipeline._validate_skeleton_boundary_simplify_m(
+            args.skeleton_boundary_simplify_m)
+    except ValueError as e:
+        raise SystemExit(f"--skeleton-boundary-simplify-m: {e}")
     try:
         NauticalRoutingPipeline._validate_classification_overrides(
             args.axis_dedup_cap, args.axis_dedup_fraction,
@@ -7721,5 +7842,6 @@ if __name__ == "__main__":
                                        node_merge_m=args.node_merge_m,
                                        narrow_fragment_reclass_max_fraction=args.narrow_fragment_reclass_max_fraction,
                                        pass0_fanin_cap=args.pass0_fanin_cap,
-                                       pass0_cross_type_first=args.pass0_cross_type_first)
+                                       pass0_cross_type_first=args.pass0_cross_type_first,
+                                       skeleton_boundary_simplify_m=args.skeleton_boundary_simplify_m)
     pipeline.run_pipeline()
