@@ -2326,17 +2326,22 @@ class NauticalRoutingPipeline:
             if local_wide.is_empty:
                 kept.append(frag)
                 continue
-            local_combined = unary_union([local_wide, frag]).buffer(0)
-            local_closed = (local_combined.buffer(NARROW_FRAGMENT_RECLASS_CLOSING_M)
-                             .buffer(-NARROW_FRAGMENT_RECLASS_CLOSING_M))
+            # Whole probe (union, closing, erosion, recovery, intersection) shares
+            # one handler -- a GEOSException/MemoryError from ANY of these on one
+            # pathological fragment must not abort the whole build; degrade by
+            # keeping that fragment narrow (unchanged today's behaviour), same
+            # convention as _safe_negative_buffer's own docstring.
             try:
+                local_combined = unary_union([local_wide, frag]).buffer(0)
+                local_closed = (local_combined.buffer(NARROW_FRAGMENT_RECLASS_CLOSING_M)
+                                 .buffer(-NARROW_FRAGMENT_RECLASS_CLOSING_M))
                 local_eroded = self._safe_negative_buffer(local_closed, radius_m)
-            except GEOSException:
+                local_recovered = self._clean_polygonal(
+                    local_eroded.buffer(radius_m, quad_segs=16).buffer(0).intersection(local_closed))
+                recovered_area = frag.intersection(local_recovered).area
+            except (GEOSException, MemoryError):
                 kept.append(frag)
                 continue
-            local_recovered = self._clean_polygonal(
-                local_eroded.buffer(radius_m, quad_segs=16).buffer(0).intersection(local_closed))
-            recovered_area = frag.intersection(local_recovered).area
             if frag.area > 0 and recovered_area / frag.area >= 0.95:
                 folded.append(frag)
             else:

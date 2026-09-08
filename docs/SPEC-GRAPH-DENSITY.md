@@ -6,13 +6,14 @@ density regression §6.3+§6.4 compounded; §6.6 (Pass 2 fan-in) and §6.7 (Pass
 Direction-A target fan-in) are two independent fixes for residual hub-fanout §6.5
 alone did not resolve — §6.7 is the one a real build confirmed as the actual dominant
 cause (§6.6's own real-build verification found Pass 2 was NOT it). §8 (implemented,
-NOT yet verified against a real build) covers two further, independent mechanisms
-found while investigating a US East Coast (Potomac River) screenshot showing a dense
-"bowtie" tangle in water the user identified as genuinely deep and open: Pass 0 (the
-very first stitching pass) has no fan-in cap at all, unlike every other pass in this
-family, and `_split_wide_narrow` has no size/isolation-aware fold-back for scattered
-narrow slivers, unlike its siblings `_split_deep_shallow`/`_tile_navmesh_piece`.
-**§8.6: real-build verification found neither §8.2 nor §8.3 actually fixes the
+real-build verification COMPLETE as of §8.6) covers two further, independent
+mechanisms found while investigating a US East Coast (Potomac River) screenshot
+showing a dense "bowtie" tangle in water the user identified as genuinely deep and
+open: Pass 0 (the very first stitching pass) has no fan-in cap at all, unlike every
+other pass in this family, and `_split_wide_narrow` has no size/isolation-aware
+fold-back for scattered narrow slivers, unlike its siblings
+`_split_deep_shallow`/`_tile_navmesh_piece`.
+**§8.6: that real-build verification found neither §8.2 nor §8.3 actually fixes the
 Potomac/Coltons Point case that motivated them** — that location's density is a
 different mechanism, root-caused and fixed in §9: `build_skeleton_network` never
 simplifies a water polygon's boundary before rasterizing/skeletonizing it, so fine

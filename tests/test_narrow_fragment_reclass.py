@@ -78,6 +78,21 @@ def _island_cluster_water_with_channel():
     return unary_union([water, channel])
 
 
+def _island_cluster_water_with_short_channel():
+    """Same island cluster, plus a SHORT genuine narrow channel (60m wide, 400m
+    long, area ~23,816 m^2) -- unlike `_island_cluster_water_with_channel`'s 1500m
+    channel (area ~89,816 m^2, which exceeds max_area even at fraction=1.0 and so
+    is excluded by the size test alone), this one's area sits below
+    `1.0 * pi * RADIUS_M**2` (~31,416 m^2) at the validator's maximum fraction --
+    so it actually reaches the geometric closing test, and must be rejected BY
+    THAT test (not merely by size) to prove the mechanism doesn't just get lucky
+    on channels too big to ever be size-eligible in the first place.
+    """
+    water = _island_cluster_water()
+    channel = box(3000, 1400, 3400, 1460)  # 60m wide, 400m long
+    return unary_union([water, channel])
+
+
 class TestDisabledByDefaultReproducesTodaysSplit:
     def test_no_fragments_folded_and_stats_stay_zero(self):
         p, cfg = _pipeline(narrow_fragment_reclass_max_fraction=0.0)
@@ -126,13 +141,14 @@ class TestEnabledFoldsIsolatedIslandClusterFragments:
 
 
 class TestGenuineNarrowChannelAndCornersNeverFolded:
-    def test_channel_stays_narrow_even_at_a_generous_fraction(self):
-        # fraction=1.0 is the maximum the validator allows -- even here, the
-        # channel's own area (~90,000 m^2, see the fixture) is well under
-        # max_area (1.0 * pi * 100^2 ~= 31,416) is actually SMALLER... wait: the
-        # channel is bigger than that cap, so it's excluded by the size test
-        # alone. Use a large enough fraction that the SIZE test would not be
-        # what rejects it, to actually exercise the geometric closing test too.
+    def test_long_channel_stays_narrow_even_at_a_generous_fraction(self):
+        # fraction=1.0 is the maximum the validator allows. The channel's own
+        # area (~90,000 m^2, see the fixture) still exceeds max_area
+        # (1.0 * pi * 100^2 ~= 31,416) even here, so it's excluded by the SIZE
+        # test alone -- this test only proves that case. The geometric closing
+        # test is separately exercised by test_short_channel_rejected_by_
+        # geometric_closing_test_not_just_size below, using a smaller channel
+        # that actually reaches that test.
         p, cfg = _pipeline(narrow_fragment_reclass_max_fraction=1.0)
         p.classification_config = cfg
         water = _island_cluster_water_with_channel()
@@ -143,6 +159,25 @@ class TestGenuineNarrowChannelAndCornersNeverFolded:
         channel_frags = [f for f in frags if f.bounds[0] >= 3000.0]
         assert len(channel_frags) == 1
         assert channel_frags[0].area == pytest.approx(89816.27982783053, rel=1e-6)
+
+    def test_short_channel_rejected_by_geometric_closing_test_not_just_size(self):
+        # This channel's area (~23,816 m^2) sits BELOW max_area at the
+        # validator's maximum fraction (1.0 * pi * 100^2 ~= 31,416 m^2) -- so
+        # unlike the long-channel test above, it passes the size gate and must
+        # be rejected by the geometric closing test itself to stay narrow.
+        p, cfg = _pipeline(narrow_fragment_reclass_max_fraction=1.0)
+        p.classification_config = cfg
+        water = _island_cluster_water_with_short_channel()
+
+        wide, narrow, seam = p._split_wide_narrow(water, RADIUS_M, simplify_tol_m=1.0)
+
+        # Reached the geometric test (i.e. wasn't excluded by size alone) --
+        # confirms this fixture actually exercises what it claims to.
+        assert p.narrow_fragment_reclass_stats["fragments_checked"] == 8
+        frags = p._explode_polygonal(narrow)
+        channel_frags = [f for f in frags if f.bounds[0] >= 3000.0]
+        assert len(channel_frags) == 1
+        assert channel_frags[0].area == pytest.approx(23816.279827830534, rel=1e-6)
 
     def test_corner_rounding_artifacts_stay_narrow(self):
         p, cfg = _pipeline(narrow_fragment_reclass_max_fraction=0.5)
