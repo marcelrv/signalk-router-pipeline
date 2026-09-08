@@ -1576,3 +1576,400 @@ Same discipline as §8.5, not yet executed:
 - Given §8.6's lesson, do not deploy off the strength of a clean build alone —
   confirm the specific motivating location actually improved before replacing any
   live database.
+
+## 10. Post-§9 investigation: the "bowtie" is still present nearby — a different,
+navmesh-side mechanism (investigation only, no fix implemented)
+
+### 10.1 Symptom
+
+`--skeleton-boundary-simplify-m` (§9) shipped and was rebuilt/deployed as
+`data/us_east_md_stitched_v4.sqlite` (`--skeleton-boundary-simplify-m=20.0`,
+confirmed in `data/us_east_md_stitched_v4_build.log`: "Skeleton boundary simplify:
+54 pieces, 459733 -> 125709 boundary vertices (72.7% reduction)"). This measurably
+reduced node/edge count in the original Coltons Point bounding box (10.4%/10.9%
+reported). But a follow-up screenshot at a **different, nearby** location on the
+same stretch of the Potomac (START 38.1960°N -76.7836°W, DEST 38.1960°N
+-76.7088°W — near Potomac River Channel Buoys 13-15, Dukeharts Channel, Heron
+Island Bar, Saint Clement Bay Warning Daybeacon; roughly 7-9km south/east of the
+original Coltons Point screenshot at 38.2696°N -76.8189°W / 38.2628°N -76.8716°W)
+showed the same dense "bowtie" tangle, essentially unchanged.
+
+The user rejected a "genuinely shallow/drying marsh, not worth finely routing
+through" explanation for this (verbatim): "I don't agree with your analysis wrt to
+the connectivity. The lack of connections is not because of little depth of the
+water, it is because somehow we are not trying the right way to connect the
+navmesh. we can still eliminate much of the redundant nodes navmesh basically in
+the example I think we can then remove all nodes that are non-connecting to the
+skeleton nodes. In very large navmeshes it may needs bit more thought on the right
+solution... Write detailed findings and clear description of the real findings (not
+your assumption that it is shallow, as that is plainly not right on a large portion
+of the connections between the skeleton and the navmesh (the ones on the whole
+south side)."
+
+This section investigates that claim directly against the live, deployed
+`data/us_east_md_stitched_v4.sqlite` (identical copy at
+`/home/node/signalkdev/signalk-routeiq/data/us_east_md_stitched_v4.sqlite`) —
+**investigation only, no code changed, nothing rebuilt.**
+
+**Bottom line up front: the user's hypothesis is confirmed, not refuted.** In the
+investigated area: 83.9% of navmesh (`node_kind_id=1`) nodes have zero edges to any
+skeleton (`node_kind_id=0`) node; of those, 99.5% sit at a near-straight (>150°)
+turn between their two ring neighbours (median sagitta 6.2m) — unnecessary
+boundary-ring filler, not real shape. A pure ring-chain-contraction removes 182 of
+218 navmesh nodes (83.5%) and the same number of edges. On the "south side"
+specifically, **100% of the 17 navmesh-to-skeleton connector edges found there are
+in ≥5.4m water** (0% shallow) — the depth explanation is flatly refuted for that
+side; the only shallow connectors anywhere in the area (11 of 51, all 0.0-1.8m) are
+on a distinct, localized *north*-side cluster. Separately, ≥4 pairs of skeleton
+nodes 44-360m apart each independently fan out to the same navmesh targets — a
+smaller, additional stitching-redundancy issue on top of the ring-density one.
+
+### 10.2 What was already tried and ruled out (do not re-propose)
+
+§8.2 (`--narrow-fragment-reclass-max-fraction`) and §8.3
+(`--pass0-fanin-cap`/`--pass0-cross-type-first`) are already confirmed inert for
+this class of location (§8.6: zero candidates found, `fanin_capped` never fired,
+out-degree histogram shows no real hub). This investigation's own fan-in/fan-out
+measurements (§10.4.2) independently reconfirm no meaningful same-type hub pattern
+in the newly-investigated area either — don't re-propose either flag for this
+problem.
+
+**New finding: §9's fix (`--skeleton-boundary-simplify-m`) resolved the original
+Coltons Point location, but that location and the new one are different
+mechanisms.** Re-querying the original screenshot's bounding box (and a much wider
+surrounding box, lat 38.22-38.32 / lon -76.92--76.75) in the live v4 database finds
+**zero `node_kind_id=1` (navmesh) nodes at all** there now — every node is
+skeleton, with a mild out-degree histogram (`{1: 28, 2: 35, 3: 49}`, nothing above
+degree 3) — no hub/bowtie signature remains. §9's fix worked, fully, at that
+location. The new location, by contrast, is **navmesh-dominated** (148/210 nodes in
+a representative bounding box there are `node_kind_id=1`) — a region
+`--skeleton-boundary-simplify-m` structurally cannot touch, because it only
+`simplify()`s the *skeleton* polygon before rasterizing (`build_skeleton_network`);
+`build_navmesh_region` is a separate code path with its own, separately-tuned
+simplify constant (`NAVMESH_BOUNDARY_SIMPLIFY_M = 5.0`, see §10.3.1). This fully
+explains, mechanistically, why the user saw no visible improvement at the new
+location despite a real, correctly-targeted fix at the original one.
+
+### 10.3 Investigation methodology
+
+Schema/constants confirmed directly in `nautical_routing_pipeline.py` (not
+assumed): `EDGE_KIND_CENTERLINE=0`, `EDGE_KIND_NAVMESH_BOUNDARY=1`,
+`EDGE_KIND_LANE=2`, `EDGE_KIND_MACRO=3`, `NODE_KIND_POINT=0` ("skeleton" below),
+`NODE_KIND_NAVMESH_VERTEX=1` ("navmesh" below), `NODE_KIND_SUPERNODE=2` (0 rows in
+this dataset). `region_id` is **not** a navmesh-piece discriminator in this
+schema — every node in the whole MD clip has `region_id=1`; navmesh pieces have to
+be found by graph structure instead (connected components of the
+`node_kind_id=1`-only subgraph, §10.3.2).
+
+#### 10.3.1 What "navmesh nodes in the graph" actually are
+
+Reading `build_navmesh_region` (~line 3551) directly: **the interior of a
+triangulated navmesh region is never added to the routable `nodes`/`edges`
+tables.** It triangulates the polygon and stores the full triangle mesh
+(vertices/triangles/adjacency) as a JSON blob in the separate `navmesh_regions`
+table (`CREATE TABLE navmesh_regions`, ~line 7292; used by the router at query
+time for point-in-triangle routing across open water) — confirmed by tracing every
+use of `navmesh_region_rows`, none of which touch `self.graph`. The **only**
+`node_kind_id=1` rows that land in `nodes` are the polygon's own **perimeter ring
+vertices** (exterior + interior/island rings), registered one-by-one in ring order
+and connected consecutively (`EDGE_KIND_NAVMESH_BOUNDARY`, added only `if not
+self.graph.has_edge(u, v)`) — stated explicitly in the function's own docstring
+("Registers EVERY vertex of the region's own perimeter... as a literal graph node,
+connected in ring order"). Consequence: every `node_kind_id=1` node in this
+investigation is a vertex on a navmesh piece's own boundary polygon, or (secondarily)
+a node touched by `_stitch_component_pieces`'s cross-type passes — there is no
+"navmesh interior routing node" in `nodes`/`edges` at all. The density the
+screenshots show is 100% boundary-ring + stitch-connector structure.
+
+Before this ring is registered, `build_navmesh_region` already applies
+`NAVMESH_BOUNDARY_SIMPLIFY_M = 5.0` (line 685) — the navmesh analogue of §9's
+`skeleton_boundary_simplify_m`, but a fixed constant, not a CLI flag, and already
+tuned once (its own comment: a prior no-pass/5.0m/15.0m sweep found "5.0m already
+captures most of the vertex-count win, median vertices/region 1247 -> 125"). This
+is much tighter than §9 found optimal for the analogous skeleton problem (15-30m,
+plateauing ~30m) — this gap turns out to matter (§10.4.1/10.4.4).
+
+#### 10.3.2 Distinguishing "ring" vs "stitch connector" edges from the data alone
+
+Both a piece's own boundary-ring edges and cross-piece/cross-type stitch
+connectors added later by `_stitch_component_pieces` (Pass 0/0b/0c, e.g. line 4161)
+share the same `edge_kind_id=1`; the DB does not persist which pass created an edge
+(`piece_ctx`/`_node_contexts` are in-memory build diagnostics only, not exported
+columns). This investigation reconstructs the distinction from topology instead:
+built the undirected `node_kind_id=1`–`node_kind_id=1` subgraph for the
+investigation area and computed connected components. A clean, untiled, single-ring
+piece shows up as one simple cycle (`edges == nodes`, uniform degree 2); a tiled
+piece or genuinely-stitched multi-piece area would show multiple components or
+degree >2 at shared seams. Cross-checked against `_tile_navmesh_piece` (line 2652):
+tiling triggers only above `NAVMESH_TILE_MAX_EXTENT_M` (10,000m bbox extent) or
+`NAVMESH_TILE_MAX_VERTICES` (1,500 boundary vertices) — the build log for this
+exact build confirms tiling did fire once, but only for one 42km×131km piece
+("Navmesh tiling: 42x131km piece (1874 boundary verts) -> 5x14 grid -> 23 tiles" —
+clearly the main Chesapeake Bay body, not this Potomac stretch).
+
+#### 10.3.3 Queries used
+
+Ran directly against the live `sqlite3` file via Python's `sqlite3` module (no
+ORM, no synthetic data). Investigation area: lat 38.14-38.32, lon -76.98--76.62 (a
+buffered superset of the requested lat 38.15-38.30 / lon -76.95--76.65, to avoid
+edge-clipping artifacts). Core query pattern:
+
+```python
+import sqlite3
+db = sqlite3.connect("data/us_east_md_stitched_v4.sqlite")
+cur = db.cursor()
+cur.execute("""SELECT id, lat, lon, node_kind_id, node_depth FROM nodes
+               WHERE lat BETWEEN 38.14 AND 38.32 AND lon BETWEEN -76.98 AND -76.62""")
+nodes = {r[0]: {"lat": r[1], "lon": r[2], "kind": r[3], "depth": r[4]} for r in cur.fetchall()}
+cur.execute("SELECT source, target, distance, min_depth, drval1, min_width, width_profile, edge_kind_id FROM edges")
+edges = [e for e in cur.fetchall() if e[0] in nodes and e[1] in nodes]
+```
+followed by adjacency-list construction, degree computation, connected-component
+labeling, turn-angle/sagitta geometry (local equirectangular projection at
+lat0=38.2), and a chain-contraction simulation (§10.4.4) — all pure Python, no
+external geometry library needed since only turn angle and point-to-line distance
+are required. Scripts were session-scratch only, not preserved in-repo; every
+number below is reproducible from the description given plus the exact figures
+quoted.
+
+### 10.4 Findings
+
+#### 10.4.1 Redundant navmesh nodes
+
+Investigation-area totals (buffered box, lat 38.14-38.32 / lon -76.98--76.62):
+**1,785 nodes** (1,567 skeleton, 218 navmesh), **4,184 directed / 2,092 undirected
+edges** (3,564 centerline, 620 navmesh-boundary).
+
+Of the **218 navmesh nodes**: 35 (16.1%) have ≥1 edge to a skeleton node; **183
+(83.9%) have zero**. Of those 183: **182 have degree exactly 2** (both neighbours
+also navmesh — pure ring-interior vertices), 1 has degree 1 (a ring dead-end,
+likely a bbox-clip artifact, not independently re-verified).
+
+For the 182 degree-2 nodes, computed the turn angle at each node (180° = perfectly
+straight) and the sagitta (perpendicular distance from the node to the straight
+line joining its two neighbours):
+
+- **Angle**: min 149.8°, median 174.2°, 90th pct 175.3°, max 178.2°. Zero nodes have
+  a real corner (<120°). 95.1% exceed 170°, 99.5% exceed 150°.
+- **Sagitta**: median 6.2m, only 4.9% under 5m — most of these points individually
+  sit just *past* the 5.0m `NAVMESH_BOUNDARY_SIMPLIFY_M` tolerance (exactly why
+  Douglas-Peucker at 5.0m keeps them), but a chain of many such barely-over-tolerance
+  points in a row is still, cumulatively, a near-straight run.
+- **Ring-edge length**: median 119.7m (min 105.0m, max 473.2m) — far below
+  `NAVMESH_TARGET_EDGE_M` (650m, the *triangulation* target spacing), confirming
+  these are raw digitized/lightly-simplified boundary points, not triangulation
+  artifacts.
+
+**Answer**: the overwhelming majority (83.9%) of navmesh nodes here have zero
+skeleton connection, and of those, essentially all (99.5%) are also not needed to
+preserve the navmesh piece's own boundary-ring shape in any meaningful sense — ring
+filler, not genuine topology. Exact pruning count: §10.4.4.
+
+#### 10.4.2 The "south side" depth claim
+
+Found 51 distinct cross-type (`node_kind_id=0` ↔ `node_kind_id=1`) edges in the
+investigation area — the *only* navmesh-to-skeleton connections that exist (all
+`edge_kind_id=1`). Depth distribution (`min_depth`/`drval1` agree exactly):
+7.3m×29, 5.4m×11, 1.8m×4, 0.0m×7 — **78.4% deep (≥5m)**, 21.6% shallow (<2m).
+`min_width` is `999.0` (unconstrained sentinel) on all 51 — width is never the
+limiting factor either.
+
+Splitting by the screenshot route's own latitude (38.1960 — START and DEST share
+this exact lat, so "south" = navmesh endpoint lat < 38.1960, "north" = ≥):
+
+| | n | deep (≥5m) | shallow (<2m) |
+|---|---|---|---|
+| **South** | 17 | **17 (100%)** | **0 (0%)** |
+| North | 34 | 23 (68%) | 11 (32%) |
+
+All 11 shallow/drying connector edges are on the north side, all tracing to a
+small cluster of skeleton hub nodes around lon -76.74 to -76.73 / lat
+38.204-38.208 — a distinct, localized, genuinely-shallow feature, not
+representative of the area as a whole. `node_depth` on the underlying nodes
+corroborates the edge-level numbers (several south-side nodes spot-checked
+directly: `node_depth = 7.3` in every case).
+
+**Answer**: the user's claim is confirmed exactly as stated. The south side is
+100% deep water at every measured connection point; depth is not a limiting factor
+there. "It's shallow" only has real support on a specific, small, already-
+identifiable north-side cluster (21.6% of connections area-wide).
+
+**What IS true about the south-side connections instead**: grouping the 51
+cross-type edges by skeleton source and looking for source pairs with overlapping
+navmesh targets finds at least 4 pairs of skeleton nodes, 44-360m apart, **each
+independently connecting to the same set of navmesh perimeter nodes**:
+
+| skeleton source A | skeleton source B | distance A↔B | shared navmesh targets |
+|---|---|---|---|
+| (38.1913,-76.6215) | (38.1903,-76.6225) | 141.9m | 4 of 4 |
+| (38.1987,-76.8013) | (38.1995,-76.8006) | 111.0m | 4 of 4 |
+| (38.2056,-76.7417) | (38.2039,-76.7452) | 358.4m | 2 of 4 |
+| (38.1995,-76.7456) | (38.1991,-76.7456) | 44.5m | 4 of 4 |
+
+Two of the four pairs are on the south side. Fan-in per navmesh target area-wide:
+16 targets have fan-in 2, 19 have fan-in 1 — **~46% of the 35 skeleton-connected
+navmesh nodes are double-connected** by this mechanism, for no additional
+connectivity value (the two skeleton sources are close enough that either alone
+would suffice). Consistent with `_stitch_component_pieces`'s Pass 0c "LOCAL
+adjacency guarantee for navmesh perimeter" (its own docstring, ~line 4099: "no
+longer stops at first genuinely-nearby... candidate") running independently per
+skeleton node with no check for whether a nearby skeleton node already provides
+equivalent navmesh coverage — a gap distinct from what `pass0_fanin_cap`/
+`pass0_target_fanin_cap` address (§6.7, §8.3 — those cap one node's own fan-out/
+fan-in; this is redundancy *between two separate, individually-low-fan-out* hubs,
+already confirmed not to trip either existing cap, §8.6).
+
+#### 10.4.3 Is it multiple redundant navmesh pieces/tiles? Largely ruled out
+
+Connected components of the `node_kind_id=1`-only subgraph in the investigation
+area: **only 2 components**, sizes 148 and 70 nodes.
+
+- 148-node component: `edges == nodes` exactly — a single simple cycle, i.e. one
+  clean, untiled piece's boundary ring. Bbox ~4.4km × ~9.6km, both well under
+  `NAVMESH_TILE_MAX_EXTENT_M` (10,000m); vertex count (148) far under
+  `NAVMESH_TILE_MAX_VERTICES` (1,500) — `_tile_navmesh_piece` correctly never
+  tiled this piece, confirmed structurally (uniform degree 2, no degree-4
+  tile-seam vertices), not just inferred from the thresholds.
+- 70-node component: `edges == nodes - 1` — an open chain, not a closed ring.
+  Most likely an artifact of the investigation bbox clipping through part of a
+  different piece's ring (a ring edge whose other endpoint falls outside the
+  buffered box gets dropped) rather than a real broken ring in the live database —
+  **not independently re-verified against a wider box; open question (§10.5)**.
+
+Degree distribution across all 218 navmesh nodes: `{1: 2, 2: 216}` — essentially no
+branching, confirming simple ring structure, not a web of many small pieces'
+rings crisscrossing each other.
+
+**Answer**: the "many small tiled pieces, each contributing a redundant parallel
+ring" mechanism — plausible before measuring, since `NAVMESH_TILE_MAX_EXTENT_M`
+tiling is real and does fire elsewhere in this exact build (the 42km×131km
+Chesapeake body → 23 tiles) — does **not** apply here. This Potomac stretch is
+small enough (~4-10km) to stay a single untiled piece. The real mechanism is
+simpler: **one single navmesh piece's own boundary ring is far denser than it needs
+to be**, because `NAVMESH_BOUNDARY_SIMPLIFY_M` (5.0m) is much tighter than the
+tolerance §9 already found optimal for the structurally-analogous skeleton case
+(15-30m) — see §10.4.1. This is more actionable than the tiling hypothesis would
+have been: a single-parameter change to an already-proven pattern (§9's own
+`skeleton_boundary_simplify_m`), not a rework of the tiling/stitching mechanism.
+
+#### 10.4.4 Concrete pruning quantification
+
+Simulated the user's proposed rule directly: remove every `node_kind_id=1` node
+with (a) zero edges to any `node_kind_id=0` node, AND (b) degree exactly 2 within
+the navmesh-only subgraph (removal splices its two neighbours together with a
+direct replacement edge — standard chain contraction). Applied iteratively (a
+removal can make a newly-degree-2 neighbour eligible next) until no more nodes
+qualify, on the full investigation-area graph (218 navmesh nodes, 217
+navmesh-navmesh edges, both components included):
+
+- **182 of 218 navmesh nodes removed (83.5%)**
+- **navmesh-navmesh edges: 217 → 35 (182 edges removed, 83.9%)**
+- As a fraction of the area's entire graph (1,785 nodes / 2,092 undirected edges,
+  including all skeleton nodes): **182/1,785 nodes (10.2%)**, **182/2,092 edges
+  (8.7%)** — smaller in area-wide terms only because this buffered box is
+  skeleton-dominated overall; restricted to the navmesh-heavy sub-area around the
+  new screenshot specifically (148/210 nodes were navmesh there), the local
+  reduction is much larger (roughly 70% of that sub-area's total node count).
+- No node with an existing skeleton connection, and no node of degree ≠2, was
+  touched — conservative by construction, can never remove a node the user's own
+  stated rule says to keep.
+
+Extrapolation, **explicitly flagged as unverified, not a claim to build on
+directly**: this MD clip has 3,975 `node_kind_id=1` nodes total; if the
+83.5%-prunable ratio measured here generalizes (untested), that implies on the
+order of ~3,300 navmesh nodes clip-wide could be similarly prunable — order-of-
+magnitude sense of scale only.
+
+### 10.5 Hypothesis (a)/(b)/(c) status
+
+- **(a) "Navmesh contains many nodes that never serve as a real connection point to
+  the skeleton" — CONFIRMED.** 83.9% of navmesh nodes have zero skeleton
+  connection; of those, 99.5% are also geometrically non-load-bearing for the
+  ring's own shape (§10.4.1). Dominant mechanism by node count, by a wide margin.
+- **(b) "If stitching were done correctly, most of these could be pruned" —
+  PARTIALLY CONFIRMED, re-scoped.** The 182 prunable nodes (§10.4.4) are prunable
+  *independent of stitching quality* — pure boundary-ring density, untouched by any
+  cross-type stitch pass. Stitching quality is a real, separate, smaller issue: the
+  duplicate-fan-out pattern (§10.4.2) is real and fixable but accounts for at most
+  ~16 of 51 connector edges — an order of magnitude smaller than the ring-density
+  issue. Stitching redundancy is real but not the primary source of the visible
+  density; boundary-ring over-density is.
+- **(c) "Depth is not the limiting factor for a large fraction of south-side
+  connections" — CONFIRMED, unambiguously.** 100% (17/17) of south-side
+  navmesh-skeleton connector edges are in ≥5.4m water. The only shallow connections
+  anywhere in the area are a distinct, localized north-side cluster (11/51 edges,
+  21.6% of the total) — nowhere near "a large portion" of the south side.
+
+### 10.6 Recommended direction for the next session
+
+In priority order, by measured impact:
+
+1. **Primary fix — navmesh boundary ring simplification, mirroring §9's proven
+   pattern.** `NAVMESH_BOUNDARY_SIMPLIFY_M` (currently a fixed constant, 5.0m, not
+   a CLI flag) is the direct analogue of `skeleton_boundary_simplify_m`. Either (a)
+   raise the constant, or (b) parameterize it as a new CLI flag
+   (`--navmesh-boundary-simplify-m`), defaulting to today's 5.0m for byte-identical
+   output, tunable upward for real builds. **Caveat, flagged explicitly**: unlike
+   skeleton edges, navmesh-boundary (`EDGE_KIND_NAVMESH_BOUNDARY`) edges are in the
+   *lenient* bucket of `_sanity_check_no_land_crossings` (confirmed directly,
+   ~line 6322: "Navmesh fallback edges... don't set `is_placeholder`, so they fall
+   into the lenient 'skeleton' bucket... never stripped") — there is **no
+   automatic strip-on-land-crossing safety net** for these edges, unlike skeleton
+   edges' rasterize+land-mask re-intersection. Any tolerance increase needs its own
+   land-crossing validation on real extracted geometry before shipping (same
+   discipline as §9.2, not synthetic fixtures alone). The original 5.0m tuning note
+   (line 696-703) already found navmesh-boundary edges under 3.0m rose from 0.9%
+   (no-pass) to 3.9% (5.0m) to 6.0% (15.0m) — a real, quantified, non-zero
+   depth-safety-margin cost that needs re-measuring at whatever tolerance is tried.
+2. **Alternative/complementary — direct chain-contraction post-process**, exactly
+   as simulated in §10.4.4: after `build_navmesh_region` registers ring
+   nodes/edges (and after `_stitch_component_pieces` adds any cross-type
+   connectors, so a node that gains a skeleton connection is correctly excluded),
+   iteratively collapse zero-skeleton-connection `node_kind_id=1` nodes of degree
+   exactly 2 in the navmesh-only subgraph, splicing their two neighbours with a
+   direct edge. Topology-driven rather than tolerance-driven — no "how much
+   geometry am I allowed to lose" tuning question the way `simplify()` has. §10.4.1's
+   sagitta/angle numbers suggest this is very safe by construction (median 6.2m
+   sagitta, no real corners removed), but the *replacement* chord is a new straight
+   edge that didn't exist before and should still be checked for land-crossing.
+3. **Secondary fix — dedup redundant cross-type stitch connectors.** In
+   `_stitch_component_pieces`'s Pass 0c (or a post-pass), when two skeleton nodes
+   within some small radius (measured redundant pairs: 44-360m) both connect to
+   the same navmesh target(s), keep only the nearer one. Smaller impact than #1/#2
+   (§10.4.2: at most ~16 of 51 connector edges), but directly addresses the
+   mechanism most likely to visually resemble a literal "bowtie" (two nearby
+   sources fanning out to overlapping distant targets) rather than just "too many
+   nodes." Scope as its own change from #1/#2 — genuinely different mechanism
+   (stitching redundancy vs. ring density), don't conflate in one PR.
+
+**Do not re-attempt** §8.2/§8.3 for this problem — already confirmed inert (§8.6),
+independently reconfirmed by this investigation's own fan-in/fan-out measurements.
+
+### 10.7 Open questions / what would need a real rebuild to verify
+
+- **Does the 83.5% local prunable-fraction (§10.4.4) generalize** to other
+  navmesh-heavy areas in this clip, or elsewhere on the coast? Only directly
+  measured for this one Potomac stretch; the 3,300-node clip-wide extrapolation is
+  explicitly flagged as unverified.
+- **Land-crossing risk of any navmesh ring simplification/contraction** — not
+  checked against the `land`/`depth_areas` (drying) layers directly in this
+  investigation (needs `_crosses_land`/`_drying_gdf`, which need the loaded
+  GeoDataFrames from a real pipeline run, not just the exported sqlite). The single
+  most important gate before shipping either §10.6 item 1 or 2 — mirrors §9.2's own
+  discipline.
+- **The 70-node open-chain component in §10.4.3** — not confirmed whether this is
+  a genuine broken ring in the live database or a bounding-box-clip artifact. Not
+  load-bearing for any finding above, but worth a quick re-check with a wider box.
+- **Whether raising `NAVMESH_BOUNDARY_SIMPLIFY_M`/adding chain-contraction actually
+  eliminates the new screenshot's visual bowtie** — this investigation is
+  graph-theoretic (node/edge counts, degree, angle, depth), not a rendered-image
+  comparison. A future session should rebuild with whichever fix is chosen and do
+  the same visual confirmation §8.5/§9.4 establish as this repo's standard (same
+  rendering method as the original screenshots, at both locations, plus the
+  five-gate discipline: `crosses_land` stays 0; connectivity by edge length not
+  node count; POI-pair reachability zero-loss; counts against the *original*
+  pre-any-fix baseline; report new diagnostic counters in `data/BUILD_LOG.md`).
+- **Whether the duplicate-fan-out pattern (§10.4.2) recurs densely enough elsewhere
+  to be worth a dedicated fix**, or whether fixing #1/#2 alone (ring density)
+  already resolves the visible symptom without needing #3 — worth measuring again
+  after a #1/#2 rebuild before investing in #3.
