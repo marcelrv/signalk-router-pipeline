@@ -15,6 +15,7 @@
 #                      [--clip-bbox "min_lon,min_lat,max_lon,max_lat"] [--overlap-deg 0.02]
 #                      [--stitch-registry data/seam_registry.sqlite]
 #                      [--extra-pipeline-args "--sagitta-cap 250.0 --node-merge-m 5.0"]
+#                      [--build-mem-limit-gb 11]
 #
 # Round 25 cross-database seam stitching: pass --stitch-registry to adopt/publish
 # shared seam nodes against a global-node registry SQLite (see STITCHING_DESIGN.md
@@ -29,6 +30,18 @@
 # script's own flags -- e.g. the density-tuning flags
 # (--sagitta-cap/--axis-dedup-cap/--node-merge-m/etc., see SPEC-GRAPH-DENSITY.md)
 # without hand-editing this script per run.
+#
+# Step 3/3 (the routing-graph build) runs under a default `ulimit -v` memory
+# ceiling (data/BUILD_LOG.md build #32: _split_wide_narrow's erosion step can
+# exhaust GEOS's own working memory on a huge/complex coastal_water component;
+# _safe_negative_buffer already degrades gracefully on a catchable
+# GEOSException/MemoryError, but an unbounded process can instead be killed by
+# the Linux OOM-killer once whole-system memory runs low on a shared host -- an
+# uncatchable SIGKILL that can take down unrelated processes too. The ceiling
+# converts that into a clean, catchable failure inside the pipeline itself).
+# Override with --build-mem-limit-gb <N> or the SK_ROUTING_BUILD_MEM_LIMIT_GB
+# env var; 0 disables the ceiling entirely for a region that legitimately needs
+# more.
 #
 # Examples:
 #   ./build_region.sh us-east-coast
@@ -62,6 +75,13 @@ STITCH_REGISTRY=""
 STITCH_BAND_M=""
 STITCH_RADIUS_M=""
 EXTRA_PIPELINE_ARGS=""
+BUILD_MEM_LIMIT_GB="${SK_ROUTING_BUILD_MEM_LIMIT_GB-11}"  # unset (no colon) -- an
+                                                           # explicitly empty env var
+                                                           # override means "disabled",
+                                                           # same as an explicitly empty
+                                                           # --build-mem-limit-gb; only
+                                                           # a genuinely UNSET var falls
+                                                           # back to the 11GB default.
 while [ $# -gt 0 ]; do
     case "$1" in
         --force) FORCE="--force"; shift ;;
@@ -75,6 +95,12 @@ while [ $# -gt 0 ]; do
         --stitch-band-m) STITCH_BAND_M="$2"; shift 2 ;;
         --stitch-radius-m) STITCH_RADIUS_M="$2"; shift 2 ;;
         --extra-pipeline-args) EXTRA_PIPELINE_ARGS="$2"; shift 2 ;;
+        --build-mem-limit-gb)
+            if [ "$#" -lt 2 ]; then
+                echo "Error: --build-mem-limit-gb requires a value." >&2
+                exit 1
+            fi
+            BUILD_MEM_LIMIT_GB="$2"; shift 2 ;;
         *) echo "Unknown option: $1" >&2; exit 1 ;;
     esac
 done
@@ -177,6 +203,37 @@ PYEOF
     fi
 fi
 
+# Validate before it ever reaches Bash arithmetic ($(( )) below): an unvalidated
+# value there is evaluated as an ARITHMETIC EXPRESSION, not just a number (e.g.
+# "1+2" silently becomes a 3GB limit), and a malformed one (empty already handled
+# above, but e.g. non-numeric or negative) can abort the whole step-3 subshell
+# under `set -euo pipefail` with a cryptic error instead of a clear one. Empty
+# and "0" are the two valid "disabled" spellings already handled by the `-n`/
+# `!= "0"` checks below; anything else must be a plain non-negative integer.
+# Normalize to ONE canonical numeric value, used for every enabled/disabled
+# check and the arithmetic below -- previously each call site re-checked
+# `[ -n ... ] && [ != "0" ]` as a STRING comparison, which a value like "00"
+# or "000" passes validation but is never EQUAL to the string "0": that took
+# the "enabled" branch with a normalized value of 0, i.e. `ulimit -v 0`,
+# which would have prevented the routing process from starting at all.
+# BUILD_MEM_LIMIT_GB_NUM=0 is the single, unambiguous "disabled" state.
+BUILD_MEM_LIMIT_GB_NUM=0
+if [ -n "$BUILD_MEM_LIMIT_GB" ]; then
+    case "$BUILD_MEM_LIMIT_GB" in
+        ''|*[!0-9]*)
+            echo "Error: --build-mem-limit-gb/SK_ROUTING_BUILD_MEM_LIMIT_GB must be a" >&2
+            echo "  plain non-negative integer (GB), or empty/0 to disable the ceiling" >&2
+            echo "  (got: '$BUILD_MEM_LIMIT_GB')." >&2
+            exit 1
+            ;;
+    esac
+    # 10# forces base-10 parsing -- Bash arithmetic otherwise treats a
+    # leading-zero value (e.g. "08", plausible from a hand-typed
+    # --build-mem-limit-gb) as octal, and "08"/"09" are invalid octal
+    # literals, aborting the script under set -euo pipefail.
+    BUILD_MEM_LIMIT_GB_NUM=$((10#$BUILD_MEM_LIMIT_GB))
+fi
+
 EXTRA_PIPELINE_ARGS_ARR=()
 if [ -n "$EXTRA_PIPELINE_ARGS" ]; then
     # Word-split on purpose (like $FORCE above) -- this is a plain space-
@@ -185,21 +242,59 @@ if [ -n "$EXTRA_PIPELINE_ARGS" ]; then
     read -ra EXTRA_PIPELINE_ARGS_ARR <<< "$EXTRA_PIPELINE_ARGS"
 fi
 
-step "3/3 build routing graph -> $OUTPUT"
-time "$PYTHON" nautical_routing_pipeline.py \
-    --input-dir "$GEOJSON_DIR" \
-    --output "$OUTPUT" \
-    --country US \
-    --name "$NAME" \
-    --description "$DESCRIPTION" \
-    --tags '["noaa","enc","coastal"]' \
-    --url "https://github.com/marcelrv/signalk-router-data" \
-    --license "Public Domain (NOAA)" \
-    --copyright "NOAA Office of Coast Survey" \
-    --depth-ceiling "$DEPTH_CEILING" \
-    "${STITCH_ARGS[@]}" \
-    "${EXTRA_PIPELINE_ARGS_ARR[@]}" \
-    2>&1 | tee "${LOG_PREFIX}_build.log"
+if [ "$BUILD_MEM_LIMIT_GB_NUM" -gt 0 ]; then
+    step "3/3 build routing graph -> $OUTPUT (memory ceiling: ${BUILD_MEM_LIMIT_GB_NUM}GB)"
+else
+    step "3/3 build routing graph -> $OUTPUT (no memory ceiling)"
+fi
+(
+    if [ "$BUILD_MEM_LIMIT_GB_NUM" -gt 0 ]; then
+        # ulimit -v is in KB; only scopes this subshell and its children, so
+        # steps 1/3 and 2/3 above (already run) and the rest of this script
+        # after step 3/3 completes are unaffected.
+        #
+        # Plain `ulimit -v N` (no -S/-H) sets BOTH the soft and hard limit to
+        # N -- two real failure modes confirmed directly, not just a style
+        # nit: (1) if this process already inherited a lower HARD limit (some
+        # outer constraint, e.g. this exact host's own shared-resource
+        # limits), trying to raise it to N fails outright ("cannot modify
+        # limit: Invalid argument"), aborting this whole subshell under
+        # set -euo pipefail; (2) if the inherited SOFT limit is already lower
+        # than N but the hard limit is not, `ulimit -v N` silently RAISES
+        # that tighter existing constraint to N instead of respecting it.
+        # Fix: compute the tightest of (configured, inherited soft, inherited
+        # hard) and apply only that, only via -Sv (the soft limit alone) --
+        # never attempts to exceed the inherited hard limit, and never
+        # loosens an inherited soft limit that was already tighter.
+        CONFIGURED_MEM_KB=$((BUILD_MEM_LIMIT_GB_NUM * 1024 * 1024))
+        EFFECTIVE_MEM_KB=$CONFIGURED_MEM_KB
+        INHERITED_SOFT_KB=$(ulimit -Sv)
+        INHERITED_HARD_KB=$(ulimit -Hv)
+        if [ "$INHERITED_SOFT_KB" != "unlimited" ] && [ "$INHERITED_SOFT_KB" -lt "$EFFECTIVE_MEM_KB" ]; then
+            EFFECTIVE_MEM_KB="$INHERITED_SOFT_KB"
+        fi
+        if [ "$INHERITED_HARD_KB" != "unlimited" ] && [ "$INHERITED_HARD_KB" -lt "$EFFECTIVE_MEM_KB" ]; then
+            EFFECTIVE_MEM_KB="$INHERITED_HARD_KB"
+        fi
+        if [ "$EFFECTIVE_MEM_KB" != "$CONFIGURED_MEM_KB" ]; then
+            echo "  (inherited ulimit is tighter than ${BUILD_MEM_LIMIT_GB_NUM}GB -- using ${EFFECTIVE_MEM_KB}KB instead)"
+        fi
+        ulimit -Sv "$EFFECTIVE_MEM_KB"
+    fi
+    time "$PYTHON" nautical_routing_pipeline.py \
+        --input-dir "$GEOJSON_DIR" \
+        --output "$OUTPUT" \
+        --country US \
+        --name "$NAME" \
+        --description "$DESCRIPTION" \
+        --tags '["noaa","enc","coastal"]' \
+        --url "https://github.com/marcelrv/signalk-router-data" \
+        --license "Public Domain (NOAA)" \
+        --copyright "NOAA Office of Coast Survey" \
+        --depth-ceiling "$DEPTH_CEILING" \
+        "${STITCH_ARGS[@]}" \
+        "${EXTRA_PIPELINE_ARGS_ARR[@]}"
+) 2>&1 | tee "${LOG_PREFIX}_build.log"
 
 echo
 echo "=== [$REGION] Done: $OUTPUT ==="
