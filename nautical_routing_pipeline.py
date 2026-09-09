@@ -1204,6 +1204,22 @@ class ClassificationConfig:
     # build_skeleton_network's own docstring/comment for the full measurement.
     # Must be finite, >= 0.0, and < SKELETON_BOUNDARY_SIMPLIFY_MAX_M if enabled.
     skeleton_boundary_simplify_m: float = 0.0
+    # docs/SPEC-CHANNEL-AXES.md: merge derive_channel_axes.py's channel_axes_lines.geojson
+    # (centerlines of FAIRWY/DRGARE polygons and of lateral buoy/beacon chains) into
+    # the inland_waterways layer, so the existing "prefer the authoritative axis"
+    # machinery -- _build_inland_network topology, axis-dedup carve + reconnect,
+    # waterway-crossing connectors, cost_factor 0.8 -- applies to marked channels
+    # that are charted only as a polygon or only as buoys (61% of MD marked channels
+    # have no polygon at all; the Potomac at Coltons Point is buoy-only). Off by
+    # default: the layer is loaded but never merged, byte-identical output.
+    use_channel_axes: bool = False
+    # Derived axes below this confidence (0..1, written by derive_channel_axes.py:
+    # 0.9 polygon centerline, 0.5-0.8 mark chain by chain quality) are not merged.
+    channel_axes_min_confidence: float = 0.5
+    # Whether merged channel axes also take part in the NAVMESH-side axis-dedup carve
+    # (skeleton-side carve always applies: there the generated medial-axis twin is
+    # real). Off by default -- see _axis_dedup_suppression_mask's exclude_layer_key.
+    channel_axes_navmesh_carve: bool = False
 
     def pixel_size_for(self, min_dimension_m: float) -> float:
         return float(np.clip(min_dimension_m / self.pixel_dim_divisor,
@@ -1287,8 +1303,13 @@ def _iter_boundary_lines(geom):
         yield from (geom.geoms if isinstance(geom, MultiLineString) else [geom])
 
 
-def _default_data_sources() -> List[dict]:
+def _default_data_sources(include_channel_axes: bool = False) -> List[dict]:
     """One provenance row per input layer for the data_sources table (spec §2.2).
+
+    ``include_channel_axes`` appends the derived marked-channel axis layer's row
+    (docs/SPEC-CHANNEL-AXES.md) -- appended last so every existing layer keeps its
+    id, and only when ``--channel-axes`` is on so a default build's data_sources
+    table is byte-identical to before.
 
     All current pilot layers are ENC/IENC-derived, so default_tier=1. In particular
     inland_waterways was verified during Session 0 recon to be RWS IENC (S-57
@@ -1329,6 +1350,17 @@ def _default_data_sources() -> List[dict]:
         "accessed_date": None,
         "default_tier": DEFAULT_SOURCE_TIER,
     })
+    if include_channel_axes:
+        rows.append({
+            "name": "channel_axes",
+            "source_type": "derived",
+            "url": None,
+            "license": None,
+            "attribution_text": "channel_axes: marked-channel axes derived from ENC fairway/dredged-area "
+                                "polygons and lateral buoys/beacons (derive_channel_axes.py)",
+            "accessed_date": None,
+            "default_tier": DEFAULT_SOURCE_TIER,
+        })
     return rows
 
 
@@ -1452,7 +1484,10 @@ class NauticalRoutingPipeline:
                  narrow_fragment_reclass_max_fraction: float = 0.0,
                  pass0_fanin_cap: int = 0,
                  pass0_cross_type_first: bool = False,
-                 skeleton_boundary_simplify_m: float = 0.0):
+                 skeleton_boundary_simplify_m: float = 0.0,
+                 use_channel_axes: bool = False,
+                 channel_axes_min_confidence: float = 0.5,
+                 channel_axes_navmesh_carve: bool = False):
         self.data_paths = data_paths
         self.db_path = db_path
         self.country = country
@@ -1477,7 +1512,11 @@ class NauticalRoutingPipeline:
                                                            narrow_fragment_reclass_max_fraction=narrow_fragment_reclass_max_fraction,
                                                            pass0_fanin_cap=pass0_fanin_cap,
                                                            pass0_cross_type_first=pass0_cross_type_first,
-                                                           skeleton_boundary_simplify_m=skeleton_boundary_simplify_m)
+                                                           skeleton_boundary_simplify_m=skeleton_boundary_simplify_m,
+                                                           use_channel_axes=use_channel_axes,
+                                                           channel_axes_min_confidence=channel_axes_min_confidence,
+                                                           channel_axes_navmesh_carve=channel_axes_navmesh_carve)
+        self.channel_axes_stats = None
         if max_segment_m is not None:
             self.classification_config.max_segment_m = float(max_segment_m)
         self._validate_classification_overrides(axis_dedup_cap, axis_dedup_fraction,
@@ -1616,7 +1655,8 @@ class NauticalRoutingPipeline:
         logger.info("Parsing shapefiles and GeoJSONs...")
         # Map each layer name to its data_sources row id (deterministic insertion
         # order in _default_data_sources -> id = index+1), for provenance stamping.
-        self.layer_source_ids = {s["name"]: i + 1 for i, s in enumerate(_default_data_sources())}
+        self.layer_source_ids = {s["name"]: i + 1 for i, s in enumerate(
+            _default_data_sources(self.classification_config.use_channel_axes))}
         for layer_name, path in self.data_paths.items():
             if os.path.exists(path):
                 gdf = gpd.read_file(path)
@@ -1627,6 +1667,7 @@ class NauticalRoutingPipeline:
             else:
                 logger.warning(f"File not found for '{layer_name}': {path}. Using empty fallback.")
                 self.gdfs[layer_name] = gpd.GeoDataFrame(geometry=[], crs=self.CRS_WGS84)
+        self._merge_channel_axes()
         if "inland_waterways" in self.gdfs:
             self.gdfs["inland_waterways"] = self._densify_inland_waterways(self.gdfs["inland_waterways"])
             self.gdfs["inland_waterways"] = self._resample_inland_waterways(self.gdfs["inland_waterways"])
@@ -1635,6 +1676,44 @@ class NauticalRoutingPipeline:
             name: gdf.to_crs(self.CRS_METRIC) for name, gdf in self.gdfs.items()
         }
         self._build_obstacle_layer()
+
+    def _merge_channel_axes(self):
+        """docs/SPEC-CHANNEL-AXES.md: append derived channel axes to inland_waterways.
+
+        Runs before `_densify_inland_waterways` so `--inland-densify-max-segment-m`
+        bounds the vertex spacing of the merged axes too (Pass 0d's lateral
+        connectors and the §6.4 hub-fan-out fix both key on vertex spacing). Each
+        row carries `layer_key` so `_build_inland_network` stamps the derived
+        edges with the channel_axes data_sources id, not inland_waterways'. Off by
+        default (`use_channel_axes`): the inland layer is left untouched.
+        """
+        cfg = self.classification_config
+        axes = self.gdfs.get("channel_axes")
+        if not cfg.use_channel_axes:
+            return
+        if axes is None or axes.empty:
+            logger.warning("--channel-axes: channel_axes_lines.geojson missing or empty; nothing merged "
+                           "(run derive_channel_axes.py on the input dir first).")
+            return
+        n_total = len(axes)
+        if "confidence" in axes.columns:
+            conf = pd.to_numeric(axes["confidence"], errors="coerce").fillna(0.0)
+            axes = axes[conf >= cfg.channel_axes_min_confidence]
+        axes = axes[axes.geometry.geom_type == "LineString"].copy()
+        axes["layer_key"] = "channel_axes"
+        inland = self.gdfs.get("inland_waterways")
+        if inland is None or inland.empty:
+            merged = axes.reset_index(drop=True)
+        else:
+            inland = inland.copy()
+            inland["layer_key"] = "inland_waterways"
+            merged = gpd.GeoDataFrame(pd.concat([inland, axes], ignore_index=True), crs=self.CRS_WGS84)
+        self.gdfs["inland_waterways"] = gpd.GeoDataFrame(merged, crs=self.CRS_WGS84)
+        kinds = axes["axis_kind"].value_counts().to_dict() if "axis_kind" in axes.columns else {}
+        self.channel_axes_stats = {"loaded": n_total, "merged": int(len(axes)),
+                                   "min_confidence": cfg.channel_axes_min_confidence, "kinds": kinds}
+        logger.info(f"--channel-axes: merged {len(axes)} of {n_total} derived channel axes "
+                    f"(confidence >= {cfg.channel_axes_min_confidence}) into inland_waterways: {kinds}")
 
     def _build_fairways_unified(self):
         """FAIRWY + DRGARE as one fairway signal (docs/SPEC-FAIRWAY-HARMONIZATION.md).
@@ -1735,6 +1814,16 @@ class NauticalRoutingPipeline:
             raise ValueError(
                 f"skeleton_boundary_simplify_m must be finite, >= 0.0, and < "
                 f"{SKELETON_BOUNDARY_SIMPLIFY_MAX_M:.0f}m (got {tol_m!r}).")
+
+    @staticmethod
+    def _validate_channel_axes_min_confidence(min_confidence):
+        """`channel_axes_min_confidence` is a threshold on a 0..1 score, so it must be
+        finite and within that range; `NaN` slips past bare comparisons (always
+        `False`), so it is rejected explicitly like every other override here."""
+        if not math.isfinite(min_confidence) or min_confidence < 0.0 or min_confidence > 1.0:
+            raise ValueError(
+                f"channel_axes_min_confidence must be finite and within 0.0..1.0 "
+                f"(got {min_confidence!r}).")
 
     @staticmethod
     def _validate_classification_overrides(axis_dedup_cap_m, axis_dedup_fraction,
@@ -2004,6 +2093,8 @@ class NauticalRoutingPipeline:
             self.classification_config.narrow_fragment_reclass_max_fraction)
         self._validate_skeleton_boundary_simplify_m(
             self.classification_config.skeleton_boundary_simplify_m)
+        self._validate_channel_axes_min_confidence(
+            self.classification_config.channel_axes_min_confidence)
         # Inland waterway centerlines are unchanged (already vector line topology).
         if "inland_waterways" in self.gdfs and not self.gdfs["inland_waterways"].empty:
             self._build_inland_network()
@@ -3003,10 +3094,17 @@ class NauticalRoutingPipeline:
 
     def _build_inland_network(self):
         inland_gdf = self.gdfs["inland_waterways"]
-        src_id = self.layer_source_ids.get("inland_waterways") if hasattr(self, "layer_source_ids") else None
-        eattr = dict(edge_type="inland", source_tier=DEFAULT_SOURCE_TIER, source_id=src_id)
+        ids = self.layer_source_ids if hasattr(self, "layer_source_ids") else {}
+        default_src_id = ids.get("inland_waterways")
+        has_layer_key = "layer_key" in inland_gdf.columns
         for fi, (_, row) in enumerate(inland_gdf.iterrows()):
             geom = row.geometry
+            # docs/SPEC-CHANNEL-AXES.md: a merged derived axis is stamped with its own
+            # data_sources row so DB consumers can tell it from a charted wtwaxs line.
+            src_id = default_src_id
+            if has_layer_key and isinstance(row.get("layer_key"), str):
+                src_id = ids.get(row["layer_key"], default_src_id)
+            eattr = dict(edge_type="inland", source_tier=DEFAULT_SOURCE_TIER, source_id=src_id)
             if isinstance(geom, LineString):
                 coords = list(geom.coords)
                 for i in range(len(coords) - 1):
@@ -5100,7 +5198,8 @@ class NauticalRoutingPipeline:
                                   fill=0, dtype="uint8", all_touched=True)
         return protect.astype(bool)
 
-    def _axis_dedup_suppression_mask(self, mask, transform, utm_crs, pixel_size_m, polygon_wgs84):
+    def _axis_dedup_suppression_mask(self, mask, transform, utm_crs, pixel_size_m, polygon_wgs84,
+                                     exclude_layer_key=None):
         """SPEC-GRAPH-DENSITY.md §4.3.2: per-pixel suppression mask for water pixels
         that sit within a width-coupled tolerance of an authoritative inland_waterways
         axis line (wtwaxs/RECTRC/NAVLNE), so build_skeleton_network never generates a
@@ -5163,6 +5262,14 @@ class NauticalRoutingPipeline:
         margin_lon_deg, margin_lat_deg = _lonlat_margin_deg(polygon_wgs84, cfg.axis_dedup_cap_m)
         candidates = _candidates_by_bounds_static(inland_gdf, polygon_wgs84,
                                                     margin=margin_lat_deg, margin_lon=margin_lon_deg)
+        if exclude_layer_key is not None and "layer_key" in candidates.columns:
+            # docs/SPEC-CHANNEL-AXES.md: the navmesh carve skips derived channel axes
+            # by default -- a triangulated mesh has no generated centerline twin to
+            # suppress, so carving a strip along 900 km of axes only adds boundary
+            # vertices on both sides of it (measured: +12k navmesh vertices on MD).
+            # Boolean filtering keeps the original index, which is what the carve
+            # attribution (line_iloc) is keyed on.
+            candidates = candidates[candidates["layer_key"] != exclude_layer_key]
         if candidates.empty:
             return np.zeros(mask.shape, dtype=bool), {}
 
@@ -5436,7 +5543,8 @@ class NauticalRoutingPipeline:
             return [poly_m], set(), {}
 
         suppress, line_iloc_by_suppressed_px = self._axis_dedup_suppression_mask(
-            mask, transform, utm_crs, px, polygon_wgs84)
+            mask, transform, utm_crs, px, polygon_wgs84,
+            exclude_layer_key=None if cfg.channel_axes_navmesh_carve else "channel_axes")
         stats["rasterize_seconds"] += time.perf_counter() - t0
         if not suppress.any():
             return [poly_m], set(), {}
@@ -7354,7 +7462,7 @@ class NauticalRoutingPipeline:
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
                 [(i + 1, s["name"], s["source_type"], s["url"], s["license"],
                   s["attribution_text"], s["accessed_date"], s["default_tier"])
-                 for i, s in enumerate(_default_data_sources())]
+                 for i, s in enumerate(_default_data_sources(self.classification_config.use_channel_axes))]
             )
             
             now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -7743,6 +7851,21 @@ if __name__ == "__main__":
                              "fragment-to-fragment candidates are then rejected for free by the "
                              "existing already-connected check instead of firing. Default: off, "
                              "identical call order to today's (Pass 0, then Pass 0b).")
+    parser.add_argument("--channel-axes", action="store_true",
+                        help="Merge derive_channel_axes.py's channel_axes_lines.geojson (centerlines of "
+                             "FAIRWY/DRGARE polygons and of lateral buoy/beacon chains) into the "
+                             "inland_waterways layer, so marked channels charted only as a polygon or "
+                             "only as buoys get explicit, preferred (cost_factor 0.8) routing topology "
+                             "and the axis-dedup mechanism suppresses the generated skeleton twin next "
+                             "to them (docs/SPEC-CHANNEL-AXES.md). Default: off, byte-identical output.")
+    parser.add_argument("--channel-axes-min-confidence", type=float, default=0.5,
+                        help="With --channel-axes: only merge derived axes whose confidence is at least "
+                             "this (0..1; polygon centerlines 0.9, buoy chains 0.5-0.8). Default 0.5.")
+    parser.add_argument("--channel-axes-navmesh-carve", action="store_true",
+                        help="With --channel-axes: let derived axes also carve the open-water navmesh "
+                             "(axis-dedup's navmesh extension). Off by default: a triangulated mesh has "
+                             "no centerline twin to suppress, and the carve only adds boundary vertices "
+                             "along both sides of every axis. Skeleton-side dedup always applies.")
     parser.add_argument("--skeleton-boundary-simplify-m", type=float, default=0.0,
                         help="Simplify (preserve_topology=True) a water polygon's boundary by this "
                              "many metres before rasterizing/skeletonizing it in "
@@ -7813,6 +7936,10 @@ if __name__ == "__main__":
     except ValueError as e:
         raise SystemExit(f"--skeleton-boundary-simplify-m: {e}")
     try:
+        NauticalRoutingPipeline._validate_channel_axes_min_confidence(args.channel_axes_min_confidence)
+    except ValueError as e:
+        raise SystemExit(f"--channel-axes-min-confidence: {e}")
+    try:
         NauticalRoutingPipeline._validate_classification_overrides(
             args.axis_dedup_cap, args.axis_dedup_fraction,
             args.axis_dedup_floor_m, args.min_navmesh_radius_m)
@@ -7841,8 +7968,13 @@ if __name__ == "__main__":
         "obstacles": os.path.join(args.input_dir, "obstructions_points.geojson"),
         "hulks": os.path.join(args.input_dir, "hulks_polygons.geojson"),
         "mariculture": os.path.join(args.input_dir, "mariculture_polygons.geojson"),
-        "caution_areas": os.path.join(args.input_dir, "caution_areas_polygons.geojson")
+        "caution_areas": os.path.join(args.input_dir, "caution_areas_polygons.geojson"),
     }
+    if args.channel_axes:
+        # docs/SPEC-CHANNEL-AXES.md -- written by derive_channel_axes.py; only read
+        # (and merged into inland_waterways) under --channel-axes, so a default build
+        # neither loads nor warns about the file.
+        data_sources["channel_axes"] = os.path.join(args.input_dir, "channel_axes_lines.geojson")
 
     pipeline = NauticalRoutingPipeline(data_paths=data_sources, db_path=args.output,
                                        country=args.country, region_name=args.name,
@@ -7872,5 +8004,8 @@ if __name__ == "__main__":
                                        narrow_fragment_reclass_max_fraction=args.narrow_fragment_reclass_max_fraction,
                                        pass0_fanin_cap=args.pass0_fanin_cap,
                                        pass0_cross_type_first=args.pass0_cross_type_first,
-                                       skeleton_boundary_simplify_m=args.skeleton_boundary_simplify_m)
+                                       skeleton_boundary_simplify_m=args.skeleton_boundary_simplify_m,
+                                       use_channel_axes=args.channel_axes,
+                                       channel_axes_min_confidence=args.channel_axes_min_confidence,
+                                       channel_axes_navmesh_carve=args.channel_axes_navmesh_carve)
     pipeline.run_pipeline()
