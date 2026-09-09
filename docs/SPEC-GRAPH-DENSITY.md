@@ -1366,7 +1366,7 @@ the whole component, for cost; skipped entirely above
 `NARROW_FRAGMENT_RECLASS_MAX_COUNT` (500) fragments on one component, same
 degrade-gracefully convention as `_safe_negative_buffer`.
 
-Verified with synthetic real-geometry fixtures (`tests/test_narrow_fragment_reclass.py`):
+Verified with synthetic, hand-constructed (not mocked) geometry fixtures (`tests/test_narrow_fragment_reclass.py`):
 a cluster of tiny islands well inside otherwise-wide water (small enough that closing
 at 50m swallows the whole cluster) is correctly folded (~100% of each fragment's area
 recovered); a genuine narrow channel attached to the same water body, and the
@@ -1557,7 +1557,7 @@ risk is purely topological (a narrow real gap simplified into an accidental merg
 or the reverse), the same class of approximation `_split_wide_narrow`'s own
 pre-erosion simplify already accepts.
 
-Verified with a synthetic real-geometry fixture (`tests/test_skeleton_boundary_simplify.py`,
+Verified with a synthetic, hand-constructed (not mocked) geometry fixture (`tests/test_skeleton_boundary_simplify.py`,
 11 tests): a long channel with a sawtooth-notched edge (standing in for
 fine-grained chart-digitization noise) drops from 86 to 24 nodes at a 15m
 tolerance in this fixture; `0.0` reproduces today's skeleton output byte-for-byte
@@ -1652,14 +1652,17 @@ measurements (§10.4.2) independently reconfirm no meaningful same-type hub patt
 in the newly-investigated area either — don't re-propose either flag for this
 problem.
 
-**New finding: §9's fix (`--skeleton-boundary-simplify-m`) resolved the original
-Coltons Point location, but that location and the new one are different
-mechanisms.** Re-querying the original screenshot's bounding box (and a much wider
-surrounding box, lat 38.22-38.32 / lon -76.92--76.75) in the live v4 database finds
-**zero `node_kind_id=1` (navmesh) nodes at all** there now — every node is
-skeleton, with a mild out-degree histogram (`{1: 28, 2: 35, 3: 49}`, nothing above
-degree 3) — no hub/bowtie signature remains. §9's fix worked, fully, at that
-location. The new location, by contrast, is **navmesh-dominated** (148/210 nodes in
+**New finding: §9's fix (`--skeleton-boundary-simplify-m`) appears to have resolved
+the original Coltons Point location by graph metrics, but that location and the new
+one are different mechanisms.** Re-querying the original screenshot's bounding box
+(and a much wider surrounding box, lat 38.22-38.32 / lon -76.92--76.75) in the live
+v4 database finds **zero `node_kind_id=1` (navmesh) nodes at all** there now — every
+node is skeleton, with a mild out-degree histogram (`{1: 28, 2: 35, 3: 49}`, nothing
+above degree 3) — no hub/bowtie signature remains in the graph. This is graph-query
+evidence only — the original screenshot has not actually been re-rendered to confirm
+visually (see §9.4's "Not done" item), so treat the original location as resolved by
+graph metrics, not as visually confirmed. The new location, by contrast, is
+**navmesh-dominated** (148/210 nodes in
 a representative bounding box there are `node_kind_id=1`) — a region
 `--skeleton-boundary-simplify-m` structurally cannot touch, because it only
 `simplify()`s the *skeleton* polygon before rasterizing (`build_skeleton_network`);
