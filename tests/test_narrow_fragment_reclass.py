@@ -35,6 +35,7 @@ import math
 from unittest import mock
 
 import pytest
+from shapely.errors import GEOSException
 from shapely.geometry import box
 from shapely.ops import unary_union
 
@@ -204,6 +205,95 @@ class TestDefensiveFragmentCountCap:
         # entirely (degrade gracefully), leaving narrow untouched.
         assert p.narrow_fragment_reclass_stats == {"fragments_checked": 0, "fragments_folded": 0}
         assert len(p._explode_polygonal(narrow)) == 8
+
+
+class TestExceptionSafetyDuringPerFragmentSetup:
+    """CodeRabbit round 11 (PR #23): the per-fragment setup steps
+    (`frag.intersects`, `frag.buffer`, `wide.intersection`) ran BEFORE the
+    try/except that already guards the rest of the probe (union/closing/
+    erosion/recovery/intersection) -- a GEOSException/MemoryError from any of
+    THOSE setup calls would have aborted the whole build instead of degrading
+    gracefully, breaking this function's own documented convention ("a
+    GEOSException/MemoryError from ANY of these on one pathological fragment
+    must not abort the whole build"). Mock geometries (not real Shapely
+    objects) inject a failure at an exact point deterministically -- same
+    style as test_safe_negative_buffer.py's `_FakeGeom`.
+    """
+
+    def test_geos_exception_during_wide_intersection_setup_is_caught(self):
+        p, cfg = _pipeline(narrow_fragment_reclass_max_fraction=0.5)
+        p.classification_config = cfg
+
+        frag = mock.MagicMock()
+        frag.area = 10.0
+        frag.intersects.return_value = True
+        frag.buffer.return_value = mock.sentinel.window
+
+        wide = mock.MagicMock()
+        wide.is_empty = False
+        wide.buffer.return_value = mock.sentinel.wide_touch
+        wide.intersection.side_effect = GEOSException("std::bad_alloc")
+
+        narrow = mock.MagicMock()
+        narrow.is_empty = False
+
+        with mock.patch.object(p, "_explode_polygonal", return_value=[frag]):
+            result_wide, result_narrow = p._reclassify_scattered_narrow_fragments(
+                wide, narrow, RADIUS_M)
+
+        # Degrades gracefully: the fragment is kept narrow (unchanged today's
+        # behaviour), nothing folded, no exception propagates.
+        assert result_wide is wide
+        assert result_narrow is narrow
+        assert p.narrow_fragment_reclass_stats == {"fragments_checked": 1, "fragments_folded": 0}
+
+    def test_memory_error_during_frag_buffer_setup_is_caught(self):
+        p, cfg = _pipeline(narrow_fragment_reclass_max_fraction=0.5)
+        p.classification_config = cfg
+
+        frag = mock.MagicMock()
+        frag.area = 10.0
+        frag.intersects.return_value = True
+        frag.buffer.side_effect = MemoryError()
+
+        wide = mock.MagicMock()
+        wide.is_empty = False
+        wide.buffer.return_value = mock.sentinel.wide_touch
+
+        narrow = mock.MagicMock()
+        narrow.is_empty = False
+
+        with mock.patch.object(p, "_explode_polygonal", return_value=[frag]):
+            result_wide, result_narrow = p._reclassify_scattered_narrow_fragments(
+                wide, narrow, RADIUS_M)
+
+        assert result_wide is wide
+        assert result_narrow is narrow
+
+    def test_geos_exception_from_wide_touch_precompute_returns_unchanged(self):
+        # `wide.buffer(1e-6)` (computed once, right before the per-fragment
+        # loop) failing must return the original (wide, narrow) pair
+        # unchanged, without ever entering the per-fragment loop.
+        p, cfg = _pipeline(narrow_fragment_reclass_max_fraction=0.5)
+        p.classification_config = cfg
+
+        frag = mock.MagicMock()
+
+        wide = mock.MagicMock()
+        wide.is_empty = False
+        wide.buffer.side_effect = GEOSException("std::bad_alloc")
+
+        narrow = mock.MagicMock()
+        narrow.is_empty = False
+
+        with mock.patch.object(p, "_explode_polygonal", return_value=[frag]):
+            result_wide, result_narrow = p._reclassify_scattered_narrow_fragments(
+                wide, narrow, RADIUS_M)
+
+        assert result_wide is wide
+        assert result_narrow is narrow
+        frag.intersects.assert_not_called()
+        assert p.narrow_fragment_reclass_stats == {"fragments_checked": 0, "fragments_folded": 0}
 
 
 class TestValidation:
