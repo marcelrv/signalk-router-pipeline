@@ -2315,23 +2315,28 @@ class NauticalRoutingPipeline:
             return wide, narrow
         max_area = fraction * math.pi * radius_m ** 2
         window_margin = radius_m * 2.0
-        wide_touch = wide.buffer(1e-6)
+        try:
+            wide_touch = wide.buffer(1e-6)
+        except (GEOSException, MemoryError):
+            return wide, narrow
         folded, kept = [], []
         for frag in fragments:
-            if frag.area >= max_area or not frag.intersects(wide_touch):
-                kept.append(frag)
-                continue
-            window = frag.buffer(window_margin)
-            local_wide = wide.intersection(window)
-            if local_wide.is_empty:
-                kept.append(frag)
-                continue
-            # Whole probe (union, closing, erosion, recovery, intersection) shares
-            # one handler -- a GEOSException/MemoryError from ANY of these on one
-            # pathological fragment must not abort the whole build; degrade by
-            # keeping that fragment narrow (unchanged today's behaviour), same
-            # convention as _safe_negative_buffer's own docstring.
+            # Whole per-fragment probe -- setup (intersects/buffer/intersection)
+            # AND the union/closing/erosion/recovery/intersection probe below --
+            # shares one handler -- a GEOSException/MemoryError from ANY of these
+            # on one pathological fragment must not abort the whole build;
+            # degrade by keeping that fragment narrow (unchanged today's
+            # behaviour), same convention as _safe_negative_buffer's own
+            # docstring.
             try:
+                if frag.area >= max_area or not frag.intersects(wide_touch):
+                    kept.append(frag)
+                    continue
+                window = frag.buffer(window_margin)
+                local_wide = wide.intersection(window)
+                if local_wide.is_empty:
+                    kept.append(frag)
+                    continue
                 local_combined = unary_union([local_wide, frag]).buffer(0)
                 local_closed = (local_combined.buffer(NARROW_FRAGMENT_RECLASS_CLOSING_M)
                                  .buffer(-NARROW_FRAGMENT_RECLASS_CLOSING_M))
