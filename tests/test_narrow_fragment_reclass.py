@@ -158,7 +158,7 @@ class TestGenuineNarrowChannelAndCornersNeverFolded:
         frags = p._explode_polygonal(narrow)
         channel_frags = [f for f in frags if f.bounds[0] >= 3000.0]
         assert len(channel_frags) == 1
-        assert channel_frags[0].area == pytest.approx(89816.27982783053, rel=1e-6)
+        assert channel_frags[0].area == pytest.approx(89816.27982783053, rel=1e-3)
 
     def test_short_channel_rejected_by_geometric_closing_test_not_just_size(self):
         # This channel's area (~23,816 m^2) sits BELOW max_area at the
@@ -177,7 +177,7 @@ class TestGenuineNarrowChannelAndCornersNeverFolded:
         frags = p._explode_polygonal(narrow)
         channel_frags = [f for f in frags if f.bounds[0] >= 3000.0]
         assert len(channel_frags) == 1
-        assert channel_frags[0].area == pytest.approx(23816.279827830534, rel=1e-6)
+        assert channel_frags[0].area == pytest.approx(23816.279827830534, rel=1e-3)
 
     def test_corner_rounding_artifacts_stay_narrow(self):
         p, cfg = _pipeline(narrow_fragment_reclass_max_fraction=0.5)

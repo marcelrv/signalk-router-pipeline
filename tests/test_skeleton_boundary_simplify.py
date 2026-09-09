@@ -91,8 +91,13 @@ class TestDisabledByDefaultReproducesTodaysSkeleton:
         p_default._inland_split_cuts = {}
         p_default.build_skeleton_network(polygon)
 
-        assert p_explicit.graph.number_of_nodes() == p_default.graph.number_of_nodes()
-        assert p_explicit.graph.number_of_edges() == p_default.graph.number_of_edges()
+        # Equal counts alone don't prove identical graphs (two graphs could
+        # coincidentally have the same node/edge totals with different
+        # topology) -- compare the actual node id set and edge set. Node ids
+        # are coordinate-derived, so two byte-identical builds produce the
+        # exact same ids, not just the same count of them.
+        assert set(p_explicit.graph.nodes) == set(p_default.graph.nodes)
+        assert set(p_explicit.graph.edges) == set(p_default.graph.edges)
 
 
 class TestEnabledReducesNodeCount:
