@@ -24,6 +24,14 @@ from nautical_routing_pipeline import ClassificationConfig, NauticalRoutingPipel
 
 BASE_LON, BASE_LAT = 4.0, 51.5
 
+# Radius for _spoke_with_satellites_graph's decoy ring -- must be well above
+# _get_or_create_node's ~5-decimal-place (~1.1m) coordinate-rounding grain so all
+# 6 decoy positions round to distinct nodes (0.00001deg was tried first and found
+# to collapse two pairs of positions onto the same rounded coordinate, silently
+# leaving only 4 of the intended 6). Still tiny relative to hub_radius_deg
+# (0.003deg default), so decoys remain unambiguously H's own 6 nearest neighbors.
+DECOY_RADIUS_DEG = 0.0002
+
 
 def _pipeline(pass0_fanin_cap=0, pass0_cross_type_first=False):
     # __init__ only assigns attributes (no file I/O) -- safe to build directly, same
@@ -77,14 +85,22 @@ def _spoke_with_satellites_graph(pipeline, n_satellites=5, n_decoys=6,
 
     `n_decoys` nodes sit a few metres from the hub H -- far closer than the
     busy spoke B, so H's own k=6 nearest-neighbor list is entirely decoys (H
-    never even considers B or its satellites in its own iteration), while still
-    being beyond `snap_radius_m` so they contribute no real edges of their own
-    (radius-rejected, harmless). B sits `hub_radius_deg` from H, with
-    `n_satellites` further nodes clustered `sat_offset_deg` around B (<<
-    `hub_radius_deg`, so B is unambiguously each satellite's own nearest
-    neighbor). This leaves B to independently accumulate its OWN Pass 0
-    connections to its satellites, exactly the scenario `pass0_fanin_cap` is
-    meant to bound on any node, not just a designated "hub".
+    never even considers B or its satellites in its own iteration). They are
+    still well within `snap_radius_m` (500m), so they DO receive real Pass 0
+    edges from H -- that's exactly the mechanism that keeps H occupied: they
+    fill every one of H's own k=6 neighbor-list slots (and, when
+    `pass0_fanin_cap` is active, count toward H's own accumulated cap), not
+    because they're radius-rejected. `DECOY_RADIUS_DEG` is chosen well above
+    `_get_or_create_node`'s ~5-decimal-place (~1.1m) coordinate-rounding grain
+    -- confirmed directly: a too-small radius here previously collapsed two
+    pairs of the 6 intended decoy positions onto the same rounded coordinate,
+    silently leaving only 4 distinct decoy nodes instead of 6. B sits
+    `hub_radius_deg` from H, with `n_satellites` further nodes clustered
+    `sat_offset_deg` around B (<< `hub_radius_deg`, so B is unambiguously each
+    satellite's own nearest neighbor). This leaves B to independently
+    accumulate its OWN Pass 0 connections to its satellites, exactly the
+    scenario `pass0_fanin_cap` is meant to bound on any node, not just a
+    designated "hub".
 
     Verified directly: with `pass0_fanin_cap` disabled, B accumulates all
     `n_satellites` connections (matching `_hub_and_spokes_graph`'s own
@@ -100,8 +116,8 @@ def _spoke_with_satellites_graph(pipeline, n_satellites=5, n_decoys=6,
     decoy_ids = []
     for i in range(n_decoys):
         theta = 2 * math.pi * i / n_decoys
-        lon = BASE_LON + 0.00001 * math.cos(theta)
-        lat = BASE_LAT + 0.00001 * math.sin(theta)
+        lon = BASE_LON + DECOY_RADIUS_DEG * math.cos(theta)
+        lat = BASE_LAT + DECOY_RADIUS_DEG * math.sin(theta)
         decoy_ids.append(pipeline._get_or_create_node(lon, lat, "coastal", context="test"))
     busy_lon, busy_lat = BASE_LON + hub_radius_deg, BASE_LAT
     busy_id = pipeline._get_or_create_node(busy_lon, busy_lat, "coastal", context="test")

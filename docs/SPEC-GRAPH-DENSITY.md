@@ -1452,9 +1452,15 @@ not a substitute for a real rebuild.** Before enabling any of these by default:
 Rebuilt both `data/zeeland_fresh_clip` (`--narrow-fragment-reclass-max-fraction 0.5
 --pass0-fanin-cap 6 --pass0-cross-type-first`, on top of Zeeland's own verified
 tuning config) and the MD region (`us-east-md-stitched-v3`, same additions on top
-of the rollout's tuning config) — both clean (`crosses_land=0`, 0 hubs), matching
-§8.5's first gate. But the second gate — did it actually fix the motivating Potomac/
-Coltons Point case — **failed**:
+of the rollout's tuning config) with the new flags ENABLED, not at their `0`/off
+defaults — these builds do not exercise, and are not a substitute for, §8.5's own
+first gate (a byte-identical rebuild at the default). What they do confirm is
+`crosses_land=0` and 0 hubs with the flags on — clean and safe, but node/edge counts
+differ from baseline in both builds (see below), exactly as expected with the flags
+enabled. Whether §8.5's own byte-identical-at-default gate holds is still verified
+only by the unit test suite's disabled-by-default coverage, not by a real rebuild at
+`0`. The actual question these builds were run to answer — did enabling the flags
+fix the motivating Potomac/Coltons Point case — **failed**:
 
 - Zeeland: 42,092/124,679 nodes/edges vs. baseline 42,092/124,689 — byte-similar,
   and `--narrow-fragment-reclass-max-fraction` found **zero** candidate fragments

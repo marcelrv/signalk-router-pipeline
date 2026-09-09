@@ -234,7 +234,12 @@ fi
         # ulimit -v is in KB; only scopes this subshell and its children, so
         # steps 1/3 and 2/3 above (already run) and the rest of this script
         # after step 3/3 completes are unaffected.
-        ulimit -v $((BUILD_MEM_LIMIT_GB * 1024 * 1024))
+        # 10# forces base-10 parsing -- Bash arithmetic otherwise treats a
+        # leading-zero value (e.g. "08", plausible from a hand-typed
+        # --build-mem-limit-gb) as octal, and "08"/"09" are invalid octal
+        # literals, aborting this whole subshell under set -euo pipefail
+        # instead of applying the memory limit.
+        ulimit -v $((10#$BUILD_MEM_LIMIT_GB * 1024 * 1024))
     fi
     time "$PYTHON" nautical_routing_pipeline.py \
         --input-dir "$GEOJSON_DIR" \
