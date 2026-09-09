@@ -205,7 +205,15 @@ fi
 # under `set -euo pipefail` with a cryptic error instead of a clear one. Empty
 # and "0" are the two valid "disabled" spellings already handled by the `-n`/
 # `!= "0"` checks below; anything else must be a plain non-negative integer.
-if [ -n "$BUILD_MEM_LIMIT_GB" ] && [ "$BUILD_MEM_LIMIT_GB" != "0" ]; then
+# Normalize to ONE canonical numeric value, used for every enabled/disabled
+# check and the arithmetic below -- previously each call site re-checked
+# `[ -n ... ] && [ != "0" ]` as a STRING comparison, which a value like "00"
+# or "000" passes validation but is never EQUAL to the string "0": that took
+# the "enabled" branch with a normalized value of 0, i.e. `ulimit -v 0`,
+# which would have prevented the routing process from starting at all.
+# BUILD_MEM_LIMIT_GB_NUM=0 is the single, unambiguous "disabled" state.
+BUILD_MEM_LIMIT_GB_NUM=0
+if [ -n "$BUILD_MEM_LIMIT_GB" ]; then
     case "$BUILD_MEM_LIMIT_GB" in
         ''|*[!0-9]*)
             echo "Error: --build-mem-limit-gb/SK_ROUTING_BUILD_MEM_LIMIT_GB must be a" >&2
@@ -214,6 +222,11 @@ if [ -n "$BUILD_MEM_LIMIT_GB" ] && [ "$BUILD_MEM_LIMIT_GB" != "0" ]; then
             exit 1
             ;;
     esac
+    # 10# forces base-10 parsing -- Bash arithmetic otherwise treats a
+    # leading-zero value (e.g. "08", plausible from a hand-typed
+    # --build-mem-limit-gb) as octal, and "08"/"09" are invalid octal
+    # literals, aborting the script under set -euo pipefail.
+    BUILD_MEM_LIMIT_GB_NUM=$((10#$BUILD_MEM_LIMIT_GB))
 fi
 
 EXTRA_PIPELINE_ARGS_ARR=()
@@ -224,22 +237,17 @@ if [ -n "$EXTRA_PIPELINE_ARGS" ]; then
     read -ra EXTRA_PIPELINE_ARGS_ARR <<< "$EXTRA_PIPELINE_ARGS"
 fi
 
-if [ -n "$BUILD_MEM_LIMIT_GB" ] && [ "$BUILD_MEM_LIMIT_GB" != "0" ]; then
-    step "3/3 build routing graph -> $OUTPUT (memory ceiling: ${BUILD_MEM_LIMIT_GB}GB)"
+if [ "$BUILD_MEM_LIMIT_GB_NUM" -gt 0 ]; then
+    step "3/3 build routing graph -> $OUTPUT (memory ceiling: ${BUILD_MEM_LIMIT_GB_NUM}GB)"
 else
     step "3/3 build routing graph -> $OUTPUT (no memory ceiling)"
 fi
 (
-    if [ -n "$BUILD_MEM_LIMIT_GB" ] && [ "$BUILD_MEM_LIMIT_GB" != "0" ]; then
+    if [ "$BUILD_MEM_LIMIT_GB_NUM" -gt 0 ]; then
         # ulimit -v is in KB; only scopes this subshell and its children, so
         # steps 1/3 and 2/3 above (already run) and the rest of this script
         # after step 3/3 completes are unaffected.
-        # 10# forces base-10 parsing -- Bash arithmetic otherwise treats a
-        # leading-zero value (e.g. "08", plausible from a hand-typed
-        # --build-mem-limit-gb) as octal, and "08"/"09" are invalid octal
-        # literals, aborting this whole subshell under set -euo pipefail
-        # instead of applying the memory limit.
-        ulimit -v $((10#$BUILD_MEM_LIMIT_GB * 1024 * 1024))
+        ulimit -v $((BUILD_MEM_LIMIT_GB_NUM * 1024 * 1024))
     fi
     time "$PYTHON" nautical_routing_pipeline.py \
         --input-dir "$GEOJSON_DIR" \
