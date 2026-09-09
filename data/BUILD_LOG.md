@@ -1252,7 +1252,7 @@ skip re-preprocessing/re-clipping.)
   `us_east_md_stitched.sqlite`, for visual comparison — `us_east_md_stitched_v4.sqlite`
   in `signalk-routeiq/data`.
 - **Regression coverage**: `tests/test_skeleton_boundary_simplify.py` (11 tests,
-  real-geometry fixtures). Full suite: 300/300 passing. PR: #23.
+  synthetic, hand-constructed (not mocked) geometry fixtures). Full suite: 300/300 passing. PR: #23.
 - **Logs**: `data/us_east_md_stitched_v4_build.log`.
 
 ### #35 — `zeeland_skeletonsimplify_v2.sqlite` — combined tuning (incl. `skeleton_boundary_simplify_m`) applied to Zeeland
