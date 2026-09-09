@@ -5526,6 +5526,13 @@ class NauticalRoutingPipeline:
         margin_lon_deg, margin_lat_deg = _lonlat_margin_deg(polygon_wgs84, cfg.axis_dedup_cap_m)
         candidates = _candidates_by_bounds_static(inland_gdf, polygon_wgs84,
                                                     margin=margin_lat_deg, margin_lon=margin_lon_deg)
+        exclude_layer_key = None if cfg.channel_axes_navmesh_carve else "channel_axes"
+        if exclude_layer_key is not None and "layer_key" in candidates.columns:
+            # CodeRabbit (PR #24): apply the same exclusion _axis_dedup_suppression_mask
+            # applies, but BEFORE rasterizing -- a piece whose only nearby lines are
+            # derived channel axes must take the no-candidates fast path, not pay for
+            # a raster it then discards.
+            candidates = candidates[candidates["layer_key"] != exclude_layer_key]
         if candidates.empty:
             return [poly_m], set(), {}
 
@@ -5543,8 +5550,7 @@ class NauticalRoutingPipeline:
             return [poly_m], set(), {}
 
         suppress, line_iloc_by_suppressed_px = self._axis_dedup_suppression_mask(
-            mask, transform, utm_crs, px, polygon_wgs84,
-            exclude_layer_key=None if cfg.channel_axes_navmesh_carve else "channel_axes")
+            mask, transform, utm_crs, px, polygon_wgs84, exclude_layer_key=exclude_layer_key)
         stats["rasterize_seconds"] += time.perf_counter() - t0
         if not suppress.any():
             return [poly_m], set(), {}

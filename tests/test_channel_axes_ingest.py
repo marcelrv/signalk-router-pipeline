@@ -7,15 +7,12 @@ their own data_sources row. Off by default: byte-identical output.
 
 All fixtures are synthetic geometry near Zeeland -- no real chart data.
 """
-import math
 
 import geopandas as gpd
-import networkx as nx
 import pytest
 from shapely.geometry import LineString
 
 from nautical_routing_pipeline import (
-    ClassificationConfig,
     NauticalRoutingPipeline,
     _default_data_sources,
 )
@@ -164,3 +161,46 @@ class TestNavmeshCarveExclusion:
         suppress, _ = p._axis_dedup_suppression_mask(mask, transform, utm, px, polygon,
                                                      exclude_layer_key="channel_axes")
         assert suppress[49, 100]
+
+
+class TestNavmeshCarveFastPath:
+    """CodeRabbit (PR #24): when derived axes are excluded from the navmesh carve, a
+    piece whose only nearby lines are derived axes must take the no-candidates fast
+    path -- no rasterization at all -- rather than rasterize and then discard."""
+
+    UTM = "EPSG:32631"
+
+    def _setup(self, monkeypatch, layer_key):
+        from shapely.geometry import box
+        p = _pipeline(use_channel_axes=True)
+        p.classification_config.axis_dedup_cap_m = 50.0
+        piece = box(500000.0, 5700000.0, 502000.0, 5701000.0)
+        line = gpd.GeoSeries([LineString([(499900.0, 5700500.0), (502100.0, 5700500.0)])],
+                             crs=self.UTM).to_crs("EPSG:4326").iloc[0]
+        p.gdfs["inland_waterways"] = gpd.GeoDataFrame({"layer_key": [layer_key]}, geometry=[line], crs="EPSG:4326")
+        calls = []
+        orig = p._rasterize_water_polygon
+
+        def _spy(*a, **kw):
+            calls.append(1)
+            return orig(*a, **kw)
+        monkeypatch.setattr(p, "_rasterize_water_polygon", _spy)
+        return p, piece, calls
+
+    def test_only_derived_axes_nearby_skips_rasterization(self, monkeypatch):
+        p, piece, calls = self._setup(monkeypatch, "channel_axes")
+        result, seams, attrib = p._axis_dedup_carve_navmesh_pieces(piece, self.UTM)
+        assert calls == []
+        assert len(result) == 1 and result[0].equals(piece) and not seams and not attrib
+
+    def test_charted_line_nearby_still_rasterizes_and_carves(self, monkeypatch):
+        p, piece, calls = self._setup(monkeypatch, "inland_waterways")
+        result, _, _ = p._axis_dedup_carve_navmesh_pieces(piece, self.UTM)
+        assert calls == [1]
+        assert len(result) >= 2          # the through-line carves the piece in two
+
+    def test_opt_in_flag_lets_derived_axes_carve(self, monkeypatch):
+        p, piece, calls = self._setup(monkeypatch, "channel_axes")
+        p.classification_config.channel_axes_navmesh_carve = True
+        result, _, _ = p._axis_dedup_carve_navmesh_pieces(piece, self.UTM)
+        assert calls == [1] and len(result) >= 2

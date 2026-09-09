@@ -4,12 +4,11 @@ All fixtures are synthetic geometry in a local metric frame (or a tiny WGS84 pat
 near Zeeland for the end-to-end run) -- no real chart data.
 """
 import json
-import math
 import os
 
 import geopandas as gpd
 import pytest
-from shapely.geometry import LineString, Point, Polygon, box
+from shapely.geometry import LineString, Point, box
 
 import derive_channel_axes as dca
 from derive_channel_axes import (
@@ -84,17 +83,34 @@ class TestPolygonSkeleton:
     def test_l_shaped_channel_keeps_both_legs(self):
         poly = box(0, 0, 1500, 100).union(box(1400, 0, 1500, 1200))
         lines = polygon_skeleton(poly, step_m=10.0, prune_m=150.0, reach_m=350.0)
-        total = sum(l.length for l in lines)
+        total = sum(ln.length for ln in lines)
         # ~1450 (x-leg to the corner) + ~1150 (y-leg) minus a little at the corner
         assert 2300 < total < 2750
-        assert all(poly.buffer(1.0).covers(l) for l in lines)
+        assert all(poly.buffer(1.0).covers(ln) for ln in lines)
+
+    def test_short_component_is_rejected_as_a_whole(self, tmp_path):
+        # a 150 m fairway stub (below --min-length-m 200) yields no axis but a reason
+        utm = "EPSG:32631"
+        x0, y0 = 550000.0, 5700000.0
+        d = tmp_path / "stub"
+        d.mkdir()
+        gpd.GeoDataFrame(geometry=[box(x0, y0, x0 + 3000, y0 + 3000)], crs=utm).to_crs("EPSG:4326").to_file(
+            d / "coastal_water_polygons.geojson", driver="GeoJSON")
+        gpd.GeoDataFrame({"OBJNAM": ["Stub"], "src_objl": ["FAIRWY"]},
+                         geometry=[box(x0 + 1000, y0 + 1000, x0 + 1150, y0 + 1030)], crs=utm
+                         ).to_crs("EPSG:4326").to_file(d / "fairways_polygons.geojson", driver="GeoJSON")
+        ChannelAxisDeriver(str(d), str(d), Params()).run()
+        axes = gpd.read_file(d / dca.OUTPUT_AXES)
+        rejected = gpd.read_file(d / dca.OUTPUT_REJECTED)
+        assert len(axes) == 0
+        assert list(rejected["reason"]) == ["too_short"]
 
     def test_side_branch_survives_pruning(self):
         poly = box(0, 0, 2000, 100).union(box(950, 0, 1050, 800))
         lines = polygon_skeleton(poly, step_m=10.0, prune_m=150.0, reach_m=350.0)
         # three legs meeting at a junction: west, east, and the 800 m branch
         assert len(lines) == 3
-        assert max(l.length for l in lines) > 700
+        assert max(ln.length for ln in lines) > 700
 
 
 # ----------------------------------------------------------------------------- marks

@@ -269,14 +269,16 @@ def graph_to_polylines(G: nx.Graph) -> List[LineString]:
             if (s, nbr) in seen:
                 continue
             pts = list(_edge_coords(G, s, nbr))
-            seen.add((s, nbr)); seen.add((nbr, s))
+            seen.add((s, nbr))
+            seen.add((nbr, s))
             prev, cur = s, nbr
             while G.degree(cur) == 2:
                 nxt = [n for n in G.neighbors(cur) if n != prev][0]
                 if (cur, nxt) in seen:
                     break
                 pts.extend(_edge_coords(G, cur, nxt)[1:])
-                seen.add((cur, nxt)); seen.add((nxt, cur))
+                seen.add((cur, nxt))
+                seen.add((nxt, cur))
                 prev, cur = cur, nxt
             if len(pts) >= 2:
                 lines.append(LineString(pts))
@@ -363,11 +365,10 @@ def polygon_skeleton(poly: Polygon, step_m: float, prune_m: float, reach_m: floa
         lines = [lp] if lp is not None else []
         leaves = {_key(*lp.coords[0]), _key(*lp.coords[-1])} if lp is not None else set()
     out = []
-    for l in lines:
-        ls = l.simplify(1.0)
-        out.append(extend_to_boundary(ls, poly, reach_m,
-                                      extend_start=_key(*l.coords[0]) in leaves,
-                                      extend_end=_key(*l.coords[-1]) in leaves))
+    for ln in lines:
+        out.append(extend_to_boundary(ln.simplify(1.0), poly, reach_m,
+                                      extend_start=_key(*ln.coords[0]) in leaves,
+                                      extend_end=_key(*ln.coords[-1]) in leaves))
     return out
 
 
@@ -603,13 +604,15 @@ def split_anchors(anchors: List[Anchor], max_gap_m: float, max_turn_deg: float) 
         if cur:
             gap = cur[-1].pt.distance(a.pt)
             if gap > max_gap_m:
-                chains.append(cur); cur = []
+                chains.append(cur)
+                cur = []
         if cur and len(cur) >= 2:
             d0 = _unit(cur[-2].pt, cur[-1].pt)
             d1 = _unit(cur[-1].pt, a.pt)
             cos = max(-1.0, min(1.0, d0[0] * d1[0] + d0[1] * d1[1]))
             if math.degrees(math.acos(cos)) > max_turn_deg:
-                chains.append(cur); cur = [cur[-1]]
+                chains.append(cur)
+                cur = [cur[-1]]
         cur.append(a)
     if cur:
         chains.append(cur)
@@ -860,10 +863,10 @@ def snap_end_to_lines(part: LineString, lines: List[LineString], max_m: float, l
     for end in (0, -1):
         pt = Point(coords[end])
         best = None
-        for l in lines:
-            if l.distance(pt) > max_m:
+        for ln in lines:
+            if ln.distance(pt) > max_m:
                 continue
-            for c in l.coords:
+            for c in ln.coords:
                 d = pt.distance(Point(c))
                 if d <= max_m and (best is None or d < best[0]):
                     best = (d, c)
@@ -884,7 +887,7 @@ def subtract_coverage(line: LineString, coverage_lines: List[LineString], buffer
     """Remove the parts of ``line`` within ``buffer_m`` of any coverage line."""
     if not coverage_lines:
         return [line], 0.0
-    cov = unary_union([l.buffer(buffer_m) for l in coverage_lines])
+    cov = unary_union([ln.buffer(buffer_m) for ln in coverage_lines])
     rest = line.difference(cov)
     parts = [p for p in _flatten_lines(rest) if p.length >= min_len_m]
     removed = line.length - sum(p.length for p in parts)
@@ -1038,6 +1041,14 @@ class ChannelAxisDeriver:
                 n_rej += 1
                 self._reject(comp.exterior, 2, name, "voronoi_empty", {})
                 continue
+            skeleton_m = sum(ln.length for ln in lines)
+            if skeleton_m < p.min_length_m:
+                # The length floor applies to the whole component (its parts may be
+                # short links between junctions); a component whose entire skeleton
+                # is below the floor is a stub not worth an axis.
+                n_rej += 1
+                self._reject(comp.exterior, 2, name, "too_short", {"skeleton_m": round(skeleton_m, 1)})
+                continue
             water = self.navigable_water(comp, 50.0)
             confidence = 0.9 if not (aspect_ratio(comp) < p.polygon_min_aspect) else 0.8
             for li, line in enumerate(lines):
@@ -1048,7 +1059,8 @@ class ChannelAxisDeriver:
                                                "n_marks": None, "n_gates": None},
                                         depth_ref=None, coverage_tiers=(1,), part_min_len_m=20.0)
                 if res:
-                    n_ok += res[0]; km += res[1]
+                    n_ok += res[0]
+                    km += res[1]
                 else:
                     n_rej += 1
         self.stats["tier2"] = {"components": len(components), "axes": n_ok, "km": round(km, 1),
@@ -1092,7 +1104,8 @@ class ChannelAxisDeriver:
                         continue
                     ok, reason = self._derive_one_chain(chain, chain_marks, name, convention_odd_port)
                     if ok:
-                        n_ok += ok[0]; km += ok[1]
+                        n_ok += ok[0]
+                        km += ok[1]
                     else:
                         n_rej += 1
                         reasons[reason] += 1
