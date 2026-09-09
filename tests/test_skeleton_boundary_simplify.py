@@ -23,6 +23,7 @@ convention.
 """
 import math
 
+import geopandas as gpd
 import pytest
 from shapely.geometry import Polygon, box
 from shapely.ops import transform as shapely_transform, unary_union
@@ -61,6 +62,32 @@ def _jagged_channel_wgs84(length=1500.0, width=250.0, tooth_depth=8.0, tooth_spa
         x += tooth_spacing
     water = base.difference(unary_union(teeth))
     return shapely_transform(lambda x, y: _to_lonlat(x, y), water)
+
+
+def _notched_channel_wgs84(notch_depth=40.0):
+    """A long rectangular channel with ONE tall triangular notch cut into one
+    long edge -- deep enough (`notch_depth`) that a `skeleton_boundary_simplify_m`
+    tolerance above it removes the notch's apex vertex entirely, growing the
+    simplified polygon outward to cover the whole notch cavity. Single notch
+    (not a sawtooth) so the exact land-query-extent test below has one
+    unambiguous cavity to place a land feature inside.
+    """
+    base = box(0, 0, 1500, 250)
+    notch = Polygon([(700, 0), (750, notch_depth), (800, 0)])
+    water = base.difference(notch)
+    return shapely_transform(lambda x, y: _to_lonlat(x, y), water)
+
+
+def _land_inset_in_notch_wgs84():
+    """A small triangle strictly inside `_notched_channel_wgs84`'s notch cavity,
+    inset ~5-10m from the notch's own edges on every side. Never touches the
+    channel's water polygon at all (a deliberate gap, standing in for
+    independently-digitized land/water layers that don't share an exact
+    boundary) -- so `_land_union_for` queried against the ORIGINAL,
+    pre-simplify polygon can never find it via `intersects`.
+    """
+    land = Polygon([(740, 5), (750, 30), (760, 5)])
+    return shapely_transform(lambda x, y: _to_lonlat(x, y), land)
 
 
 def _pipeline(skeleton_boundary_simplify_m=0.0):
@@ -165,3 +192,46 @@ class TestValidation:
     def test_infinity_is_rejected(self):
         with pytest.raises(ValueError):
             NauticalRoutingPipeline._validate_skeleton_boundary_simplify_m(float("inf"))
+
+
+class TestLandQueryUsesPostSimplifyExtent:
+    """CodeRabbit round 9 (PR #23): when the boundary simplify grows `poly_m`
+    past the original `polygon` (removing a notch), the land query feeding
+    `_rasterize_water_polygon` must cover the grown extent too. Before the
+    fix, `land_m = self._land_union_for(polygon, utm)` queried against the
+    stale, pre-simplify `polygon` -- a land feature sitting in the gap between
+    the original boundary and the smoothed one (never touching the original,
+    independently-digitized water polygon) was invisible to that query and
+    would have produced unmasked, routable land-crossing pixels. Mirrors the
+    pattern `_axis_dedup_carve_navmesh_pieces` already used correctly
+    (deriving its own land/candidate query polygon from the post-processed
+    `poly_m`, not the pre-processing input).
+    """
+
+    def test_land_query_polygon_covers_post_simplify_extent(self, monkeypatch):
+        polygon = _notched_channel_wgs84()
+        land = _land_inset_in_notch_wgs84()
+        # Sanity: the land feature must NOT touch the original, pre-simplify
+        # polygon -- otherwise this test isn't exercising the gap at all.
+        assert not polygon.intersects(land)
+
+        p = _pipeline(skeleton_boundary_simplify_m=45.0)
+        p.gdfs["land"] = gpd.GeoDataFrame(geometry=[land], crs="EPSG:4326")
+
+        captured = {}
+        real_land_union_for = p._land_union_for
+
+        def spy(poly, utm):
+            captured["polygon"] = poly
+            return real_land_union_for(poly, utm)
+
+        monkeypatch.setattr(p, "_land_union_for", spy)
+
+        p.build_skeleton_network(polygon)
+
+        # The notch's apex (40m deviation) must actually have been simplified
+        # away at this 45m tolerance, or the rest of this test is vacuous.
+        assert p.skeleton_boundary_simplify_stats["vertices_before"] > \
+            p.skeleton_boundary_simplify_stats["vertices_after"]
+        assert captured.get("polygon") is not None
+        assert captured["polygon"].intersects(land)

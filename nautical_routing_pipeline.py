@@ -5720,12 +5720,19 @@ class NauticalRoutingPipeline:
         # matching every other flag's convention in this file.
         #
         # Safety: `_rasterize_water_polygon` always re-intersects against `land_m`
-        # (rasterized separately from the authoritative, unmodified land layer)
         # AFTER this simplify, so a simplified water boundary bulging slightly
         # into what should be land can never produce a routable pixel there --
-        # the land mask is the actual safety gate, not this polygon's own
-        # precision. The risk this carries is purely topological (a narrow real
-        # gap simplified into a merge, or vice versa), the same class of
+        # but only because `land_m` itself is re-queried against the SIMPLIFIED
+        # (post-simplify) extent below, not the original `polygon` -- a simplify
+        # can grow the water boundary outward past a land feature that never
+        # touched the original, pre-simplify polygon (independently-digitized
+        # land/water layers are not guaranteed to share a boundary), which would
+        # otherwise let that land feature's own pixels go unmasked. Mirrors
+        # `_axis_dedup_carve_navmesh_pieces`'s existing pattern (line ~5400)
+        # of deriving its land/candidate query polygon from the already-
+        # processed `poly_m`, not the pre-processing input. The risk this
+        # carries beyond that is purely topological (a narrow real gap
+        # simplified into a merge, or vice versa), the same class of
         # approximation `_split_wide_narrow`'s own pre-erosion simplify already
         # accepts -- not a land-crossing risk.
         if cfg.skeleton_boundary_simplify_m > 0.0:
@@ -5735,6 +5742,9 @@ class NauticalRoutingPipeline:
             stats["pieces"] += 1
             stats["vertices_before"] += vertices_before
             stats["vertices_after"] += len(shapely.get_coordinates(poly_m))
+            # Land/candidate queries below must use the post-simplify extent --
+            # see the safety comment above.
+            polygon = gpd.GeoSeries([poly_m], crs=utm).to_crs(self.CRS_WGS84).iloc[0]
         b = poly_m.bounds
         min_dim = min(b[2] - b[0], b[3] - b[1])
         px = cfg.pixel_size_for(min_dim)
