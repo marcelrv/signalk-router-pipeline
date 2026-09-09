@@ -630,6 +630,23 @@ ADOPT_POLY_TOLERANCE_M = 50.0
 NAVMESH_TARGET_EDGE_M = 650.0  # target interior triangle edge length (spec's 500-800m band)
 NAVMESH_PSLG_BUDGET = 20_000    # max len(vertices)+len(segments) fed into triangle's PSLG mode
 NAVMESH_MAX_TRIANGLES = 200_000 # sanity cap on triangulate() output; retry coarser above this
+NARROW_FRAGMENT_RECLASS_MAX_COUNT = 500  # _reclassify_scattered_narrow_fragments: skip entirely
+                                          # above this many narrow fragments on one component --
+                                          # degrade gracefully rather than pay unbounded per-
+                                          # fragment re-erosion cost on a pathological input,
+                                          # matching _safe_negative_buffer's own convention.
+SKELETON_BOUNDARY_SIMPLIFY_MAX_M = 200.0  # build_skeleton_network: ceiling on
+                                           # skeleton_boundary_simplify_m -- measured
+                                           # gains plateau well below this (~30m); a much
+                                           # larger value risks eroding real channel shape.
+NARROW_FRAGMENT_RECLASS_CLOSING_M = 50.0  # _reclassify_scattered_narrow_fragments: morphological
+                                           # closing radius applied before the fold-back
+                                           # eligibility re-test, smoothing away small-scale
+                                           # coastline detail without widening a genuine narrow
+                                           # channel -- reuses DEPTH_SPLIT_CLOSING_RADIUS_M's own
+                                           # established magnitude/pattern for the identical kind
+                                           # of "bridge realistic small-scale misalignment/detail"
+                                           # problem in _split_deep_shallow.
 DEPTH_SPLIT_SAFETY_MARGIN_M = 20.0  # _split_deep_shallow: extra erosion past the depth-ceiling
                                      # contour so navmesh boundary edges clear it with margin,
                                      # not sit exactly on the transition
@@ -1107,6 +1124,86 @@ class ClassificationConfig:
     # axis_dedup_floor_m's established "effectively coincident" floor. Must be
     # finite, >= 0.0, and < NODE_MERGE_MAX_M (see _validate_node_merge_m).
     node_merge_m: float = 0.0
+    # Follow-on to SPEC-GRAPH-DENSITY.md: _split_wide_narrow's erosion has no
+    # size/isolation-aware fold-back, unlike its siblings _split_deep_shallow and
+    # _tile_navmesh_piece's tile_reclassified re-filter. A small, isolated sliver
+    # that erodes away purely because the LOCAL coastline nearby is intricate --
+    # not because the water itself is narrow -- becomes "narrow" and is routed to
+    # skeleton/medial-axis treatment even when it sits embedded in otherwise wide,
+    # deep, easily-navigable water. build_skeleton_network then rasterizes that
+    # scattered narrow remainder as one piece, but geometrically separate slivers
+    # don't end up raster-connected, so each becomes its own disconnected
+    # medial-axis sub-chain -- and _stitch_component_pieces' Pass 0 (a type-blind,
+    # uncapped k=6 nearest-neighbor pass) reconnects many such sub-chain pairs
+    # with straight connectors, producing a dense crisscross tangle between the
+    # scattered fragments instead of the plain triangulated mesh the surrounding
+    # water gets. 0.0 (default) disables this entirely -- _split_wide_narrow
+    # returns byte-identical wide/narrow/seam to today's, matching every other
+    # flag's convention in this dataclass. > 0.0: a narrow fragment whose area is
+    # below `this fraction * pi * min_navmesh_radius_m**2` is a *candidate* for
+    # folding into `wide`, but only actually folded if re-running this same
+    # erode/dilate/intersect test on the surrounding wide water unioned with the
+    # fragment still recovers (most of) the fragment -- i.e. only when the
+    # surrounding wide water genuinely confers eligibility on the sliver by
+    # connectivity, not merely because it is small. This is what stops a genuine
+    # narrow channel's own chopped-up mid-section (which fails that re-erosion
+    # test by construction, same as it failed the original one) from ever being
+    # folded back. See _reclassify_scattered_narrow_fragments.
+    narrow_fragment_reclass_max_fraction: float = 0.0
+    # SPEC-GRAPH-DENSITY.md follow-on: _stitch_component_pieces' Pass 0 (the very
+    # first stitching pass, run before Pass 0b/0c/0d) is a raw, type-blind, per-
+    # node k=6 nearest-neighbor pass with NO fan-in/fan-out cap of any kind --
+    # unlike Pass 2 (pass2_max_fanin_per_node) and Pass 0c/0d's own target side
+    # (pass0_target_fanin_cap), which is a DIFFERENT, already-shipped flag scoped
+    # only to those two passes. Deliberately a separate flag rather than
+    # reinterpreting pass0_target_fanin_cap, to avoid silently changing what an
+    # already-shipped flag means. Where many small fragments sit close together
+    # (see narrow_fragment_reclass_max_fraction above), Pass 0 independently
+    # discovers and accepts a valid connector for many distinct fragment pairs.
+    # 0 (default) disables this entirely -- Pass 0 stays byte-identical to
+    # today's. > 0: applied SYMMETRICALLY to both sides of a candidate pair
+    # (unlike pass0_target_fanin_cap's target-only asymmetry -- Pass 0 has no
+    # source/target direction, either side of a same-type pair can become a
+    # hub); once a node has accumulated this many Pass-0-added edges, further
+    # Pass-0 candidates touching it are skipped and the next-nearest is tried
+    # instead. Safe regardless of value: Pass 0b/0c/0d/Pass 1/Pass 2 and
+    # _resolve_local_skeleton_gaps all run afterward and remain the connectivity
+    # guarantee, exactly as they already are for whatever Pass 0c/0d's own caps
+    # reject.
+    pass0_fanin_cap: int = 0
+    # SPEC-GRAPH-DENSITY.md follow-on: Pass 0b (cross-type k=6 NN, navmesh
+    # perimeter vs everything else) already does what a fragment embedded near
+    # open water wants -- connect outward to the surrounding navmesh, immune to
+    # Pass 0's same-type crowding -- but it runs SECOND, after Pass 0 has already
+    # unioned many same-type fragment-to-fragment pairs together. False
+    # (default) leaves Pass 0/0b's execution order unchanged, byte-identical to
+    # today's. True: run Pass 0b before Pass 0, so its outward cross-type unions
+    # land first and many of Pass 0's same-type candidates are then rejected for
+    # free by the existing find(u)==find(v) check instead of firing at all. Only
+    # the call order changes -- no change to Pass 0/0b/0c/0d/Pass 1/Pass 2's own
+    # internal logic or caps.
+    pass0_cross_type_first: bool = False
+    # Follow-on to SPEC-GRAPH-DENSITY.md: build_skeleton_network rasterizes/
+    # skeletonizes the water polygon with NO boundary simplification at all --
+    # straight from the source layer's own ENC/chart digitization detail (a real
+    # complex tidal marsh/creek water body can carry hundreds of thousands of
+    # vertices). Every small boundary wiggle spawns its own tiny branch in the
+    # medial axis, producing a dense tangle of short junction-to-junction edges
+    # -- confirmed directly this is NOT a resampling artifact (those chains are
+    # already minimal, 2 raw points) but genuine junction-count density driven
+    # by boundary noise. 0.0 (default) disables this entirely -- the polygon fed
+    # to rasterization stays byte-identical to today's, matching every other
+    # flag's convention in this dataclass. > 0.0: simplify (preserve_topology=
+    # True) the metric-projected polygon by this many metres before rasterizing.
+    # Safe by construction against land-crossing: _rasterize_water_polygon always
+    # re-intersects against the land mask, rasterized separately from the
+    # unmodified land layer, AFTER this simplify -- a slightly-bulged water
+    # boundary can never produce a routable pixel over real land. Measured
+    # directly on a real narrow-water piece: node count in the affected area drops
+    # 17%/27%/35% at 5m/15m/30m, plateauing past ~30m -- see
+    # build_skeleton_network's own docstring/comment for the full measurement.
+    # Must be finite, >= 0.0, and < SKELETON_BOUNDARY_SIMPLIFY_MAX_M if enabled.
+    skeleton_boundary_simplify_m: float = 0.0
 
     def pixel_size_for(self, min_dimension_m: float) -> float:
         return float(np.clip(min_dimension_m / self.pixel_dim_divisor,
@@ -1351,7 +1448,11 @@ class NauticalRoutingPipeline:
                  connector_merge_m: float = 0.0,
                  pass2_max_fanin_per_node: int = 0,
                  pass0_target_fanin_cap: int = 0,
-                 node_merge_m: float = 0.0):
+                 node_merge_m: float = 0.0,
+                 narrow_fragment_reclass_max_fraction: float = 0.0,
+                 pass0_fanin_cap: int = 0,
+                 pass0_cross_type_first: bool = False,
+                 skeleton_boundary_simplify_m: float = 0.0):
         self.data_paths = data_paths
         self.db_path = db_path
         self.country = country
@@ -1372,7 +1473,11 @@ class NauticalRoutingPipeline:
                                                            connector_merge_m=connector_merge_m,
                                                            pass2_max_fanin_per_node=pass2_max_fanin_per_node,
                                                            pass0_target_fanin_cap=pass0_target_fanin_cap,
-                                                           node_merge_m=node_merge_m)
+                                                           node_merge_m=node_merge_m,
+                                                           narrow_fragment_reclass_max_fraction=narrow_fragment_reclass_max_fraction,
+                                                           pass0_fanin_cap=pass0_fanin_cap,
+                                                           pass0_cross_type_first=pass0_cross_type_first,
+                                                           skeleton_boundary_simplify_m=skeleton_boundary_simplify_m)
         if max_segment_m is not None:
             self.classification_config.max_segment_m = float(max_segment_m)
         self._validate_classification_overrides(axis_dedup_cap, axis_dedup_fraction,
@@ -1434,6 +1539,16 @@ class NauticalRoutingPipeline:
         # the end of build_network. Both stay 0 when node_merge_m == 0.0 (the code
         # path that increments them is only entered when the feature is on).
         self.node_merge_stats = {"created": 0, "merged": 0}
+        # Follow-on to SPEC-GRAPH-DENSITY.md: narrow_fragment_reclass_max_fraction
+        # summary counters, logged once at the end of build_network. Both stay 0
+        # when the fraction is 0.0 (the code path that increments them is only
+        # entered when the feature is on).
+        self.narrow_fragment_reclass_stats = {"fragments_checked": 0, "fragments_folded": 0}
+        # Follow-on to SPEC-GRAPH-DENSITY.md: skeleton_boundary_simplify_m summary
+        # counters, logged once at the end of build_network. All stay 0 when the
+        # tolerance is 0.0 (the code path that increments them is only entered
+        # when the feature is on).
+        self.skeleton_boundary_simplify_stats = {"pieces": 0, "vertices_before": 0, "vertices_after": 0}
         # DIAGNOSTIC (connectivity-regression investigation, not shipped as a
         # feature): per-pass attempt/outcome counters for _stitch_component_pieces
         # and _resolve_local_skeleton_gaps, plus aggregate union-find group counts
@@ -1580,6 +1695,46 @@ class NauticalRoutingPipeline:
             raise ValueError(
                 f"node_merge_m must be finite, >= 0.0, and < {NODE_MERGE_MAX_M:.0f}m "
                 f"(got {merge_tol_m!r}).")
+
+    @staticmethod
+    def _validate_narrow_fragment_reclass_max_fraction(fraction):
+        """`narrow_fragment_reclass_max_fraction == 0.0` (the default) disables
+        `_reclassify_scattered_narrow_fragments` entirely -- no validation needed,
+        same convention as `connector_merge_m`/`node_merge_m`. `> 0.0` must be
+        finite and at most 1.0: the fraction scales the eligibility-disk area
+        (`fraction * pi * min_navmesh_radius_m**2`) that bounds which narrow
+        fragments are even considered for fold-back, and a value above 1.0 would
+        let a fragment as large as (or larger than) the eligibility disk itself
+        become a candidate, defeating the point of restricting this to small
+        slivers. `NaN`/negative slip past a bare `<= 0.0` check (`NaN`
+        comparisons are always `False` in Python), so both are checked
+        explicitly rather than relying on that alone.
+        """
+        if fraction == 0.0:
+            return
+        if not math.isfinite(fraction) or fraction < 0.0 or fraction > 1.0:
+            raise ValueError(
+                f"narrow_fragment_reclass_max_fraction must be finite, >= 0.0, and <= 1.0 "
+                f"(got {fraction!r}).")
+
+    @staticmethod
+    def _validate_skeleton_boundary_simplify_m(tol_m):
+        """`skeleton_boundary_simplify_m == 0.0` (the default) disables the
+        pre-rasterization boundary simplify entirely -- no validation needed, same
+        convention as `connector_merge_m`/`node_merge_m`. `> 0.0` must be finite
+        and strictly less than `SKELETON_BOUNDARY_SIMPLIFY_MAX_M` -- measured gains
+        plateau well below that ceiling (~30m), and a much larger value risks
+        eroding real channel shape rather than just chart-digitization noise.
+        `NaN`/negative slip past a bare `<= 0.0` check (`NaN` comparisons are
+        always `False` in Python), so both are checked explicitly rather than
+        relying on that alone.
+        """
+        if tol_m == 0.0:
+            return
+        if not math.isfinite(tol_m) or tol_m < 0.0 or tol_m >= SKELETON_BOUNDARY_SIMPLIFY_MAX_M:
+            raise ValueError(
+                f"skeleton_boundary_simplify_m must be finite, >= 0.0, and < "
+                f"{SKELETON_BOUNDARY_SIMPLIFY_MAX_M:.0f}m (got {tol_m!r}).")
 
     @staticmethod
     def _validate_classification_overrides(axis_dedup_cap_m, axis_dedup_fraction,
@@ -1845,6 +2000,10 @@ class NauticalRoutingPipeline:
         self._node_merge_grid = defaultdict(list)
         self._validate_connector_merge_m(self.classification_config.connector_merge_m)
         self._validate_node_merge_m(self.classification_config.node_merge_m)
+        self._validate_narrow_fragment_reclass_max_fraction(
+            self.classification_config.narrow_fragment_reclass_max_fraction)
+        self._validate_skeleton_boundary_simplify_m(
+            self.classification_config.skeleton_boundary_simplify_m)
         # Inland waterway centerlines are unchanged (already vector line topology).
         if "inland_waterways" in self.gdfs and not self.gdfs["inland_waterways"].empty:
             self._build_inland_network()
@@ -2004,6 +2163,20 @@ class NauticalRoutingPipeline:
                         f"_get_or_create_node calls reused an existing node within "
                         f"{self.classification_config.node_merge_m:.1f}m instead of minting a "
                         f"near-duplicate, {nms['created']} new nodes created under this tolerance.")
+        nfrs = self.narrow_fragment_reclass_stats
+        if nfrs["fragments_checked"]:
+            logger.info(f"Narrow fragment reclassification: {nfrs['fragments_folded']}/"
+                        f"{nfrs['fragments_checked']} scattered narrow fragments folded back into "
+                        f"the navmesh-eligible path (--narrow-fragment-reclass-max-fraction="
+                        f"{self.classification_config.narrow_fragment_reclass_max_fraction:.3f}).")
+        sbs = self.skeleton_boundary_simplify_stats
+        if sbs["pieces"]:
+            pct = (100.0 * (1.0 - sbs["vertices_after"] / sbs["vertices_before"])
+                   if sbs["vertices_before"] else 0.0)
+            logger.info(f"Skeleton boundary simplify: {sbs['pieces']} pieces, "
+                        f"{sbs['vertices_before']} -> {sbs['vertices_after']} boundary vertices "
+                        f"({pct:.1f}% reduction) before rasterizing (--skeleton-boundary-simplify-m="
+                        f"{self.classification_config.skeleton_boundary_simplify_m:.1f}).")
         logger.info(f"Network built with {self.graph.number_of_nodes()} nodes and {self.graph.number_of_edges()} edges.")
 
     # ------------------------------------------------------------------
@@ -2081,8 +2254,119 @@ class NauticalRoutingPipeline:
         wide = eroded.buffer(radius_m, quad_segs=16).buffer(0).intersection(cleaned)
         narrow = cleaned.difference(wide).buffer(0)
         wide, narrow = self._clean_polygonal(wide), self._clean_polygonal(narrow)
+        if self.classification_config.narrow_fragment_reclass_max_fraction > 0.0:
+            wide, narrow = self._reclassify_scattered_narrow_fragments(wide, narrow, radius_m)
         seam = wide.boundary.intersection(narrow.boundary)
         return wide, narrow, seam
+
+    def _reclassify_scattered_narrow_fragments(self, wide, narrow, radius_m: float):
+        """Fold small, isolated `narrow` fragments back into `wide` where the
+        surrounding wide water genuinely confers navmesh eligibility on them by
+        connectivity -- see ClassificationConfig.narrow_fragment_reclass_max_
+        fraction's docstring for the full motivation (this is what stops an
+        intricate-but-deep coastline area from fragmenting into many scattered
+        skeleton slivers that _stitch_component_pieces' Pass 0 then crisscrosses
+        with straight connectors instead of the plain triangulated mesh the rest
+        of that same open water gets).
+
+        Two-part test per fragment:
+          1. Size: area below `fraction * pi * radius_m**2` -- only small slivers
+             are even considered.
+          2. Geometric justification: simply re-running _split_wide_narrow's own
+             erode/dilate/intersect test on `wide` unioned with just this one
+             fragment CANNOT ever recover it -- erosion is monotonic, so eroding
+             any subset of the original `cleaned` polygon (which `wide ∪ frag`
+             always is) can only ever recover a subset of what eroding the whole
+             of `cleaned` already recovered, i.e. never more than the original
+             split already gave `wide`. Testing that would be a silent no-op.
+             Instead, apply a morphological CLOSING (dilate then erode --
+             mirrors _split_deep_shallow's own DEPTH_SPLIT_CLOSING_RADIUS_M
+             pattern) to `wide ∪ frag` before the eligibility re-test. Closing is
+             extensive (its output always contains its input) and specifically
+             smooths away small-scale boundary notches/detail -- e.g. a narrow
+             spit or cove tip -- without widening a genuinely narrow channel,
+             whose width is a real, larger-scale property closing at a modest
+             radius does not change. This is what lets a fragment that failed
+             the original erosion purely because of fine local coastline detail
+             pass this test, while a genuine narrow channel's own chopped-up
+             mid-section still fails it, same as it failed the original one.
+             The CLOSED shape is used only to decide whether to fold `frag` in
+             -- the fold itself unions the real, unmodified `frag` geometry into
+             `wide`, so this can never introduce closed-but-not-real water into
+             the output.
+
+        Windowed to a local neighbourhood (`radius_m * 2` around the fragment)
+        rather than the whole component, since both the erosion and closing
+        tests are inherently local -- nothing beyond a bounded distance away can
+        affect whether a point survives them, and re-testing a whole region's
+        `wide` polygon once per small candidate fragment would be needlessly
+        expensive.
+
+        Skipped entirely above NARROW_FRAGMENT_RECLASS_MAX_COUNT fragments on one
+        component, to keep per-fragment cost bounded on a pathologically
+        fragmented input -- same "degrade gracefully instead of paying unbounded
+        cost" convention as _safe_negative_buffer.
+        """
+        if wide.is_empty or narrow.is_empty:
+            return wide, narrow
+        fraction = self.classification_config.narrow_fragment_reclass_max_fraction
+        fragments = self._explode_polygonal(narrow)
+        if not fragments or len(fragments) > NARROW_FRAGMENT_RECLASS_MAX_COUNT:
+            return wide, narrow
+        max_area = fraction * math.pi * radius_m ** 2
+        window_margin = radius_m * 2.0
+        try:
+            wide_touch = wide.buffer(1e-6)
+        except (GEOSException, MemoryError):
+            return wide, narrow
+        folded, kept = [], []
+        for frag in fragments:
+            # Whole per-fragment probe -- setup (intersects/buffer/intersection)
+            # AND the union/closing/erosion/recovery/intersection probe below --
+            # shares one handler -- a GEOSException/MemoryError from ANY of these
+            # on one pathological fragment must not abort the whole build;
+            # degrade by keeping that fragment narrow (unchanged today's
+            # behaviour), same convention as _safe_negative_buffer's own
+            # docstring.
+            try:
+                if frag.area >= max_area or not frag.intersects(wide_touch):
+                    kept.append(frag)
+                    continue
+                window = frag.buffer(window_margin)
+                local_wide = wide.intersection(window)
+                if local_wide.is_empty:
+                    kept.append(frag)
+                    continue
+                local_combined = unary_union([local_wide, frag]).buffer(0)
+                local_closed = (local_combined.buffer(NARROW_FRAGMENT_RECLASS_CLOSING_M)
+                                 .buffer(-NARROW_FRAGMENT_RECLASS_CLOSING_M))
+                local_eroded = self._safe_negative_buffer(local_closed, radius_m)
+                local_recovered = self._clean_polygonal(
+                    local_eroded.buffer(radius_m, quad_segs=16).buffer(0).intersection(local_closed))
+                recovered_area = frag.intersection(local_recovered).area
+            except (GEOSException, MemoryError):
+                kept.append(frag)
+                continue
+            if frag.area > 0 and recovered_area / frag.area >= 0.95:
+                folded.append(frag)
+            else:
+                kept.append(frag)
+        self.narrow_fragment_reclass_stats["fragments_checked"] += len(fragments)
+        if not folded:
+            return wide, narrow
+        # Final assembly shares the same "must not abort the whole build"
+        # convention as the per-fragment probe above -- a GEOSException/
+        # MemoryError here degrades by returning the ORIGINAL (wide, narrow)
+        # pair unchanged (nothing actually folded), not a partially-assembled
+        # result. fragments_folded is only incremented once assembly actually
+        # succeeds, so the stat never claims a fold that didn't happen.
+        try:
+            new_wide = self._clean_polygonal(unary_union([wide] + folded))
+            new_narrow = self._clean_polygonal(unary_union(kept)) if kept else Polygon()
+        except (GEOSException, MemoryError):
+            return wide, narrow
+        self.narrow_fragment_reclass_stats["fragments_folded"] += len(folded)
+        return new_wide, new_narrow
 
     def _safe_negative_buffer(self, geom, radius_m: float, quad_segs: int = 16):
         """SPEC-GRAPH-DENSITY.md: `geom.buffer(-radius_m)` on an unusually large,
@@ -3661,6 +3945,21 @@ class NauticalRoutingPipeline:
             if pass0_target_fanin_cap > 0:
                 pass0_target_fanin_count[node_id] = pass0_target_fanin_count.get(node_id, 0) + 1
 
+        # Follow-on to SPEC-GRAPH-DENSITY.md: Pass 0's OWN fan-in/fan-out cap
+        # (ClassificationConfig.pass0_fanin_cap's docstring) -- a SEPARATE budget
+        # from pass0_target_fanin_cap above, which stays scoped to Pass 0c/0d only.
+        # Applied symmetrically (both sides of a candidate pair), since Pass 0 has
+        # no source/target direction the way Pass 0c/0d's Direction A/B split does.
+        pass0_fanin_cap = self.classification_config.pass0_fanin_cap
+        pass0_fanin_count: Dict[int, int] = {}
+
+        def _pass0_capped(node_id) -> bool:
+            return pass0_fanin_cap > 0 and pass0_fanin_count.get(node_id, 0) >= pass0_fanin_cap
+
+        def _pass0_record(node_id):
+            if pass0_fanin_cap > 0:
+                pass0_fanin_count[node_id] = pass0_fanin_count.get(node_id, 0) + 1
+
         # Pass 0: k-nearest-neighbor pass, independent of Pass 1's
         # MAX_IDS_FOR_PASS1 gate. That gate exists because materializing every
         # coastal-node pair within snap_radius_m (tree.query_pairs()) blows up
@@ -3709,8 +4008,10 @@ class NauticalRoutingPipeline:
         # connector was never found despite being trivially within
         # snap_radius_m. This pass sidesteps group sampling entirely: every
         # node gets to look at its own nearest neighbors directly.
-        pass0_idx_list = list(range(len(ids)))
-        if len(pass0_idx_list) >= 2:
+        def _run_pass0():
+            pass0_idx_list = list(range(len(ids)))
+            if len(pass0_idx_list) < 2:
+                return
             from scipy.spatial import cKDTree
             pass0_coords = coords_m[pass0_idx_list]
             pass0_tree = cKDTree(pass0_coords)
@@ -3720,14 +4021,25 @@ class NauticalRoutingPipeline:
                 neighbor_local_idxs = neighbor_local_idxs.reshape(-1, 1)
             for local_i, neighbors in enumerate(neighbor_local_idxs):
                 gi = pass0_idx_list[local_i]
+                u = ids[gi]
+                if _pass0_capped(u):
+                    continue
                 for local_j in neighbors:
                     if local_j == local_i:
                         continue
                     gj = pass0_idx_list[int(local_j)]
+                    v = ids[gj]
+                    if _pass0_capped(u):
+                        break
+                    if _pass0_capped(v):
+                        self._stitch_diag["pass0"]["fanin_capped"] += 1
+                        continue
                     if np.linalg.norm(coords_m[gi] - coords_m[gj]) > snap_radius_m:
                         self._stitch_diag["pass0"]["radius_reject"] += 1
                         continue
-                    try_add(gi, gj, "pass0")
+                    if try_add(gi, gj, "pass0"):
+                        _pass0_record(u)
+                        _pass0_record(v)
 
         # Pass 0b: cross-type k-nearest-neighbor pass, navmesh perimeter
         # vertices against everything else (skeleton chain nodes, etc).
@@ -3761,31 +4073,47 @@ class NauticalRoutingPipeline:
             navmesh_tree = cKDTree(navmesh_coords)
             other_tree = cKDTree(other_coords)
 
-            k_navmesh = min(6, len(navmesh_idx))
-            _, nn_idxs = navmesh_tree.query(other_coords, k=k_navmesh)
-            if k_navmesh == 1:
-                nn_idxs = nn_idxs.reshape(-1, 1)
-            for local_i, neighbors in enumerate(nn_idxs):
-                gi = other_idx[local_i]
-                for local_j in neighbors:
-                    gj = navmesh_idx[int(local_j)]
-                    if np.linalg.norm(coords_m[gi] - coords_m[gj]) > snap_radius_m:
-                        self._stitch_diag["pass0b"]["radius_reject"] += 1
-                        continue
-                    try_add(gi, gj, "pass0b")
+            def _run_pass0b():
+                k_navmesh = min(6, len(navmesh_idx))
+                _, nn_idxs = navmesh_tree.query(other_coords, k=k_navmesh)
+                if k_navmesh == 1:
+                    nn_idxs = nn_idxs.reshape(-1, 1)
+                for local_i, neighbors in enumerate(nn_idxs):
+                    gi = other_idx[local_i]
+                    for local_j in neighbors:
+                        gj = navmesh_idx[int(local_j)]
+                        if np.linalg.norm(coords_m[gi] - coords_m[gj]) > snap_radius_m:
+                            self._stitch_diag["pass0b"]["radius_reject"] += 1
+                            continue
+                        try_add(gi, gj, "pass0b")
 
-            k_other = min(6, len(other_idx))
-            _, nn_idxs2 = other_tree.query(navmesh_coords, k=k_other)
-            if k_other == 1:
-                nn_idxs2 = nn_idxs2.reshape(-1, 1)
-            for local_i, neighbors in enumerate(nn_idxs2):
-                gi = navmesh_idx[local_i]
-                for local_j in neighbors:
-                    gj = other_idx[int(local_j)]
-                    if np.linalg.norm(coords_m[gi] - coords_m[gj]) > snap_radius_m:
-                        self._stitch_diag["pass0b"]["radius_reject"] += 1
-                        continue
-                    try_add(gi, gj, "pass0b")
+                k_other = min(6, len(other_idx))
+                _, nn_idxs2 = other_tree.query(navmesh_coords, k=k_other)
+                if k_other == 1:
+                    nn_idxs2 = nn_idxs2.reshape(-1, 1)
+                for local_i, neighbors in enumerate(nn_idxs2):
+                    gi = navmesh_idx[local_i]
+                    for local_j in neighbors:
+                        gj = other_idx[int(local_j)]
+                        if np.linalg.norm(coords_m[gi] - coords_m[gj]) > snap_radius_m:
+                            self._stitch_diag["pass0b"]["radius_reject"] += 1
+                            continue
+                        try_add(gi, gj, "pass0b")
+
+            # Follow-on to SPEC-GRAPH-DENSITY.md
+            # (ClassificationConfig.pass0_cross_type_first's docstring): Pass 0b's
+            # cross-type matching is immune to Pass 0's same-type crowding by
+            # construction, so running it FIRST when this flag is set lets its
+            # outward unions land before Pass 0 evaluates same-type candidates --
+            # many of which then get rejected for free by try_add's own
+            # find(u)==find(v) check instead of firing. False (default): identical
+            # call order to before this flag existed (Pass 0, then Pass 0b).
+            if self.classification_config.pass0_cross_type_first:
+                _run_pass0b()
+                _run_pass0()
+            else:
+                _run_pass0()
+                _run_pass0b()
 
             # Pass 0c: LOCAL adjacency guarantee for navmesh perimeter
             # vertices -- unlike every pass above (and try_add's own
@@ -3926,6 +4254,11 @@ class NauticalRoutingPipeline:
                     if try_add_local(gj, gi):
                         cross_count[u] += 1
                         _pass0_record_target(v)
+        else:
+            # Degenerate split (every id is navmesh-kind, or none are) -- Pass 0b/0c
+            # need both groups non-empty to mean anything, but Pass 0 itself must
+            # still run regardless, exactly as it did before this flag existed.
+            _run_pass0()
 
         # Pass 0d (Round 15, NEXT_PHASES.md §5.2.2): LOCAL adjacency guarantee for
         # in-polygon inland nodes, generalizing Pass 0c to a second cross-type
@@ -5381,6 +5714,51 @@ class NauticalRoutingPipeline:
         cfg = self.classification_config
         utm = self._local_utm_crs(polygon)
         poly_m = gpd.GeoSeries([polygon], crs="EPSG:4326").to_crs(utm).iloc[0]
+        # Follow-on to SPEC-GRAPH-DENSITY.md: unlike _split_wide_narrow (which
+        # simplifies its own input before eroding), this polygon reaches
+        # rasterization/skeletonization with NO simplification at all -- straight
+        # from the source layer's own digitization detail. A real, complex tidal
+        # marsh/creek water body carries hundreds of thousands of vertices from
+        # fine-grained ENC survey digitization; every small boundary wiggle
+        # (a cove, a point, a single surveyed notch) spawns its own tiny branch
+        # in the medial axis, producing a dense tangle of short junction-to-
+        # junction edges that _resample_long_skeleton_edges/sagitta resampling
+        # cannot help with -- those chains are already minimal (2 raw points),
+        # confirmed directly against a real build (92% of sampled 10-50m edges
+        # in one such area had exactly 2 width_profile points), so the density
+        # is topological (junction count), not a resampling artifact. Measured
+        # directly on the real narrow-water piece covering that same area: a
+        # boundary simplify before rasterizing cuts local node count 17%/27%/35%
+        # at 5m/15m/30m tolerance (diminishing returns past ~30m). 0.0 (default)
+        # disables this entirely -- poly_m stays byte-identical to today's,
+        # matching every other flag's convention in this file.
+        #
+        # Safety: `_rasterize_water_polygon` always re-intersects against `land_m`
+        # AFTER this simplify, so a simplified water boundary bulging slightly
+        # into what should be land can never produce a routable pixel there --
+        # but only because `land_m` itself is re-queried against the SIMPLIFIED
+        # (post-simplify) extent below, not the original `polygon` -- a simplify
+        # can grow the water boundary outward past a land feature that never
+        # touched the original, pre-simplify polygon (independently-digitized
+        # land/water layers are not guaranteed to share a boundary), which would
+        # otherwise let that land feature's own pixels go unmasked. Mirrors
+        # `_axis_dedup_carve_navmesh_pieces`'s existing pattern (line ~5400)
+        # of deriving its land/candidate query polygon from the already-
+        # processed `poly_m`, not the pre-processing input. The risk this
+        # carries beyond that is purely topological (a narrow real gap
+        # simplified into a merge, or vice versa), the same class of
+        # approximation `_split_wide_narrow`'s own pre-erosion simplify already
+        # accepts -- not a land-crossing risk.
+        if cfg.skeleton_boundary_simplify_m > 0.0:
+            vertices_before = len(shapely.get_coordinates(poly_m))
+            poly_m = poly_m.simplify(cfg.skeleton_boundary_simplify_m, preserve_topology=True)
+            stats = self.skeleton_boundary_simplify_stats
+            stats["pieces"] += 1
+            stats["vertices_before"] += vertices_before
+            stats["vertices_after"] += len(shapely.get_coordinates(poly_m))
+            # Land/candidate queries below must use the post-simplify extent --
+            # see the safety comment above.
+            polygon = gpd.GeoSeries([poly_m], crs=utm).to_crs(self.CRS_WGS84).iloc[0]
         b = poly_m.bounds
         min_dim = min(b[2] - b[0], b[3] - b[1])
         px = cfg.pixel_size_for(min_dim)
@@ -7325,6 +7703,66 @@ if __name__ == "__main__":
                              f"{NODE_MERGE_MAX_M:.0f}m if enabled (raises otherwise) -- a much "
                              "tighter ceiling than --connector-merge-m since this governs every "
                              "node in the graph, not one line's own search radius.")
+    parser.add_argument("--narrow-fragment-reclass-max-fraction", type=float, default=0.0,
+                        help="Fold a small, isolated `narrow` fragment (from _split_wide_narrow's "
+                             "erosion) back into the navmesh-eligible ('wide') path if its area is "
+                             "below `this fraction * pi * min_navmesh_radius_m**2` AND re-running "
+                             "the same erode/dilate/intersect eligibility test on the surrounding "
+                             "wide water unioned with just that fragment still recovers (most of) "
+                             "it -- i.e. only when the surrounding wide water genuinely confers "
+                             "eligibility on the sliver by connectivity, not merely because it is "
+                             "small. Targets an intricate-but-deep coastline area fragmenting into "
+                             "many scattered skeleton slivers that _stitch_component_pieces' Pass 0 "
+                             "then crisscrosses with straight connectors, instead of the plain "
+                             "triangulated mesh the rest of that same open water gets. Default 0.0 "
+                             "DISABLES this entirely and reproduces today's _split_wide_narrow "
+                             "output byte-for-byte. Must be finite, >= 0.0, and <= 1.0 if enabled "
+                             "(raises otherwise).")
+    parser.add_argument("--pass0-fanin-cap", type=int, default=0,
+                        help="Cap how many edges _stitch_component_pieces' Pass 0 (the very first, "
+                             "type-blind k=6 nearest-neighbor stitching pass) may add to any single "
+                             "node. A SEPARATE budget from --pass0-target-fanin-cap, which stays "
+                             "scoped to Pass 0c/0d only -- Pass 0 currently has NO fan-in/fan-out "
+                             "cap of any kind, so where many small fragments sit close together "
+                             "(see --narrow-fragment-reclass-max-fraction) it independently "
+                             "discovers and accepts a valid connector for many distinct fragment "
+                             "pairs. Default 0 DISABLES this entirely and reproduces today's Pass 0 "
+                             "output byte-for-byte. > 0: applied SYMMETRICALLY to both sides of a "
+                             "candidate pair (Pass 0 has no source/target direction); once a node "
+                             "has accumulated this many Pass-0-added edges, further Pass-0 "
+                             "candidates touching it are skipped and the next-nearest is tried "
+                             "instead. Safe regardless of value: Pass 0b/0c/0d/Pass 1/Pass 2 and "
+                             "gap-resolve all run afterward and remain the connectivity guarantee. "
+                             "Must be >= 0.")
+    parser.add_argument("--pass0-cross-type-first", action="store_true",
+                        help="Run Pass 0b (cross-type k=6 NN, navmesh perimeter vs everything else) "
+                             "BEFORE Pass 0 (type-blind k=6 NN) instead of after. Pass 0b's outward "
+                             "cross-type matching is immune to Pass 0's same-type crowding by "
+                             "construction -- running it first lets its unions land before Pass 0 "
+                             "evaluates same-type candidates, so many of Pass 0's redundant "
+                             "fragment-to-fragment candidates are then rejected for free by the "
+                             "existing already-connected check instead of firing. Default: off, "
+                             "identical call order to today's (Pass 0, then Pass 0b).")
+    parser.add_argument("--skeleton-boundary-simplify-m", type=float, default=0.0,
+                        help="Simplify (preserve_topology=True) a water polygon's boundary by this "
+                             "many metres before rasterizing/skeletonizing it in "
+                             "build_skeleton_network. build_skeleton_network currently applies NO "
+                             "boundary simplification at all -- straight from the source layer's own "
+                             "ENC/chart digitization detail, which for a complex tidal marsh/creek "
+                             "water body can carry hundreds of thousands of vertices. Every small "
+                             "boundary wiggle spawns its own tiny branch in the medial axis, "
+                             "producing a dense tangle of short junction-to-junction edges that "
+                             "--sagitta-cap cannot help with (confirmed directly: those chains are "
+                             "already minimal, 2 raw points -- the density is topological junction "
+                             "count, not a resampling artifact). Safe by construction against "
+                             "land-crossing: _rasterize_water_polygon always re-intersects against "
+                             "the land mask, rasterized separately from the unmodified land layer, "
+                             "AFTER this simplify. Default 0.0 DISABLES this entirely and reproduces "
+                             "today's skeleton raster byte-for-byte. Measured directly on a real "
+                             "narrow-water piece: node count in the affected area dropped 17%%/27%%/"
+                             "35%% at 5m/15m/30m tolerance, plateauing past ~30m. Must be finite, "
+                             ">= 0.0, and < "
+                             f"{SKELETON_BOUNDARY_SIMPLIFY_MAX_M:.0f}m if enabled (raises otherwise).")
     parser.add_argument("--stitch-registry", nargs="?", const="data/seam_registry.sqlite", default="",
                         help="Enable Round 25 cross-database seam stitching (STITCHING_DESIGN.md "
                              "Section 3) against the shared global-node registry at this SQLite "
@@ -7361,6 +7799,19 @@ if __name__ == "__main__":
         NauticalRoutingPipeline._validate_node_merge_m(args.node_merge_m)
     except ValueError as e:
         raise SystemExit(f"--node-merge-m: {e}")
+    try:
+        NauticalRoutingPipeline._validate_narrow_fragment_reclass_max_fraction(
+            args.narrow_fragment_reclass_max_fraction)
+    except ValueError as e:
+        raise SystemExit(f"--narrow-fragment-reclass-max-fraction: {e}")
+    if args.pass0_fanin_cap < 0:
+        raise SystemExit(f"--pass0-fanin-cap must be >= 0 "
+                          f"(got {args.pass0_fanin_cap!r}).")
+    try:
+        NauticalRoutingPipeline._validate_skeleton_boundary_simplify_m(
+            args.skeleton_boundary_simplify_m)
+    except ValueError as e:
+        raise SystemExit(f"--skeleton-boundary-simplify-m: {e}")
     try:
         NauticalRoutingPipeline._validate_classification_overrides(
             args.axis_dedup_cap, args.axis_dedup_fraction,
@@ -7417,5 +7868,9 @@ if __name__ == "__main__":
                                        connector_merge_m=args.connector_merge_m,
                                        pass2_max_fanin_per_node=args.pass2_max_fanin_per_node,
                                        pass0_target_fanin_cap=args.pass0_target_fanin_cap,
-                                       node_merge_m=args.node_merge_m)
+                                       node_merge_m=args.node_merge_m,
+                                       narrow_fragment_reclass_max_fraction=args.narrow_fragment_reclass_max_fraction,
+                                       pass0_fanin_cap=args.pass0_fanin_cap,
+                                       pass0_cross_type_first=args.pass0_cross_type_first,
+                                       skeleton_boundary_simplify_m=args.skeleton_boundary_simplify_m)
     pipeline.run_pipeline()
