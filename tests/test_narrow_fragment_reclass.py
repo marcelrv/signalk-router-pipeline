@@ -295,6 +295,47 @@ class TestExceptionSafetyDuringPerFragmentSetup:
         frag.intersects.assert_not_called()
         assert p.narrow_fragment_reclass_stats == {"fragments_checked": 0, "fragments_folded": 0}
 
+    def test_geos_exception_during_final_assembly_is_caught_and_stat_not_incremented(self):
+        # Unlike the setup-phase tests above (mocked geometries, exception
+        # injected before anything real folds), this exercises a REAL fold on
+        # real geometry (matching TestEnabledFoldsIsolatedIslandClusterFragments'
+        # own fixture/fraction, known to fold 3 fragments) so `folded` is
+        # genuinely non-empty when the final assembly -- unary_union([wide] +
+        # folded) / unary_union(kept) -- is reached. Only unary_union's call at
+        # the FINAL assembly line raises (identified by `wide` itself being a
+        # literal element of the geoms list -- no other call site in this
+        # function passes `wide` by identity, including _clean_polygonal's own
+        # internal unary_union call on freshly-exploded pieces).
+        p, cfg = _pipeline(narrow_fragment_reclass_max_fraction=0.5)
+        p.classification_config = cfg
+        water = _island_cluster_water_with_channel()
+        cleaned = water.buffer(0).simplify(1.0)
+        eroded = p._safe_negative_buffer(cleaned, RADIUS_M)
+        wide = eroded.buffer(RADIUS_M, quad_segs=16).buffer(0).intersection(cleaned)
+        narrow = cleaned.difference(wide).buffer(0)
+        wide, narrow = p._clean_polygonal(wide), p._clean_polygonal(narrow)
+
+        real_unary_union = unary_union
+
+        def raising_unary_union(geoms, *args, **kwargs):
+            if any(g is wide for g in geoms):
+                raise GEOSException("std::bad_alloc")
+            return real_unary_union(geoms, *args, **kwargs)
+
+        with mock.patch("nautical_routing_pipeline.unary_union", side_effect=raising_unary_union):
+            result_wide, result_narrow = p._reclassify_scattered_narrow_fragments(
+                wide, narrow, RADIUS_M)
+
+        # Degrades gracefully: original geometries returned unchanged, and the
+        # folded-count stat must NOT claim a fold that never actually completed.
+        assert result_wide is wide
+        assert result_narrow is narrow
+        assert p.narrow_fragment_reclass_stats["fragments_folded"] == 0
+        # Sanity: the per-fragment loop actually ran and found something
+        # eligible to fold -- otherwise this test never reaches the
+        # final-assembly code path at all, and would pass vacuously.
+        assert p.narrow_fragment_reclass_stats["fragments_checked"] == 8
+
 
 class TestValidation:
     def test_zero_is_accepted(self):

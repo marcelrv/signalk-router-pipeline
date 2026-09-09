@@ -2354,9 +2354,18 @@ class NauticalRoutingPipeline:
         self.narrow_fragment_reclass_stats["fragments_checked"] += len(fragments)
         if not folded:
             return wide, narrow
+        # Final assembly shares the same "must not abort the whole build"
+        # convention as the per-fragment probe above -- a GEOSException/
+        # MemoryError here degrades by returning the ORIGINAL (wide, narrow)
+        # pair unchanged (nothing actually folded), not a partially-assembled
+        # result. fragments_folded is only incremented once assembly actually
+        # succeeds, so the stat never claims a fold that didn't happen.
+        try:
+            new_wide = self._clean_polygonal(unary_union([wide] + folded))
+            new_narrow = self._clean_polygonal(unary_union(kept)) if kept else Polygon()
+        except (GEOSException, MemoryError):
+            return wide, narrow
         self.narrow_fragment_reclass_stats["fragments_folded"] += len(folded)
-        new_wide = self._clean_polygonal(unary_union([wide] + folded))
-        new_narrow = self._clean_polygonal(unary_union(kept)) if kept else Polygon()
         return new_wide, new_narrow
 
     def _safe_negative_buffer(self, geom, radius_m: float, quad_segs: int = 16):
