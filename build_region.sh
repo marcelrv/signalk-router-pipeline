@@ -95,7 +95,12 @@ while [ $# -gt 0 ]; do
         --stitch-band-m) STITCH_BAND_M="$2"; shift 2 ;;
         --stitch-radius-m) STITCH_RADIUS_M="$2"; shift 2 ;;
         --extra-pipeline-args) EXTRA_PIPELINE_ARGS="$2"; shift 2 ;;
-        --build-mem-limit-gb) BUILD_MEM_LIMIT_GB="$2"; shift 2 ;;
+        --build-mem-limit-gb)
+            if [ "$#" -lt 2 ]; then
+                echo "Error: --build-mem-limit-gb requires a value." >&2
+                exit 1
+            fi
+            BUILD_MEM_LIMIT_GB="$2"; shift 2 ;;
         *) echo "Unknown option: $1" >&2; exit 1 ;;
     esac
 done
@@ -247,7 +252,34 @@ fi
         # ulimit -v is in KB; only scopes this subshell and its children, so
         # steps 1/3 and 2/3 above (already run) and the rest of this script
         # after step 3/3 completes are unaffected.
-        ulimit -v $((BUILD_MEM_LIMIT_GB_NUM * 1024 * 1024))
+        #
+        # Plain `ulimit -v N` (no -S/-H) sets BOTH the soft and hard limit to
+        # N -- two real failure modes confirmed directly, not just a style
+        # nit: (1) if this process already inherited a lower HARD limit (some
+        # outer constraint, e.g. this exact host's own shared-resource
+        # limits), trying to raise it to N fails outright ("cannot modify
+        # limit: Invalid argument"), aborting this whole subshell under
+        # set -euo pipefail; (2) if the inherited SOFT limit is already lower
+        # than N but the hard limit is not, `ulimit -v N` silently RAISES
+        # that tighter existing constraint to N instead of respecting it.
+        # Fix: compute the tightest of (configured, inherited soft, inherited
+        # hard) and apply only that, only via -Sv (the soft limit alone) --
+        # never attempts to exceed the inherited hard limit, and never
+        # loosens an inherited soft limit that was already tighter.
+        CONFIGURED_MEM_KB=$((BUILD_MEM_LIMIT_GB_NUM * 1024 * 1024))
+        EFFECTIVE_MEM_KB=$CONFIGURED_MEM_KB
+        INHERITED_SOFT_KB=$(ulimit -Sv)
+        INHERITED_HARD_KB=$(ulimit -Hv)
+        if [ "$INHERITED_SOFT_KB" != "unlimited" ] && [ "$INHERITED_SOFT_KB" -lt "$EFFECTIVE_MEM_KB" ]; then
+            EFFECTIVE_MEM_KB="$INHERITED_SOFT_KB"
+        fi
+        if [ "$INHERITED_HARD_KB" != "unlimited" ] && [ "$INHERITED_HARD_KB" -lt "$EFFECTIVE_MEM_KB" ]; then
+            EFFECTIVE_MEM_KB="$INHERITED_HARD_KB"
+        fi
+        if [ "$EFFECTIVE_MEM_KB" != "$CONFIGURED_MEM_KB" ]; then
+            echo "  (inherited ulimit is tighter than ${BUILD_MEM_LIMIT_GB_NUM}GB -- using ${EFFECTIVE_MEM_KB}KB instead)"
+        fi
+        ulimit -Sv "$EFFECTIVE_MEM_KB"
     fi
     time "$PYTHON" nautical_routing_pipeline.py \
         --input-dir "$GEOJSON_DIR" \
