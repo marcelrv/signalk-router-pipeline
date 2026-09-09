@@ -6,6 +6,11 @@ it does not reduce density for a fairway that sits wholly interior to a piece, a
 change it does produce there is a seam artifact rather than legitimate simplification.
 The next session should start by prototyping the single-pass, vertex-weighted-simplify
 alternative §10 item 3 already names, not by implementing §6.1 as currently sketched.**
+**§2.4 also corrects an earlier, wrong negative finding: the original location query used
+the wrong reference point, and real `FAIRWY`/`DRGARE` coverage (`Cobb Island Channel`,
+`Neale Sound Channel`) is now confirmed to sit directly at the motivating Coltons Point
+screenshot location, not merely nearby — see §2.4 for the corrected query and its
+downstream consequences.**
 Written as a standalone document rather
 than a new section of `SPEC-FAIRWAY-HARMONIZATION.md`: that spec is about depth/cost/
 classification signal (what `min_depth`/`cost_factor`/`laned` a fairway contributes to an
@@ -82,8 +87,11 @@ NOAA/RWS fairway.** The line-type analogue that *does* exist — `RECTRC`/`NAVLN
 different, separate S-57 object class that `enc_preprocessor.py` already merges into
 `inland_waterways_lines.geojson` today (unconditionally, `SPEC-RECOMMENDED-TRACK.md`
 "Option A"), and therefore *already* gets axis-dedup treatment wherever it exists and
-`--axis-dedup-cap` is enabled. §4 below establishes that this pre-existing path is real
-but does not reach the motivating Coltons Point location.
+`--axis-dedup-cap` is enabled. §4 below establishes that this pre-existing path is real,
+though (per §2.4's corrected finding) it still does not reach the motivating Coltons
+Point location specifically — zero `inland_waterways` features sit within 15 km of it,
+even though `fairways`/`dredged_areas` coverage (a different layer, this spec's own
+subject) does.
 
 ### 2.2 Fairway/dredged polygons are channel-shaped and far coarser than natural coastline
 
@@ -99,9 +107,10 @@ Across `data/geojson/us-east-md-stitched-v3/{fairways,dredged_areas}_polygons.ge
 | boundary vertex density, mean | 9.74 | 9.55 |
 
 Most fairway/dredged polygons in this real dataset are long, thin corridors — not blobs —
-and are digitized far more coarsely than natural coastline. The motivating case's own
-feature, `Kettle Bottom Shoal` (the nearest named `FAIRWY`/`DRGARE` pair to Coltons Point;
-see §2.4), is close to the coarse end of that distribution: 2 polygons, 11-12 vertices
+and are digitized far more coarsely than natural coastline. `Kettle Bottom Shoal` (used
+here as a sample feature, NOT the nearest named `FAIRWY`/`DRGARE` pair to Coltons Point —
+see §2.4's correction, which found `Cobb Island Channel`/`Neale Sound Channel` actually
+sit at that location) is close to the coarse end of that distribution: 2 polygons, 11-12 vertices
 each, ~6.6-6.9 km long, ~80-94 m wide (minimum-rotated-rectangle short edge), area
 541,000-587,000 m² — **≈0.8-0.9 vertices per km**.
 
@@ -150,38 +159,59 @@ NL-vs-US density table) against a sparser NOAA sample here. Real in both dataset
 secondary in scale in both (§4.3's own words: "~5% of the graph, against ~33% for
 over-sampling" — this MD measurement, 4.8%, lands in the same range).
 
-### 2.4 The motivating screenshot's own location — a negative finding, reported honestly
+### 2.4 The motivating screenshot's own location — CORRECTED (found in review; the original query used the wrong point)
 
-Following `SPEC-GRAPH-DENSITY.md` §8.6's own precedent (report a negative result plainly
-rather than assume a mechanism applies where it wasn't checked): the nearest actual
-`fairways`/`dredged_areas` feature to Coltons Point itself (38.209°N, 76.859°W) is
-**`Kettle Bottom Shoal`, 3,915 m away**. No `fairways`/`dredged_areas` polygon of any name
-sits within a few kilometres of the exact bowtie location the original screenshot showed.
-Also checked, per §2.1's finding that `RECTRC`/`NAVLNE` already flow through
-`inland_waterways`: **zero `inland_waterways` features exist within a 0.15° (~15 km)
-search radius of that point at all** in this clip's data.
+**Correction, found in review before this spec went further: the original version of this
+section queried the wrong reference point** — a single point (38.209°N, 76.859°W) that
+does not actually match the screenshot's own documented coordinates (START 38.2696°N
+76.8189°W, DEST 38.2628°N 76.8716°W) — and concluded, wrongly, that no fairway/dredged
+feature sits near the motivating location. Re-querying against the REAL screenshot
+bounding box (`box(-76.8716, 38.2628, -76.8189, 38.2696)`, both points included) gives the
+opposite answer:
+
+**Six `fairways`/`dredged_areas` features directly intersect the real screenshot bounding
+box** — two named `Cobb Island Channel` (a `FAIRWY`/`DRGARE` pair) and two named `Neale
+Sound Channel` (also a `FAIRWY`/`DRGARE` pair), each counted once per layer. `Cobb Island
+Channel`'s own extent (`-76.8416, 38.2648` to `-76.8392, 38.2656`) sits well inside the
+bbox; `Neale Sound Channel` spans roughly `-76.868` to `-76.855` longitude at
+`38.267-38.271` latitude, also inside it. Both are real, named marked channels sitting
+directly on top of the motivating "bowtie" location — not 3.9 km away as the original
+(wrongly-targeted) query concluded.
+
+`Kettle Bottom Shoal` (§2.2's own sample feature, still a real, correctly-measured
+`FAIRWY`/`DRGARE` pair in this dataset) is NOT the nearest feature to Coltons Point — it
+was only the nearest to the mistakenly-used reference point. §2.2's vertex-density
+measurement of it stands on its own merits (a real feature, independently sampled), but
+the "nearest named pair to Coltons Point" framing there is corrected below.
+
+The `inland_waterways` negative finding, by contrast, **does still hold** against the
+correct bbox: zero `inland_waterways` features intersect it, and the nearest is 17.3 km
+away (re-queried directly; well past the 15 km radius originally checked).
 
 Separately, `fairways_polygons.geojson` (across the whole MD dataset) does carry 5
 features named exactly `"Potomac River Channel"` — but all 5 sit near Washington DC
 (38.55-38.70°N), a different reach of the same river, roughly 40-50 km upriver from
 Coltons Point. Whatever chart label the user saw reading "Potomac River Channel" near
-Coltons Point either belongs to a different, unnamed `FAIRWY`/`DRGARE` feature not
-captured in this pipeline's current extraction for that ENC cell, to a raster-chart/RNC
-label rendered independently of any S-57 vector object this pipeline reads, or to a chart
-edition/cell this pipeline's current NOAA download does not include for that specific
-reach. This is not resolved by static investigation and is carried forward as this
-document's first open question (§9).
+Coltons Point most plausibly refers informally to this general reach of the Potomac
+rather than to one specific named `FAIRWY` feature — `Cobb Island Channel`/`Neale Sound
+Channel` are the actual named vector features this pipeline has at that exact location.
+Still not fully resolved by static investigation alone (which one, if either, the user's
+own chart rendering specifically labeled "Potomac River Channel" at that point) — carried
+forward as this document's first open question (§9), now substantially narrowed.
 
-**Consequence for this design**: this mechanism, however well-founded in general (§2.2,
-§2.3), is **not expected to visibly change the exact Coltons Point bowtie the original
-screenshot showed** — `SPEC-GRAPH-DENSITY.md` §9 (`skeleton_boundary_simplify_m`, already
-shipped on this branch) is what addresses that specific location; this spec addresses the
-*separate, real* phenomenon §2.2/§2.3 measure at other marked channels in the same river
-reach (`Bonum Creek Channel`, `Cobb Island Channel`, `Neale Sound Channel`, `Saint
-Catherine Sound Upper Entrance Channel`, `Monroe Creek Channel`, `Saint Patrick Creek
-Channel`, `Cuckold Creek Channel` — all real, named, nearby `FAIRWY` features in the same
-~15 km stretch of the Potomac this dataset covers) and, per §2.3's Zeeland cross-check,
-generally.
+**Consequence for this design, corrected**: this mechanism IS now expected to be directly
+relevant to the original Coltons Point bowtie location — real `FAIRWY`/`DRGARE` coverage
+(`Cobb Island Channel`, `Neale Sound Channel`) sits right on top of it. `SPEC-GRAPH-
+DENSITY.md` §9 (`skeleton_boundary_simplify_m`, already shipped on this branch) fixed the
+mechanism it targets there (unsimplified boundary noise); this spec's mechanism, once
+implemented (§5.3's own deferred status still applies — the split+reunion construction
+itself is broken and needs redesign first, independent of this location correction), would
+address the *separate* fairway/skeleton duplication this section's own siblings
+(`Bonum Creek Channel`, `Saint Catherine Sound Upper Entrance Channel`, `Monroe Creek
+Channel`, `Saint Patrick Creek Channel`, `Cuckold Creek Channel` — all real, named,
+nearby `FAIRWY` features in the same ~15 km stretch of the Potomac this dataset covers,
+including now Cobb Island Channel and Neale Sound Channel at Coltons Point itself) and,
+per §2.3's Zeeland cross-check, generally.
 
 ## 3. Current behaviour, confirmed in code
 
@@ -543,31 +573,38 @@ document only.
   verified only against their own predecessor and compounded into a net regression before
   anyone checked against the original baseline).
 - Rebuild the MD region with a real, nonzero value; measure the actual node-count effect
-  at the seven named fairway locations in §2.4 (`Bonum Creek Channel`, `Cobb Island
-  Channel`, `Neale Sound Channel`, etc.) specifically — these, not Coltons Point itself
-  (§2.4), are where this mechanism is expected to show a measurable effect.
+  at the named fairway locations in §2.4 (`Bonum Creek Channel`, `Cobb Island Channel`,
+  `Neale Sound Channel`, `Saint Catherine Sound Upper Entrance Channel`, `Monroe Creek
+  Channel`, `Saint Patrick Creek Channel`, `Cuckold Creek Channel`, etc.) specifically —
+  §2.4's correction found `Cobb Island Channel`/`Neale Sound Channel` sit directly at
+  Coltons Point itself, so this now includes the original motivating location too, not
+  a disjoint set of "other" locations.
 - Report `fairway_boundary_simplify_stats` (pieces processed, seam-validation rejections,
   vertices before/after in the fairway-covered sub-region) in the `data/BUILD_LOG.md`
   entry for whichever build first exercises this, matching this repo's established
   build-log convention.
 - Given §8.6's own lesson (two mechanisms shipped, tested clean, and neither fixed the
-  motivating case they were built for) — **do not evaluate this mechanism's success by
-  whether the original Coltons Point screenshot changes.** §2.4 already establishes it
-  should not. Evaluate it against the seven real nearby fairway locations instead.
+  motivating case they were built for) — **do not assume this mechanism will visibly
+  change the original Coltons Point screenshot just because real fairway coverage now
+  confirmed sits there (§2.4's correction).** `SPEC-GRAPH-DENSITY.md` §9 already fixed
+  the specific boundary-noise mechanism driving that screenshot's density; whether this
+  spec's mechanism (once its own §5.3 design flaw is resolved) additionally moves that
+  exact location, versus only the other named fairway locations, is itself an open
+  question a real rebuild must answer — do not assume either way from static analysis.
 
 ## 10. Open questions for the next session
 
-1. **What is the actual source of the "Potomac River Channel"/buoy labels the user saw
-   near Coltons Point, if not a `FAIRWY`/`DRGARE` polygon in this pipeline's current
-   extraction?** (§2.4) Static investigation of this repo's already-extracted GeoJSON
-   cannot resolve this — it needs either (a) `ogrinfo`/GDAL inspection of the *raw* NOAA
-   S-57 `.000` cell(s) covering that exact reach of the Potomac, to check for a `FAIRWY`/
-   `DRGARE`/`RECTRC` feature this pipeline's `enc_preprocessor.py` extraction may have
-   missed or that the current chart download doesn't cover for that cell, or (b) directly
-   asking the user which chart/rendering produced the labels they saw (an official NOAA
-   RNC raster chart could show a named channel with no corresponding vector S-57 feature
-   at all). Until this is resolved, do not assume this spec's mechanism will visibly
-   affect that specific screenshot.
+1. **Narrowed by §2.4's correction, not fully resolved**: is the "Potomac River Channel"
+   label the user saw near Coltons Point referring informally to the general reach
+   (plausible, given `Cobb Island Channel`/`Neale Sound Channel` are the actual named
+   `FAIRWY`/`DRGARE` vector features this pipeline has right at that location), or a
+   distinct, more specifically-named feature/label this pipeline's current extraction is
+   still missing? Static investigation of this repo's already-extracted GeoJSON cannot
+   fully resolve this — it would need either (a) `ogrinfo`/GDAL inspection of the *raw*
+   NOAA S-57 `.000` cell(s) covering that exact reach, or (b) directly asking the user
+   which chart/rendering produced the exact labels they saw. Lower priority than before
+   the correction, since real fairway coverage IS now confirmed at that location either
+   way.
 2. **`fairway_boundary_buffer_m` needs a real measurement before shipping a nonzero
    default**, the same way `axis_dedup_cap_m`/`fraction`/`floor` were tuned against 23,614
    real measured Zeeland nodes before §4.3 shipped (§4.3.1). This document proposes the
