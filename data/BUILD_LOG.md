@@ -1328,3 +1328,81 @@ ulimit -v $((11*1024*1024))
   database was peeked with no errors (only the pre-existing empty `europe.sqlite`/
   `netherlands.sqlite` placeholders were skipped as invalid).
 - **Logs**: `data/zeeland_skeletonsimplify_v2_build.log`.
+
+### #36 — `us_east_md_v5_channel_axes.sqlite` — first build with derived marked-channel axes (`--channel-axes`, docs/SPEC-CHANNEL-AXES.md)
+
+Branch `channel-axes` (uncommitted at time of build, on top of 2af61ca). Inputs re-extracted
+with the new `enc_preprocessor.py` layers (`lateral_marks_points`, `safe_water_marks_points`,
+`nav_systems_polygons`) into `data/geojson/us-east-md-v5` (125 NOAA cells), clipped to the
+#34 bbox, then `derive_channel_axes.py` on the clipped dir:
+
+```bash
+python3 enc_preprocessor.py --input data/raw/us-east-md-stitched-v4 --output data/geojson/us-east-md-v5
+python3 clip_pilot_data.py --input-dir data/geojson/us-east-md-v5 --bbox="-77.39,37.89,-74.69,39.62" --overlap-deg 0.01 --output-dir data/geojson/us-east-md-v5_clipped
+python3 derive_channel_axes.py --input-dir data/geojson/us-east-md-v5_clipped
+#  -> 423 axes (269 polygon centerlines, 154 mark chains), 228 rejected with reason; 3 min
+ulimit -Sv $((11*1024*1024))
+.venv/bin/python3 nautical_routing_pipeline.py \
+  --input-dir data/geojson/us-east-md-v5_clipped \
+  --output data/us_east_md_v5_channel_axes.sqlite \
+  --country US --name "us-east-md-v5-channel-axes" \
+  --description "US coastal waters (us-east-md-v5-channel-axes), based on NOAA ENCs" \
+  --tags '["noaa","enc","coastal"]' \
+  --url "https://github.com/marcelrv/signalk-router-data" \
+  --license "Public Domain (NOAA)" --copyright "NOAA Office of Coast Survey" \
+  --depth-ceiling 6.0 \
+  --coverage-bbox="-77.4,37.88,-74.68,39.63" \
+  --sagitta-cap 250.0 --max-segment-m 2000 \
+  --axis-dedup-cap 100.0 --axis-dedup-floor-m 100.0 \
+  --min-navmesh-radius-m 1200.0 \
+  --connector-merge-m 5.0 \
+  --inland-densify-max-segment-m 120.0 \
+  --pass2-max-fanin-per-node 6 \
+  --pass0-target-fanin-cap 4 \
+  --node-merge-m 5.0 \
+  --narrow-fragment-reclass-max-fraction 0.5 \
+  --pass0-fanin-cap 6 \
+  --pass0-cross-type-first \
+  --skeleton-boundary-simplify-m 20.0 \
+  --channel-axes
+```
+
+Same tuning as #34 plus `--channel-axes` (no `--stitch-registry`: standalone comparison
+build). Build time 12.5 min. All 423 derived axes merged (`--channel-axes-min-confidence`
+default 0.5). Two runs:
+
+- run 1: raw Voronoi vertices (~55 m apart) and derived axes taking part in the navmesh
+  carve — 78,246 nodes / 210,240 edges (+52 % / +74 % vs #34), 15,996 navmesh vertices
+  (#34: 3,975). Kept as `us_east_md_v5_channel_axes_run1.sqlite` for reference.
+- run 2 (this DB): `derive_channel_axes.py --simplify-m 5` (default) and derived axes
+  excluded from the navmesh carve (`--channel-axes-navmesh-carve` to opt in).
+
+| | #34 baseline | #36 run 2 |
+|---|---|---|
+| nodes / edges | 51,519 / 121,168 | 62,309 (+20.9 %) / 162,482 (+34.1 %) |
+| crosses_land / hubs (>30) / max out-degree | 0 / 0 / 16 | 0 / 0 / 15 |
+| largest component | 38,429 nodes, 8,817 km | 50,555 nodes, 11,615 km |
+| skeleton "point" nodes from coastal_water | 39,932 | 39,895 |
+| navmesh vertices | 3,975 | 3,807 |
+| channel-axis nodes / edges (source `channel_axes`) | — | 12,449 / 25,832 (908 km one-way) |
+| connector edges (no source) | 12,728 | 31,146 (18,150 touch an axis node: Pass 0d) |
+| edges at cost_factor 0.8 | 14,196 | 59,294 |
+| Coltons box (lon -76.92..-76.75, lat 38.22..38.32) nodes / edges | 479 / 1,073 | 793 / 1,922 |
+| **route Potomac buoy 13 → buoy 33, share within 100 m of a derived axis** | 2 % (35.2 km, cost 42.2) | **95 % (31.9 km, cost 26.0)** |
+| route Wicomico 1W → 13W | 15 % | 49 % |
+| route screenshot pair (38.2696N 76.8189W → 38.2628N 76.8716W) | 5 % | 4 % (no marked channel joins those two points) |
+
+Route metric = Dijkstra on the DB's own edges (distance × cost_factor), scratch script,
+no depth constraint. Interpretation: the requirement metric moved as intended (a route up
+the Potomac now follows the buoyed channel instead of the medial-axis skeleton); the graph
+grows because every marked channel gains an explicit axis (≤120 m vertices) plus Pass 0d's
+two lateral connectors per axis vertex. The skeleton twin next to a derived axis is carved
+(skeleton node count flat), the open-water mesh is left alone. Not deployed.
+
+- **Also verified (no build)**: `derive_channel_axes.py` on Dutch IENC (Zeeland clip:
+  116 axes; Wadden clip: 170 axes, 107 of them buoy-chain axes over 330 km of tidal
+  gullies that have no polygon or charted axis) — see SPEC-CHANNEL-AXES.md §7.
+- **Regression coverage**: `tests/test_derive_channel_axes.py` (26, synthetic),
+  `tests/test_channel_axes_ingest.py` (18, incl. navmesh-carve exclusion).
+- **Logs**: `data/md_v5_channel_axes_build.log`, `data/md_v5_clipped_channel_axes.log`,
+  `data/geojson/us-east-md-v5_clipped/channel_axes_stats.json`.

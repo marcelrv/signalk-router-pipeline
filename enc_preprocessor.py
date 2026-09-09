@@ -63,7 +63,19 @@ class ENCToGeoJSONPreprocessor:
             'OBSTRN': 'obstructions_points.geojson',
             'HULKES': 'hulks_polygons.geojson',
             'MARCUL': 'mariculture_polygons.geojson',
-            'CTNARE': 'caution_areas_polygons.geojson'
+            'CTNARE': 'caution_areas_polygons.geojson',
+            # Aids to navigation that mark a channel -- input to derive_channel_axes.py
+            # (docs/SPEC-CHANNEL-AXES.md). Lateral buoys/beacons carry OBJNAM
+            # ("Potomac River Channel Buoy 15", "O 12"), CATLAM (1=port-hand,
+            # 2=starboard-hand, 3/4=preferred-channel) and COLOUR; safe-water marks
+            # sit ON the channel axis; M_NSYS gives MARSYS (IALA A/B) and ORIENT
+            # (direction of buoyage). Measured 2026-09-09: 61% of MD marked channels
+            # and most Wadden/Oosterschelde gullies have NO FAIRWY/DRGARE polygon --
+            # the marks are the only charted evidence of the channel.
+            'BOYLAT': 'lateral_marks_points.geojson',
+            'BCNLAT': 'lateral_marks_points.geojson',
+            'BOYSAW': 'safe_water_marks_points.geojson',
+            'M_NSYS': 'nav_systems_polygons.geojson',
         }
 
         # Dictionary to store lists of GeoDataFrames for each output file
@@ -133,11 +145,14 @@ class ENCToGeoJSONPreprocessor:
                     if gdf.crs and gdf.crs != "EPSG:4326":
                         gdf = gdf.to_crs("EPSG:4326")
 
-                    if s57_layer in ('FAIRWY', 'DRGARE'):
+                    if s57_layer in ('FAIRWY', 'DRGARE', 'BOYLAT', 'BCNLAT'):
                         # Record the originating S-57 object class: the pipeline
                         # unifies these two into one fairway signal at read time
                         # (see docs/SPEC-FAIRWAY-HARMONIZATION.md), and this is
                         # what lets a unified feature's origin still be told apart.
+                        # Same for BOYLAT/BCNLAT merged into lateral_marks (a buoy
+                        # can move, a beacon is fixed -- derive_channel_axes.py
+                        # weighs them differently).
                         gdf = gdf.copy()
                         gdf['src_objl'] = s57_layer
 

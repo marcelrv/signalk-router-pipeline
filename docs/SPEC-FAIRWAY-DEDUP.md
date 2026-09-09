@@ -1,6 +1,11 @@
 # Spec: Fairway/Dredged-Area Boundary Preference — Reducing Medial-Axis Density Near a Marked Channel
 
-Status: Draft — analysis only, no code changes. **§6.1's split+reunion mechanism, as
+Status: SUPERSEDED by `SPEC-CHANNEL-AXES.md` (2026-09-09). The measurements below
+(§2) stand; the mechanism (§5–§7) was not built. Probing the raw cells showed the
+motivating Potomac channel has no FAIRWY/DRGARE polygon at all — only lateral buoys —
+so a polygon-boundary mechanism could never reach it; `derive_channel_axes.py` derives
+axis lines from polygons *and* buoy chains instead and feeds them to the existing
+inland-axis path. Original draft status: analysis only, no code changes. **§6.1's split+reunion mechanism, as
 written, has a confirmed geometric flaw (see §6.1's own correction note and §10 item 3):
 it does not reduce density for a fairway that sits wholly interior to a piece, and any
 change it does produce there is a seam artifact rather than legitimate simplification.
