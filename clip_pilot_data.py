@@ -21,7 +21,7 @@ import os
 import geopandas as gpd
 from shapely.geometry import box
 
-# The 14 pipeline layers (filename per the pipeline CLI dict).
+# The pipeline layers (filename per the pipeline CLI dict) plus the marked-channel layers.
 LAYER_FILES = [
     "land_polygons.geojson",
     "coastal_water_polygons.geojson",
@@ -44,6 +44,14 @@ LAYER_FILES = [
     "hulks_polygons.geojson",
     "mariculture_polygons.geojson",
     "caution_areas_polygons.geojson",
+    # Marked-channel inputs/outputs (docs/SPEC-CHANNEL-AXES.md): aids to navigation
+    # emitted by enc_preprocessor.py, and the derived axis layer written by
+    # derive_channel_axes.py (present only if that step already ran on the source
+    # dir; it can equally be run on the clipped dir afterwards).
+    "lateral_marks_points.geojson",
+    "safe_water_marks_points.geojson",
+    "nav_systems_polygons.geojson",
+    "channel_axes_lines.geojson",
 ]
 
 
