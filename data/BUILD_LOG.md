@@ -57,6 +57,7 @@ Nodes/Edges delta.
 | 30 | 2026-09-07 | `273b563` | `data/geojson/sc_ga_reclip` (re-derived via `data/raw/us-east-coast/SC,GA`) | same tuning config as #13, applied to `us_east_sc_ga_stitched` | Roll out Zeeland's tuning config, region 18/19 | 35,438 | 87,245 | 0 | 15 | 0 | **YES** |
 | 31 | 2026-09-07 | `eeb3fed` | `data/geojson/va_reclip` (re-derived via `data/raw/us-east-coast/VA`) | same tuning config as #13, applied to `us_east_va_stitched` | Roll out Zeeland's tuning config, region 19/19 (final) | 59,443 | 143,046 | 0 | 17 | 0 | **YES** |
 | 32 | 2026-09-07 | `453586c` (PR #22, `_safe_negative_buffer` fix) | `data/geojson/fl_atl_n1a_reclip` (re-derived via `data/raw/us-east-coast/FL`) | same tuning config as #13, run under `ulimit -v 11GB` | `fl_atl_n1a` retry after root-causing and fixing its OOM (see Details) | 12,207 | 31,491 | 0 | 16 | 0 | **YES** |
+| 39 | 2026-09-11 | `8a7eaad` (`main`, PR #24 merged) | `data/geojson/us-east-md-v5_clipped` (same clip as #37) | same as #37 | Rebuild #37 on the final merged PR #24 code (picks up the post-#37 CodeRabbit fixes: tier-2 component length floor, navmesh-carve fast path) so the deployed MD channel-axes db reflects what actually merged | 62,904 | 164,468 | 0 | 15 | 0 | **YES (replaces #37)** |
 
 **Row #1 is not a valid comparison baseline** — its input clip/flags are unknown, so
 its counts cannot be attributed to any specific configuration. It's recorded because
@@ -1602,3 +1603,94 @@ candidates) diagnostics seen on prior Zeeland builds — none indicate failed ga
 - **Logs**: `data/zeeland_channel_axes_build.log`.
 - **Commit**: branch `channel-axes`, PR #24 (this BUILD_LOG update committed separately,
   see git log for the exact hash).
+
+### #39 — `us_east_md_channel_axes.sqlite` — rebuild #37 on merged PR #24 code
+
+PR #24 merged to `main` as `8a7eaad` (fast-forward, `--delete-branch`). #37 was built at
+`0d5ffe0` — the feature's *initial* commit — before `2d18544` ("Address CodeRabbit review
+on #24: tier-2 length floor, navmesh fast path, ruff E7/F") landed on the same branch later
+that session. That commit isn't a no-op: it (a) rejects a whole tier-2 polygon-centerline
+component as `too_short` if its full skeleton is under `--min-length-m`, where before only
+individual line parts were length-checked, and (b) drops derived `channel_axes` lines from
+navmesh-carve candidates *before* the no-candidates fast path, instead of after rasterizing
+them. #38 (Zeeland) already ran on `2d18544`, so only MD needed a rebuild to reflect what
+actually merged. Same input dir, flags, and command as #37 (`derive_channel_axes.py` re-run
+first, then the pipeline, both on `data/geojson/us-east-md-v5_clipped`):
+
+```bash
+.venv/bin/python3 derive_channel_axes.py --input-dir data/geojson/us-east-md-v5_clipped
+#  -> marks: 3338 parsed (93 unparsed, 0 unnamed) -> 1953 after dedupe
+#  -> tier 2: 120 components -> 266 axes (252.1 km), 17 blobs skipped, 65 rejected [45.2s]
+#  -> tier 3: 295 chains -> 154 axes (655.3 km), 86 rejected {'too_few_marks': 62,
+#     'duplicate_of_higher_tier': 48, 'too_short': 10, 'corridor_disconnected': 16,
+#     'shallower_than_marks': 10, 'voronoi_empty': 1, 'corridor_empty': 1} [116.9s]
+#  -> done in 169.8s: 420 axes, 231 rejected -> data/geojson/us-east-md-v5_clipped
+ulimit -Sv $((11*1024*1024))
+.venv/bin/python3 nautical_routing_pipeline.py \
+  --input-dir data/geojson/us-east-md-v5_clipped \
+  --output data/us_east_md_channel_axes.sqlite \
+  --country US --name "us-east-md-v5-channel-axes" \
+  --description "US coastal waters (us-east-md-v5-channel-axes), based on NOAA ENCs" \
+  --tags '["noaa","enc","coastal"]' \
+  --url "https://github.com/marcelrv/signalk-router-data" \
+  --license "Public Domain (NOAA)" --copyright "NOAA Office of Coast Survey" \
+  --depth-ceiling 6.0 \
+  --coverage-bbox="-77.4,37.88,-74.68,39.63" \
+  --sagitta-cap 250.0 --max-segment-m 2000 \
+  --axis-dedup-cap 100.0 --axis-dedup-floor-m 100.0 \
+  --min-navmesh-radius-m 1200.0 \
+  --connector-merge-m 5.0 \
+  --inland-densify-max-segment-m 120.0 \
+  --pass2-max-fanin-per-node 6 \
+  --pass0-target-fanin-cap 4 \
+  --node-merge-m 5.0 \
+  --narrow-fragment-reclass-max-fraction 0.5 \
+  --pass0-fanin-cap 6 \
+  --pass0-cross-type-first \
+  --skeleton-boundary-simplify-m 20.0 \
+  --channel-axes
+```
+
+`derive_channel_axes.py`'s tier-2 length floor is visibly active: 266 axes/65 rejected here
+vs. #37's 269 axes/62 rejected (3 short components now correctly rejected; tier-3 chain
+counts are identical to #37, as expected — the floor only touches tier 2). Total: 420 axes
+vs. #37's 423.
+
+**Result vs. #37** (same input, same flags; only the code differs):
+
+| | #37 (`0d5ffe0`, pre-fix) | **#39 (this build, `8a7eaad`)** |
+|---|---|---|
+| nodes / edges | 62,309 / 162,482 | **62,904 / 164,468 (+595 / +1,986)** |
+| crosses_land / hubs (>30) / max out-degree | 0 / 0 / 15 | **0 / 0 / 15** |
+| largest component | 50,555 nodes, 11,614.5 km | **51,212 nodes, ~11,640 km** |
+| components (total) | not recorded for #37 | 259 |
+| channel-axis nodes / edges (source `channel_axes`) | 12,449 / 25,832 (1,816.0 km directed) | **12,439 / 25,814 (1,815.0 km directed)** |
+| edges by source: `coastal_water` | 97,752 (18,425.9 km) | **99,638 (18,451.7 km)** |
+| edges by source: `inland_waterways` | 7,514 (650.7 km) | **7,514 (650.7 km, unchanged)** |
+| edges by source: `bridges` | 238 (61.6 km) | **242 (61.8 km)** |
+| connector edges (no source) | 31,146 (5,994.6 km) | **31,260 (6,011.4 km)** |
+
+The channel-axis edge count moved by almost exactly the 3-axis tier-2 reduction (small
+knock-on from re-snapping neighbours), as expected. The larger and less expected delta is
+in `coastal_water`/connector edges (+1,886 / +114) and largest-component nodes (+657) —
+plausibly the navmesh fast-path change altering which pieces get rasterized-and-carved vs.
+kept whole near a derived axis, though the CodeRabbit commit describes that change as
+performance-only (moving an exclusion earlier, not changing its outcome); could also be
+ordinary multiprocessing/geometry-order nondeterminism between runs on identical input.
+Not isolated further — flagging as a follow-up if it matters
+(see docs/SPEC-CHANNEL-AXES.md §9). No Traceback/MemoryError; `crosses_land` still 0.
+The Potomac-route on-axis-share metric from #36/#37 (buoy 13 → buoy 33, ~95%) was **not**
+re-run here — `gates.py`/`gates_zeeland.py` were scratch scripts from an earlier session
+and are no longer present in the repo or scratchpad.
+
+- **Installed live**: replaces #37's `us_east_md_channel_axes.sqlite` in
+  `signalk-routeiq/data` (still an ADDITIONAL file alongside, not replacing, the live
+  `us_east_md_stitched_v4.sqlite`); old copy backed up as
+  `us_east_md_channel_axes_pre_pr24fix.sqlite.bak`. `signalk-server` container restarted
+  (`docker restart signalk-server`), confirmed `Up`, and `docker logs` shows "peeked 32
+  database(s)" with no new errors (only the two pre-existing empty
+  `europe.sqlite`/`netherlands.sqlite` placeholders skipped, as before).
+- **Logs**: `data/md_v5_clipped_channel_axes_rebuild.log`,
+  `data/us_east_md_channel_axes_rebuild_build.log`.
+- **Commit**: `main` @ `8a7eaad` (PR #24 merge commit); this BUILD_LOG update committed
+  separately on `main`.
