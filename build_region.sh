@@ -13,6 +13,7 @@
 # a state's NOAA ZIP, like Great Lakes/Finger Lakes cells in NY's):
 #   ./build_region.sh <name> --states ME,NH,MA,RI,CT [--source-region us-east-coast]
 #                      [--clip-bbox "min_lon,min_lat,max_lon,max_lat"] [--overlap-deg 0.02]
+#                      [--channel-axes] [--channel-axes-args "--min-confidence 0.6"]
 #                      [--stitch-registry data/seam_registry.sqlite]
 #                      [--extra-pipeline-args "--sagitta-cap 250.0 --node-merge-m 5.0"]
 #                      [--build-mem-limit-gb 11]
@@ -75,6 +76,8 @@ STITCH_REGISTRY=""
 STITCH_BAND_M=""
 STITCH_RADIUS_M=""
 EXTRA_PIPELINE_ARGS=""
+CHANNEL_AXES=""            # --channel-axes: derive marked-channel axes and feed them to the pipeline
+CHANNEL_AXES_ARGS=""       # --channel-axes-args "...": extra derive_channel_axes.py options
 BUILD_MEM_LIMIT_GB="${SK_ROUTING_BUILD_MEM_LIMIT_GB-11}"  # unset (no colon) -- an
                                                            # explicitly empty env var
                                                            # override means "disabled",
@@ -95,6 +98,8 @@ while [ $# -gt 0 ]; do
         --stitch-band-m) STITCH_BAND_M="$2"; shift 2 ;;
         --stitch-radius-m) STITCH_RADIUS_M="$2"; shift 2 ;;
         --extra-pipeline-args) EXTRA_PIPELINE_ARGS="$2"; shift 2 ;;
+        --channel-axes) CHANNEL_AXES="1"; shift ;;
+        --channel-axes-args) CHANNEL_AXES_ARGS="$2"; shift 2 ;;
         --build-mem-limit-gb)
             if [ "$#" -lt 2 ]; then
                 echo "Error: --build-mem-limit-gb requires a value." >&2
@@ -171,6 +176,18 @@ if [ -n "$CLIP_BBOX" ]; then
     time "$PYTHON" clip_pilot_data.py --input-dir "$GEOJSON_DIR" --bbox="$CLIP_BBOX" --output-dir "$CLIPPED_DIR" "${OVERLAP_ARGS[@]}" \
         2>&1 | tee "${LOG_PREFIX}_clip.log"
     GEOJSON_DIR="$CLIPPED_DIR"
+fi
+
+if [ -n "$CHANNEL_AXES" ]; then
+    # docs/SPEC-CHANNEL-AXES.md: derive marked-channel axis lines (centerlines of
+    # FAIRWY/DRGARE polygons and of lateral buoy/beacon chains) from the layers the
+    # pipeline is about to read. Runs on the (clipped) input dir so the axes match
+    # the build's own extent; writes channel_axes_lines.geojson + a rejected layer
+    # and stats JSON next to the other layers.
+    step "2c/3 derive marked-channel axes -> $GEOJSON_DIR/channel_axes_lines.geojson"
+    time "$PYTHON" derive_channel_axes.py --input-dir "$GEOJSON_DIR" $CHANNEL_AXES_ARGS \
+        2>&1 | tee "${LOG_PREFIX}_channel_axes.log"
+    EXTRA_PIPELINE_ARGS="$EXTRA_PIPELINE_ARGS --channel-axes"
 fi
 
 STITCH_ARGS=()

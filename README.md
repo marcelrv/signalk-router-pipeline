@@ -67,6 +67,23 @@ with a cost penalty standing in for "you're on the wrong side." This
 degrades gracefully to a plain centerline edge wherever no buoyage data
 exists for a stretch.
 
+### Marked channels → derived channel axes (`derive_channel_axes.py`)
+
+Most marked channels are not charted as a polygon or a line at all: in the
+Maryland NOAA cells 61 % of channels with three or more marks have no
+`FAIRWY`/`DRGARE` polygon (the Potomac at Coltons Point is buoy-only), and the
+same holds for Wadden Sea gullies in the Dutch IENC. `derive_channel_axes.py`
+runs between preprocessing and the graph build and turns three sources into
+one line layer, `channel_axes_lines.geojson`, each axis carrying a confidence:
+centerlines of `FAIRWY`/`DRGARE` polygons, and axes inferred from ordered
+lateral buoy/beacon chains (`OBJNAM` number + `CATLAM` hand → channel-centre
+estimate → corridor clipped to charted water and depth, walled on the shoal
+side of every mark → medial axis). `nautical_routing_pipeline.py --channel-axes`
+merges those axes into the inland-waterway path, so they get explicit,
+preferred (`cost_factor 0.8`) topology and the axis-dedup mechanism suppresses
+the generated skeleton next to them. `build_region.sh --channel-axes` runs the
+step. Design and measurements: `docs/SPEC-CHANNEL-AXES.md`.
+
 ### Classification
 
 One function decides which representation applies to a given water

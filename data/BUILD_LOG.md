@@ -1328,3 +1328,277 @@ ulimit -v $((11*1024*1024))
   database was peeked with no errors (only the pre-existing empty `europe.sqlite`/
   `netherlands.sqlite` placeholders were skipped as invalid).
 - **Logs**: `data/zeeland_skeletonsimplify_v2_build.log`.
+
+### #36 — `us_east_md_v5_channel_axes.sqlite` — first build with derived marked-channel axes (`--channel-axes`, docs/SPEC-CHANNEL-AXES.md)
+
+Branch `channel-axes` (uncommitted at time of build, on top of 2af61ca). Inputs re-extracted
+with the new `enc_preprocessor.py` layers (`lateral_marks_points`, `safe_water_marks_points`,
+`nav_systems_polygons`) into `data/geojson/us-east-md-v5` (125 NOAA cells), clipped to the
+#34 bbox, then `derive_channel_axes.py` on the clipped dir:
+
+```bash
+python3 enc_preprocessor.py --input data/raw/us-east-md-stitched-v4 --output data/geojson/us-east-md-v5
+python3 clip_pilot_data.py --input-dir data/geojson/us-east-md-v5 --bbox="-77.39,37.89,-74.69,39.62" --overlap-deg 0.01 --output-dir data/geojson/us-east-md-v5_clipped
+python3 derive_channel_axes.py --input-dir data/geojson/us-east-md-v5_clipped
+#  -> 423 axes (269 polygon centerlines, 154 mark chains), 228 rejected with reason; 3 min
+ulimit -Sv $((11*1024*1024))
+.venv/bin/python3 nautical_routing_pipeline.py \
+  --input-dir data/geojson/us-east-md-v5_clipped \
+  --output data/us_east_md_v5_channel_axes.sqlite \
+  --country US --name "us-east-md-v5-channel-axes" \
+  --description "US coastal waters (us-east-md-v5-channel-axes), based on NOAA ENCs" \
+  --tags '["noaa","enc","coastal"]' \
+  --url "https://github.com/marcelrv/signalk-router-data" \
+  --license "Public Domain (NOAA)" --copyright "NOAA Office of Coast Survey" \
+  --depth-ceiling 6.0 \
+  --coverage-bbox="-77.4,37.88,-74.68,39.63" \
+  --sagitta-cap 250.0 --max-segment-m 2000 \
+  --axis-dedup-cap 100.0 --axis-dedup-floor-m 100.0 \
+  --min-navmesh-radius-m 1200.0 \
+  --connector-merge-m 5.0 \
+  --inland-densify-max-segment-m 120.0 \
+  --pass2-max-fanin-per-node 6 \
+  --pass0-target-fanin-cap 4 \
+  --node-merge-m 5.0 \
+  --narrow-fragment-reclass-max-fraction 0.5 \
+  --pass0-fanin-cap 6 \
+  --pass0-cross-type-first \
+  --skeleton-boundary-simplify-m 20.0 \
+  --channel-axes
+```
+
+Same tuning as #34 plus `--channel-axes` (no `--stitch-registry`: standalone comparison
+build). Build time 12.5 min. All 423 derived axes merged (`--channel-axes-min-confidence`
+default 0.5). Two runs:
+
+- run 1: raw Voronoi vertices (~55 m apart) and derived axes taking part in the navmesh
+  carve — 78,246 nodes / 210,240 edges (+52 % / +74 % vs #34), 15,996 navmesh vertices
+  (#34: 3,975). Kept as `us_east_md_v5_channel_axes_run1.sqlite` for reference.
+- run 2 (this DB): `derive_channel_axes.py --simplify-m 5` (default) and derived axes
+  excluded from the navmesh carve (`--channel-axes-navmesh-carve` to opt in).
+
+| | #34 baseline | #36 run 2 |
+|---|---|---|
+| nodes / edges | 51,519 / 121,168 | 62,309 (+20.9 %) / 162,482 (+34.1 %) |
+| crosses_land / hubs (>30) / max out-degree | 0 / 0 / 16 | 0 / 0 / 15 |
+| largest component | 38,429 nodes, 8,817 km | 50,555 nodes, 11,615 km |
+| skeleton "point" nodes from coastal_water | 39,932 | 39,895 |
+| navmesh vertices | 3,975 | 3,807 |
+| channel-axis nodes / edges (source `channel_axes`) | — | 12,449 / 25,832 (908 km one-way) |
+| connector edges (no source) | 12,728 | 31,146 (18,150 touch an axis node: Pass 0d) |
+| edges at cost_factor 0.8 | 14,196 | 59,294 |
+| Coltons box (lon -76.92..-76.75, lat 38.22..38.32) nodes / edges | 479 / 1,073 | 793 / 1,922 |
+| **route Potomac buoy 13 → buoy 33, share within 100 m of a derived axis** | 2 % (35.2 km, cost 42.2) | **95 % (31.9 km, cost 26.0)** |
+| route Wicomico 1W → 13W | 15 % | 49 % |
+| route screenshot pair (38.2696N 76.8189W → 38.2628N 76.8716W) | 5 % | 4 % (no marked channel joins those two points) |
+
+Route metric = Dijkstra on the DB's own edges (distance × cost_factor), scratch script,
+no depth constraint. Interpretation: the requirement metric moved as intended (a route up
+the Potomac now follows the buoyed channel instead of the medial-axis skeleton); the graph
+grows because every marked channel gains an explicit axis (≤120 m vertices) plus Pass 0d's
+two lateral connectors per axis vertex. The skeleton twin next to a derived axis is carved
+(skeleton node count flat), the open-water mesh is left alone. Not deployed.
+
+- **Also verified (no build)**: `derive_channel_axes.py` on Dutch IENC (Zeeland clip:
+  116 axes; Wadden clip: 170 axes, 107 of them buoy-chain axes over 330 km of tidal
+  gullies that have no polygon or charted axis) — see SPEC-CHANNEL-AXES.md §7.
+- **Regression coverage**: `tests/test_derive_channel_axes.py` (26, synthetic),
+  `tests/test_channel_axes_ingest.py` (18, incl. navmesh-carve exclusion).
+- **Logs**: `data/md_v5_channel_axes_build.log`, `data/md_v5_clipped_channel_axes.log`,
+  `data/geojson/us-east-md-v5_clipped/channel_axes_stats.json`.
+
+### #37 — `us_east_md_channel_axes.sqlite` — replicate #36 on committed code (bare-number mark parser)
+
+Branch `channel-axes` @ `0d5ffe0` (the feature's initial commit; a later same-branch commit
+`2d18544`, "Address CodeRabbit review on #24", landed mid-session from a concurrent process
+on this branch but only after this build's `nautical_routing_pipeline.py` process had already
+started — see #38's note, which *did* pick it up). Same input dir and flags as #36, but
+`derive_channel_axes.py` re-run first so the axes come from the checked-in parser (which
+already includes the bare-number mark-name pattern, `_BARE_MARK_RE` in `derive_channel_axes.py`):
+
+```bash
+python3 derive_channel_axes.py --input-dir data/geojson/us-east-md-v5_clipped
+#  -> marks: 3338 parsed (93 unparsed, 0 unnamed) -> 1953 after dedupe
+#  -> tier 2: 120 components -> 269 axes (252.5 km), 17 blobs skipped, 62 rejected [47.0s]
+#  -> tier 3: 295 chains -> 154 axes (655.3 km), 86 rejected {'too_few_marks': 62,
+#     'duplicate_of_higher_tier': 48, 'too_short': 10, 'corridor_disconnected': 16,
+#     'shallower_than_marks': 10, 'voronoi_empty': 1, 'corridor_empty': 1} [118.3s]
+#  -> done in 172.4s: 423 axes, 228 rejected -> data/geojson/us-east-md-v5_clipped
+ulimit -Sv $((11*1024*1024))
+.venv/bin/python3 nautical_routing_pipeline.py \
+  --input-dir data/geojson/us-east-md-v5_clipped \
+  --output data/us_east_md_channel_axes.sqlite \
+  --country US --name "us-east-md-v5-channel-axes" \
+  --description "US coastal waters (us-east-md-v5-channel-axes), based on NOAA ENCs" \
+  --tags '["noaa","enc","coastal"]' \
+  --url "https://github.com/marcelrv/signalk-router-data" \
+  --license "Public Domain (NOAA)" --copyright "NOAA Office of Coast Survey" \
+  --depth-ceiling 6.0 \
+  --coverage-bbox="-77.4,37.88,-74.68,39.63" \
+  --sagitta-cap 250.0 --max-segment-m 2000 \
+  --axis-dedup-cap 100.0 --axis-dedup-floor-m 100.0 \
+  --min-navmesh-radius-m 1200.0 \
+  --connector-merge-m 5.0 \
+  --inland-densify-max-segment-m 120.0 \
+  --pass2-max-fanin-per-node 6 \
+  --pass0-target-fanin-cap 4 \
+  --node-merge-m 5.0 \
+  --narrow-fragment-reclass-max-fraction 0.5 \
+  --pass0-fanin-cap 6 \
+  --pass0-cross-type-first \
+  --skeleton-boundary-simplify-m 20.0 \
+  --channel-axes
+```
+
+(No `--stitch-registry`, matching #36.) Total axes/rejects (423/228) match #36 exactly even
+though the tier-3 chain count differs (295→154 here vs 318→165 in #36) — the bare-number
+parser reclassifies some previously-unparsed marks into existing chains, but the net axis
+count landed the same.
+
+**Result vs. #34 baseline and #36 run 2** (this build reproduces #36 run 2's recipe —
+`--simplify-m 5` default, axes excluded from the navmesh carve):
+
+| | #34 baseline | #36 run 2 | **#37 (this build)** |
+|---|---|---|---|
+| nodes / edges | 51,519 / 121,168 | 62,309 / 162,482 | **62,309 / 162,482** |
+| crosses_land / hubs (>30) / max out-degree | 0 / 0 / 16 | 0 / 0 / 15 | **0 / 0 / 15** |
+| largest component | 38,429 nodes, 8,817 km | 50,555 nodes, 11,615 km | **50,555 nodes, 11,614.5 km** |
+| channel-axis nodes / edges (source `channel_axes`) | — | 12,449 / 25,832 | **12,449 / 25,832 (1,816.0 km directed)** |
+| connector edges (no source) | 12,728 | 31,146 | **31,146** |
+| **Potomac route (buoy 13 → buoy 33): share within 100 m of a derived axis** | 2 % (35.2 km, cost 42.2) | 95 % (31.9 km, cost 26.0) | **95 % (31.88 km, cost 25.98)** |
+| route Wicomico 1W → 13W | 15 % | 49 % | **49 %** |
+| route screenshot pair | 5 % | 4 % | **4 %** |
+
+Byte-for-byte reproduction of #36 run 2's gate numbers, confirming the committed code
+(including the bare-number parser change) is a no-op for this dataset relative to the
+uncommitted state #36 was built from. Edges by `data_sources`: `coastal_water` 97,752
+(18,425.9 km), `inland_waterways` 7,514 (650.7 km), `bridges` 238 (61.6 km), `channel_axes`
+25,832 (1,816.0 km), connector (no source) 31,146 (5,994.6 km). No Traceback/MemoryError in
+the build log; the usual "Axis-dedup reconnect cap: ... capping to 8" (21 occurrences) and
+"Stitch guarantee pass could not find a valid in-polygon connector" (informational, land/poly
+rejects) diagnostics appear at similar rates to prior MD builds.
+
+- **Installed live**: deployed as an ADDITIONAL file alongside (not replacing) the live
+  `us_east_md_stitched_v4.sqlite` (and `zeeland.sqlite`/`zeeland_skeletonsimplify_v2.sqlite`,
+  untouched) — `us_east_md_channel_axes.sqlite` in `signalk-routeiq/data`; `signalk-server`
+  container restarted (`docker restart signalk-server`), confirmed `Up` via `docker ps`, and
+  `docker logs` shows it was peeked among the 32 databases in that directory with no errors
+  (only the two pre-existing empty `europe.sqlite`/`netherlands.sqlite` placeholders skipped
+  as invalid, as before).
+- **Logs**: `data/us_east_md_channel_axes_build.log`.
+- **Commit**: see #38 below (both builds logged in one commit).
+
+### #38 — `zeeland_channel_axes.sqlite` — first Zeeland build with `--channel-axes`, matching #35's extent
+
+Branch `channel-axes` @ `2d18544` ("Address CodeRabbit review on #24: tier-2 length floor,
+navmesh fast path, ruff E7/F" — this commit landed on the branch from a concurrent process
+partway through this session; #37/Maryland's pipeline run had already started before it
+landed and used `0d5ffe0` throughout, but this Zeeland build's clip/derive/pipeline steps all
+started after it, so they ran against `2d18544`). Source: `data/geojson/nl-v5`, the fresh
+whole-NL extraction with the new buoy layers (`lateral_marks_points`, `safe_water_marks_points`,
+`nav_systems_polygons`) — unclipped, so never run through the pipeline directly.
+
+**Clip bbox derivation**: #35's input dir was `data/zeeland_fresh_clip`; its
+`coastal_water_polygons.geojson` total bounds are `[3.1333333, 51.21014, 4.6166667, 51.95]`
+(via `gpd.read_file(...).total_bounds`), rounded outward to 0.01° → `3.13,51.21,4.62,51.95`
+— the same coverage #35 was built on, just re-clipped from the newer `nl-v5` extraction so
+the buoy layers are present.
+
+```bash
+python3 clip_pilot_data.py --input-dir data/geojson/nl-v5 --bbox="3.13,51.21,4.62,51.95" \
+  --output-dir data/geojson/nl-v5-zeeland-build_clipped
+#  -> land 3,483 / coastal_water 119,092 / inland_waterways 1,890 / depare 119,043 /
+#     bridges 452 / locks 49 / fairways 1,740 / dredged_areas 2 / lateral_marks 863 /
+#     safe_water_marks 13 / nav_systems 184 features
+python3 derive_channel_axes.py --input-dir data/geojson/nl-v5-zeeland-build_clipped
+#  -> marks: 749 parsed (84 unparsed, 43 unnamed) -> 391 after dedupe
+#  -> tier 2: 677 components -> 429 axes (230.6 km), 177 blobs skipped, 351 rejected [176.1s]
+#  -> tier 3: 94 chains -> 67 axes (113.9 km), 42 rejected {'shallower_than_marks': 11,
+#     'duplicate_of_higher_tier': 30, 'voronoi_empty': 1, 'too_few_marks': 5} [190.0s]
+#  -> done in 445.1s: 496 axes, 578 rejected -> data/geojson/nl-v5-zeeland-build_clipped
+ulimit -Sv $((11*1024*1024))
+.venv/bin/python3 nautical_routing_pipeline.py \
+  --input-dir data/geojson/nl-v5-zeeland-build_clipped \
+  --output data/zeeland_channel_axes.sqlite \
+  --country NL --name "zeeland-channel-axes" \
+  --description "Zeeland province and approaches (Westerschelde, Oosterschelde, Veerse Meer, Grevelingen, Haringvliet, North Sea approach), based on Rijkswaterstaat IENC / ENC data" \
+  --tags '["ienc","rws","coastal","inland"]' \
+  --url "https://github.com/marcelrv/signalk-router-data" \
+  --license "Public Domain (Rijkswaterstaat)" --copyright "Rijkswaterstaat" \
+  --depth-ceiling 6.0 \
+  --sagitta-cap 250.0 --max-segment-m 2000 \
+  --axis-dedup-cap 100.0 --axis-dedup-floor-m 100.0 \
+  --min-navmesh-radius-m 1200.0 \
+  --connector-merge-m 5.0 \
+  --inland-densify-max-segment-m 120.0 \
+  --pass2-max-fanin-per-node 6 \
+  --pass0-target-fanin-cap 4 \
+  --node-merge-m 5.0 \
+  --narrow-fragment-reclass-max-fraction 0.5 \
+  --pass0-fanin-cap 6 \
+  --pass0-cross-type-first \
+  --skeleton-boundary-simplify-m 20.0 \
+  --channel-axes
+```
+
+Same tuning as #35 (no `--stitch-registry`, matching #35) plus `--channel-axes`, `--name`
+changed to `zeeland-channel-axes`. Build time ~18 min total (clip 4.7 min, derive 7.4 min,
+pipeline ~18.3 min). All 496 derived axes merged: `{'polygon_centerline': 429, 'mark_chain':
+67}` (confidence ≥ 0.5 default).
+
+**Caveat on the #35 comparison**: the clip bbox matches #35's coverage, but the *source*
+extraction differs — `nl-v5` is materially fresher/denser than #35's `zeeland_fresh_clip`
+(e.g. 1,740 fairway polygons here vs. far fewer in #35's older extraction) in addition to
+carrying the new buoy layers. So, like #35's own note about #34's flags not being an isolated
+ablation, the deltas below are **not** an isolated measurement of `--channel-axes` alone —
+some growth is the newer source data, independent of the new feature.
+
+| | #35 baseline | **#38 (this build)** |
+|---|---|---|
+| nodes / edges | 40,433 / 120,485 | **54,761 / 159,783 (+35.4 % / +32.6 %)** |
+| crosses_land / hubs (>30) / max out-degree | 0 / 0 / 14 | **0 / 0 / 13** |
+| largest component | 32,910 nodes, 6,215.6 km | **51,487 nodes, 9,187.3 km** |
+| components (total) | 350 | 420 |
+| channel-axis nodes / edges (source `channel_axes`) | — | **5,845 / 11,434 (685.2 km directed)** |
+| edges by source: `coastal_water` | 43,926 (6,274.2 km) | 49,842 (7,060.9 km) |
+| edges by source: `inland_waterways` | 37,403 (2,189.0 km) | 48,587 (2,599.7 km) |
+| edges by source: `bridges` / `locks` | 266 (11.7 km) / 110 (9.1 km) | 286 (13.5 km) / 156 (13.7 km) |
+| connector edges (no source) | 38,780 (6,329.3 km) | 49,478 (8,545.6 km) |
+
+**Route metric** (Dijkstra on the DB's own edges, `gates_zeeland.py`, EPSG:32631, 100 m
+buffer around `channel_axes_lines.geojson`; no depth constraint) — two new Zeeland test
+routes, not previously benchmarked, run on both this build and on #35's DB as baseline
+(with the same derived-axes file used for the share metric on both, for an apples-to-apples
+comparison of how much of each route the *new* graph vs. the *old* graph puts near a
+derived axis):
+
+| route | #35 baseline (length, cost, % near axis) | #38 this build (length, cost, % near axis) |
+|---|---|---|
+| Oosterschelde Roompot (3.55,51.62) → Zeelandbrug area (3.90,51.63) | 30.13 km, cost 25.95, **4 %** | 28.75 km, cost 24.51, **12 %** |
+| Westerschelde Vlissingen (3.57,51.44) → Terneuzen (3.82,51.34) | 23.41 km, cost 18.73, **12 %** | 23.48 km, cost 18.88, **12 %** |
+
+The Oosterschelde route's on-axis share triples and its cost drops (route now prefers a
+derived axis over the medial-axis skeleton there); the Westerschelde route is essentially
+unchanged in length/cost/share — Vlissingen–Terneuzen's Dijkstra path apparently already
+followed charted `wtwaxs`/fairway topology in the baseline that coincides with where the
+derived axis also runs, so `--channel-axes` had nothing new to offer there. No Potomac-style
+"expect ~95%" target was set for these Zeeland routes; both are exploratory probes of the
+new feature on IALA-A buoy/fairway data, per SPEC-CHANNEL-AXES.md §7.2's Zeeland tier
+counts. Script: `gates_zeeland.py` (scratch, adapted from `gates.py` for two Zeeland routes
+and EPSG:32631).
+
+No Traceback/MemoryError in the build log; 168 WARNING lines total, all either the routine
+"Axis-dedup reconnect cap: ... capping to 8" (63 occurrences) or "Stitch guarantee pass could
+not find a valid in-polygon connector" (150 occurrences, land/poly rejects on sampled
+candidates) diagnostics seen on prior Zeeland builds — none indicate failed gates
+(`crosses_land` is 0).
+
+- **Installed live**: deployed as an ADDITIONAL file alongside (not replacing) the live
+  `zeeland.sqlite`/`zeeland_skeletonsimplify_v2.sqlite` (and `us_east_md_stitched_v4.sqlite`,
+  untouched) — `zeeland_channel_axes.sqlite` in `signalk-routeiq/data`; `signalk-server`
+  container restarted once for both #37 and #38 (`docker restart signalk-server`), confirmed
+  `Up` via `docker ps`, and `docker logs` shows both new databases were peeked among the 32
+  in that directory with no errors.
+- **Logs**: `data/zeeland_channel_axes_build.log`.
+- **Commit**: branch `channel-axes`, PR #24 (this BUILD_LOG update committed separately,
+  see git log for the exact hash).
