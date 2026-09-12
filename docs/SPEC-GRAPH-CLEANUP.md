@@ -1,8 +1,10 @@
 # Spec: Graph cleanup — removing the graph no boat will ever use
 
-Status: Pass A implemented on branch `graph-cleanup` (2026-09-12): `graph_cleanup/`,
-`apply_cleanup.py`, `tests/test_graph_cleanup.py`. Verification build: `data/BUILD_LOG.md` #40.
-Passes B and C (model adjudication, model route tracing) are specified here but not built.
+Status: Pass A and the renderer implemented on branch `graph-cleanup` (2026-09-12):
+`graph_cleanup/`, `apply_cleanup.py`, `tests/test_graph_cleanup.py`,
+`tests/test_graph_cleanup_render.py`. Verification build: `data/BUILD_LOG.md` #40; the
+renderer's visual before/after is §5.5. Passes B and C (model adjudication, model route
+tracing) are specified here but not built.
 Complements: `SPEC-GRAPH-DENSITY.md` (the density investigation and the gate discipline
 reused here), `SPEC-CHANNEL-AXES.md` (the layer whose over-density Pass A removes).
 
@@ -188,6 +190,54 @@ POIs are held as **coordinates, not node ids**. Simplification legitimately remo
 exact node a POI snapped to; the line stays and the POI re-snaps a few metres along it.
 Gating on node identity fails every successful run.
 
+## 5.5 Renderer (`graph_cleanup/render.py`, implemented)
+
+Built to close the gap §1 describes, ahead of any tiling/prompt work: the plan called
+for "look at the tiles yourself" before spending on a model, and doing that
+immediately surfaced two real bugs that would otherwise have corrupted every Pass
+B/C tile.
+
+**Bug 1 — mixed-geometry layers silently miscolour their Point subset.**
+`caution_areas_polygons` and `obstructions_points` each hold a mix of Polygon and
+Point geometry (measured: 8 polygon / 5 point, and 88 point / 3 polygon, in the
+Coltons Point bbox). `geopandas.plot()` routes a GeoDataFrame's Point rows through
+`ax.scatter`, and a `facecolor="none"` meant for the polygon fill does not reliably
+apply there — the points silently fell back to matplotlib's default colour cycle
+instead of disappearing or taking the requested colour. The first render of the #40
+before/after comparison shipped this: unstyled orange/blue dots over open water that
+looked like real chart symbology. Fixed by splitting every layer's Point subset out
+(`POINT_LAYERS`) and drawing it explicitly — obstructions especially, since they are
+exactly the hazard a reviewer must see as what it is.
+
+**Bug 2 — a navmesh region renders as an empty ring, and reads as disconnected
+junk.** `edge_kind_id == EDGE_KIND_NAVMESH_BOUNDARY` is *only* the perimeter of a
+navmesh region (`nautical_routing_pipeline.build_navmesh_region`); the interior is a
+constrained Delaunay triangulation stored in `navmesh_regions.vertices`/`triangles`
+and walked by the funnel algorithm at query time, never flattened into `edges` rows.
+A renderer that draws only `nodes`/`edges` shows a wide, entirely normal open-water
+region as a large dotted ring with nothing inside — at the Coltons Point bbox this
+looked exactly like a disconnected artifact, the kind of thing a Pass B/C prompt
+would have flagged as `graph_noise` at scale, wrongly, region by region. **Confirmed
+in the pipeline source before drawing any conclusion from what it looked like on
+screen** — this is the same mistake the `scope: systemic` design guard exists to
+catch, and it would have reached that guard already mislabelled. Fixed by loading
+`navmesh_regions` for the tile's bbox and tinting the interior, so a reviewer sees
+"funnel-routed open water", not emptiness.
+
+**Practical lesson for Pass B/C**: a tile fed to any reviewer, human or model, needs
+the navmesh tint present or every open-water region becomes a false positive. This is
+now load-bearing for whatever candidate/prompt work comes next, not optional polish.
+
+Verified against build #39/#40 at the Coltons Point bbox `(-76.90, 38.15, -76.68,
+38.27)`: the `channel_axes` line visibly changes from a beaded/oversampled look to a
+clean line between before and after, matching §4.5's numbers exactly; the skeleton
+mesh is visibly unchanged, matching §2.3; two large navmesh regions render as tinted
+areas crossed cleanly by the channel axis, present identically in both renders (Pass A
+protects navmesh nodes, confirmed visually as well as by the gate).
+
+Tests: `tests/test_graph_cleanup_render.py` (11 tests, synthetic fixtures) — the two
+bugs above each have a regression test.
+
 ## 6. Passes B and C — not built
 
 Pass A caps out around 15% because the rest is judgement: *does this dead end lead
@@ -226,6 +276,11 @@ so per-vessel filtering stays downstream.
   proof.
 - 18.6% of nodes are outside the largest component and untouched; whether those are real
   disconnected water or artifacts is a Pass-B question.
-- Visual before/after at Coltons Point is still outstanding — the check
-  `SPEC-GRAPH-DENSITY.md` §9.4 has flagged as missing since #34, and the only one that
-  measures the thing actually complained about.
+- Visual before/after at Coltons Point is done (§5.5) — the check `SPEC-GRAPH-DENSITY.md`
+  §9.4 flagged as missing since #34. It confirmed §4.5's numbers and found two renderer
+  bugs before they could corrupt Pass B/C tiles; it did not turn up a new correctness
+  problem in the cleaned graph itself.
+- The renderer only draws what fits in the `RoutingGraph`/clipped-GeoJSON model: no
+  triangle-level navmesh interior (a tint stands in for it), no depth colour banding
+  within `depare_polygons` (single flat fill). Neither blocked the Coltons Point check;
+  revisit if a Pass B/C candidate turns out to need finer chart detail than the tint.
