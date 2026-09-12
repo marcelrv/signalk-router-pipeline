@@ -58,6 +58,7 @@ Nodes/Edges delta.
 | 31 | 2026-09-07 | `eeb3fed` | `data/geojson/va_reclip` (re-derived via `data/raw/us-east-coast/VA`) | same tuning config as #13, applied to `us_east_va_stitched` | Roll out Zeeland's tuning config, region 19/19 (final) | 59,443 | 143,046 | 0 | 17 | 0 | **YES** |
 | 32 | 2026-09-07 | `453586c` (PR #22, `_safe_negative_buffer` fix) | `data/geojson/fl_atl_n1a_reclip` (re-derived via `data/raw/us-east-coast/FL`) | same tuning config as #13, run under `ulimit -v 11GB` | `fl_atl_n1a` retry after root-causing and fixing its OOM (see Details) | 12,207 | 31,491 | 0 | 16 | 0 | **YES** |
 | 39 | 2026-09-11 | `8a7eaad` (`main`, PR #24 merged) | `data/geojson/us-east-md-v5_clipped` (same clip as #37) | same as #37 | Rebuild #37 on the final merged PR #24 code (picks up the post-#37 CodeRabbit fixes: tier-2 component length floor, navmesh-carve fast path) so the deployed MD channel-axes db reflects what actually merged | 62,904 | 164,468 | 0 | 15 | 0 | **YES (replaces #37)** |
+| 40 | 2026-09-12 | `graph-cleanup` branch | n/a — post-processes #39's `.sqlite`, not a rebuild | `apply_cleanup.py` Pass A (`--tolerance-m 20`, smooth + contract + redundant) | First deterministic post-build cleanup: measure how much of the graph comes out with no model at all | 53,930 | 142,196 | 0 | 13 | 0 | no (test build) |
 
 **Row #1 is not a valid comparison baseline** — its input clip/flags are unknown, so
 its counts cannot be attributed to any specific configuration. It's recorded because
@@ -1694,3 +1695,67 @@ and are no longer present in the repo or scratchpad.
   `data/us_east_md_channel_axes_rebuild_build.log`.
 - **Commit**: `main` @ `8a7eaad` (PR #24 merge commit); this BUILD_LOG update committed
   separately on `main`.
+
+### #40 — `us_east_md_cleanup_a.sqlite` — deterministic post-build cleanup (Pass A)
+
+First run of `apply_cleanup.py` (`docs/SPEC-GRAPH-CLEANUP.md`, branch `graph-cleanup`).
+**Not a rebuild** — it post-processes #39's shipped `.sqlite` in 4.3 s, so it is directly
+comparable to #39 in a way no re-derived build ever is. Cleanup decisions are written to
+`data/md_cleanup_a.ops.jsonl` (17,053 ops) and replay onto any later rebuild, because node
+IDs are coordinate-derived.
+
+```bash
+.venv/bin/python apply_cleanup.py \
+  --db /home/node/signalkdev/signalk-routeiq/data/us_east_md_channel_axes.sqlite \
+  --ops data/md_cleanup_a.ops.jsonl \
+  --out data/us_east_md_cleanup_a.sqlite \
+  --probe 37.8890,-76.2442,39.5338,-75.7875 \
+  --probe 38.2321,-76.9657,38.9750,-76.4850
+#  -> smooth 5,805 / contract 9,087 / redundant 2,161 ops; 16,940 applied, 113 skipped
+#     (skipped are all `not_spliceable`: the chain had already become a triangle)
+```
+
+**Result vs #39**: 62,904 → 53,930 nodes (**−14.3%**), 164,468 → 142,196 edge rows
+(**−13.5%**), 36.9 → 33.4 MB. All seven gates pass, including the two that matter:
+POI-pair reachability 48,228 → 48,228 (zero loss) and largest component by *edge length*
+0.8625 → 0.8621 (+0.05pp). The 186.9 km probe (Little Wicomico River Channel → C&D Canal
+Channel, 1,551 nodes) changed **0.0%** — routes are byte-identical in cost.
+
+**What it fixed.** The over-density complaint, on the layers that had it. Degree-2 node
+counts: `channel_axes` 6,951 → 1,252 (−82%), `inland_waterways` 2,725 → 117 (−96%). Both
+layers were already dead straight (median turn 0.5° and 0.2°) and simply over-sampled at
+76 m / 91 m, so Douglas-Peucker removes them exactly, with no judgement involved.
+
+**What it did NOT fix, and why this matters more than the headline.** The
+`coastal_water` medial-axis skeleton is barely touched: median turn 35.7° → 30.8°, still
+60.8% of its degree-2 nodes over 20°, median segment unchanged at 55 m. Measured cause:
+**the skeleton is a mesh, not a set of lines.** Of the 44,236 nodes touching a skeleton
+edge, 22,095 are degree-3 or more, and of its 5,832 degree-2 chains, 3,675 hold a single
+interior node. Median deviation-from-straight at a skeleton junction is 167°. No
+chain-based pass can reach wobble that lives *between* junctions — that needs either
+`--skeleton-boundary-simplify-m` at generation time or the route-selection judgement of
+Pass B/C.
+
+This also revises the plan's estimate downward: the deterministic ceiling is ~14–16%, not
+the 35–40% predicted. The measured floor is still 15.5% of nodes (all-pairs routing
+between the 262 POI anchors in the main component), so essentially the whole remaining gap
+is judgement work.
+
+**Two regressions the gates caught during development**, both now fixed and covered by
+`tests/test_graph_cleanup.py`:
+1. Splicing deleted 47 POI anchor nodes (Baltimore Harbor Channel, Anacostia Channel, …).
+   Fixed by `trace.protect_poi_nodes()`.
+2. Plain Douglas-Peucker left "Brewerton Channel Eastern Extension" snapping **2,123 m**
+   from its charted position — routeiq's `coverage_gap` warning in the making. Fixed by
+   `contract_chains(max_spacing_m=500)`: shape needs simplification, snapping needs density.
+
+**Hard constraint found**: 3,757 of the 3,807 navmesh nodes are referenced in
+`navmesh_regions.boundary_node_ids` and are loaded as protected. The navmesh waste in
+SPEC-GRAPH-DENSITY.md §10 therefore **cannot** be fixed post-build at all — `vertices`/
+`triangles` are a triangulation, so thinning it means re-triangulating. That work belongs
+at generation time, as §10.6 item 1 already says.
+
+- **Tests**: 393 passed (29 new in `tests/test_graph_cleanup.py`).
+- **Not installed live** — this is the first cleanup build; visual before/after at Coltons
+  Point still outstanding (the check SPEC-GRAPH-DENSITY.md §9.4 has flagged as missing
+  since #34).
