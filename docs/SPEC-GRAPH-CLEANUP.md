@@ -2,10 +2,12 @@
 
 Status: Pass A, the renderer, and Pass B (prune) implemented on branch `graph-cleanup`
 (2026-09-12/14): `graph_cleanup/`, `apply_cleanup.py`, `review_region.py`,
-`tests/test_graph_cleanup*.py`, `tests/test_review_region_cli.py`. Verification build:
-`data/BUILD_LOG.md` #40; the renderer's visual before/after is §5.5; Pass B's harness
-verification (mock backend, real data) is §6.4. **Pass B has not been run against a live
-Sonnet key** — no credentials available in the building session, see §6.5. Pass C (model
+`tests/test_graph_cleanup*.py`, `tests/test_review_region_cli.py`. Verification builds:
+`data/BUILD_LOG.md` #40 (Pass A), #41 (Pass B pilot), #42 (Pass B expanded, 3x area,
+323 candidates, §6.7). The renderer's visual before/after is §5.5; `render_diff` (a
+one-picture overlay, §6.7) is the current best way to see a cleanup's real effect.
+Pass B's harness verification (mock backend, real data) is §6.4; real reviewer results
+(no live API key used — see §6.5) are §6.6-6.7. Pass C (model
 route tracing) is specified (§6) but not built.
 Complements: `SPEC-GRAPH-DENSITY.md` (the density investigation and the gate discipline
 reused here), `SPEC-CHANNEL-AXES.md` (the layer whose over-density Pass A removes).
@@ -432,6 +434,79 @@ gates pass, 53,930 → 53,890 nodes (-40, -0.1% — expected at this pilot's sca
 out of the whole state). The result was not deployed; it exists to validate the harness and
 the prompt before spending on a wider run, which is what it did.
 
+### 6.7 Expanded review (~3x area) and the structural findings it confirms
+
+Same method as §6.6, same session, area grown from the Coltons Point bbox
+(`-76.90,38.15,-76.68,38.27`, 104 candidates) to `-76.95,38.10,-76.63,38.32`
+(323 candidates, 37 tiles) — a superset, so the 104 already-judged candidates were
+carried forward by `candidate_id` (stable, node-id-derived) rather than re-reviewed, and
+only the 219 genuinely new ones needed fresh judgement. All 323 answered, zero
+`unanswered`.
+
+| | count |
+|---|---|
+| `keep` | 262 |
+| `drop` | 52 |
+| `unsure` | 9 |
+| ops produced | 69 |
+
+**Regional composition changes the keep rate a lot, and that is itself a finding.** The
+expanded area is dominated by Maryland's Potomac-tributary tidal creeks (Nomini Creek,
+Lower Machodoc/Glebe Creek, Cuckold Creek, the Wicomico River, Breton Bay/Saint Clements
+Bay) rather than open headland coastline, and the keep rate rose from 61% (pilot) to 81%
+(expanded) accordingly — entire tiles of 5-23 candidates came back 100% `keep` because
+every stub genuinely sat inside a real, substantial, branching creek. **The pilot's drop
+rate is not a regional constant**; whatever the eventual statewide run measures will depend
+heavily on how much open headland coastline versus creek system each stratified sample
+covers, and a gold-set sampler should stratify by that if it doesn't already.
+
+**The "plain shoreline stub" pattern (§6.6) held up at 3x scale with no exceptions.**
+Every one of the 52 drops was the same shape: a short stub reaching an unremarkable point
+of open shoreline, usually one of 4-8 near-identical stubs around the same headland, with
+no cove, marsh, or named feature under it — including, this round, an isolated candidate
+at a headland shoreline point 7.3 km from the nearest charted POI (`t1_1418_-2235`). The
+candidate deterministic-rule idea in §6.6 is now supported by 52 drops, not 35, still with
+zero counterexamples found.
+
+**Two new observations, worth recording precisely because they *don't* fit the existing
+rules cleanly:**
+
+* All 20 `small_component` candidates seen so far (8 pilot + 12 here) were judged `keep`.
+  Every one sat inside real, if disconnected, marsh or cove water — none looked like a
+  rendering artifact. Twenty is still not a large sample, but it is a second sample
+  agreeing with the first, and it argues against spending Pass A effort on a
+  small-component-specific drop heuristic: on this evidence there may be little to find.
+* A handful of candidates were marked `unsure` on inspection rather than forced to a side:
+  two narrow, unnamed barrier-island breaches inside a charted restricted zone
+  (`t0_708_-1121`), and stubs reaching toward small mid-water islets with no POI nearby
+  (`t0_707_-1119`, repeated in `t2_2839_-4471`). These are not cases the "plain point"
+  vs. "real cove" rule resolves — a narrow real inlet and a stray fragment can look
+  identical at this resolution — and are exactly what `unsure → keep` (§6, "the prompt
+  guidance") is for: real ambiguity that a wider chart view or a second look could
+  resolve, not something to force a confident wrong answer on.
+
+**Visual verification, not just counts** (this is what closes the loop the Coltons Point
+render in §5.5/§6.4 opened, at the scale the user asked to see): `render_diff`
+(`graph_cleanup/render.py`, new) draws one picture instead of a before/after pair — the
+surviving graph in its ordinary colours, with everything removed drawn as a bold dashed
+red line (and a red dot at every vanished vertex, not just chain ends) directly underneath
+it. Two renders were produced over the full expanded-area bbox:
+
+* Pass A output → Pass A + expanded Pass B review: every one of the 69 removed nodes shows
+  as a short red dash at a headland, exactly where §6.7's "plain shoreline stub" pattern
+  predicts, and nowhere inside the creek systems — visually confirming the review did not
+  touch real water.
+* The original pre-cleanup build (`us_east_md_channel_axes.sqlite`, i.e. before Pass A
+  existed at all) → the final reviewed result: the dominant feature is a dense red trail
+  running along every `channel_axes` line — thousands of collinear vertices Pass A's
+  Douglas-Peucker removed, exactly reproducing §4.5's over-density finding as a picture —
+  with the Pass B headland drops visible as the same short red dashes on top.
+
+Both were reviewed directly (not just generated) before being treated as confirmation:
+the second render is what first made visible that Pass A's node reduction is concentrated
+almost entirely on the `channel_axes`/`inland_waterways` layers, matching §2.2's original
+measurement rather than contradicting it.
+
 ## 7. Known limits / follow-ups
 
 - The skeleton wobble between junctions (§2.3) is untouched and needs Pass B/C or a
@@ -450,14 +525,30 @@ the prompt before spending on a wider run, which is what it did.
   triangle-level navmesh interior (a tint stands in for it), no depth colour banding
   within `depare_polygons` (single flat fill). Neither blocked the Coltons Point check;
   revisit if a Pass B/C candidate turns out to need finer chart detail than the tint.
-- **Pass B has not been run against a live Sonnet key** (§6.5) — everything up to and
-  including the mock-backend full-harness run is verified; the actual gold-set spend is
-  not.
+- **Pass B has not been run against the `ClaudeBackend` API path** (§6.5) — real review
+  data exists (§6.6-6.7, 323 candidates over 3x the original area) but was produced by
+  the building session itself acting as the reviewer, not by a scripted API call. The
+  Message Batches path (needed for the eventual weeks-long local-model production run) is
+  still only import-verified, never executed.
+- The `nearest_poi` blind spot (§6.6: only searches the `pois` table, not lateral marks or
+  named daybeacons) is now confirmed across two review rounds and is the clearest concrete
+  fix available before scaling further — extend it to `lateral_marks_points`.
+- The "plain shoreline stub → drop" pattern (§6.6-6.7) now holds across 52 real drops with
+  zero counterexceptions and is ready to prototype as a deterministic Pass A rule; it would
+  need a held-out sample (tiles not yet hand-reviewed) to validate against, not just the
+  same data that produced it.
+- Regional composition swings the keep rate by 20 points (§6.7: 61% pilot vs 81% expanded)
+  — any statewide sampling plan should stratify by creek-density/coastline-type or its
+  headline drop-rate number will mostly reflect which regions got sampled.
 - Pass C (route tracing, §6) has a prompt but no junction-numbering candidate generator —
   needed before "which of these five parallel lines is real" can be asked of a model.
 - Only two candidate kinds exist (§6.1). The ~34% merely-unused (not provably redundant)
   edge set has no candidate generator yet, and needs a same-journey pairing to be useful
   rather than confusing.
+- A handful of `unsure` verdicts (§6.7: narrow unnamed inlet breaches, stubs toward mid-water
+  islets) are cases the current "plain point vs. real cove" heuristic can't resolve even by
+  eye at this render scale — worth a closer render (`render_tile` at a tighter bbox) or
+  aerial imagery before either is built as a candidate generator input.
 - Rendering was the dominant per-tile cost before the layer cache: a bbox-filtered
   `read_file` re-scans the whole source file every call regardless of tile size (~3-4s
   against the real 84 MB `depare_polygons.geojson`, measured), so preparing many tiles
