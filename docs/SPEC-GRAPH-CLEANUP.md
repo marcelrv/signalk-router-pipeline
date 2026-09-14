@@ -1,10 +1,12 @@
 # Spec: Graph cleanup — removing the graph no boat will ever use
 
-Status: Pass A and the renderer implemented on branch `graph-cleanup` (2026-09-12):
-`graph_cleanup/`, `apply_cleanup.py`, `tests/test_graph_cleanup.py`,
-`tests/test_graph_cleanup_render.py`. Verification build: `data/BUILD_LOG.md` #40; the
-renderer's visual before/after is §5.5. Passes B and C (model adjudication, model route
-tracing) are specified here but not built.
+Status: Pass A, the renderer, and Pass B (prune) implemented on branch `graph-cleanup`
+(2026-09-12/14): `graph_cleanup/`, `apply_cleanup.py`, `review_region.py`,
+`tests/test_graph_cleanup*.py`, `tests/test_review_region_cli.py`. Verification build:
+`data/BUILD_LOG.md` #40; the renderer's visual before/after is §5.5; Pass B's harness
+verification (mock backend, real data) is §6.4. **Pass B has not been run against a live
+Sonnet key** — no credentials available in the building session, see §6.5. Pass C (model
+route tracing) is specified (§6) but not built.
 Complements: `SPEC-GRAPH-DENSITY.md` (the density investigation and the gate discipline
 reused here), `SPEC-CHANNEL-AXES.md` (the layer whose over-density Pass A removes).
 
@@ -238,7 +240,7 @@ protects navmesh nodes, confirmed visually as well as by the gate).
 Tests: `tests/test_graph_cleanup_render.py` (11 tests, synthetic fixtures) — the two
 bugs above each have a regression test.
 
-## 6. Passes B and C — not built
+## 6. Pass B — implemented; Pass C — not built
 
 Pass A caps out around 15% because the rest is judgement: *does this dead end lead
 anywhere a boater wants to go*, *which of these five parallel lines is the real route*,
@@ -254,17 +256,119 @@ set the local model is scored against, per candidate kind, before it is trusted.
 The model never emits a coordinate. Both tasks are discrete choices over items numbered on
 a rendered image:
 
-* **Pass B, prune** — `{"6": {"verdict": "drop", "why": "ends in the marsh"}}` over
-  candidates Pass A could not prove. `unsure` is treated as `keep`, so a weak model
-  degrades into doing nothing rather than into breaking the graph.
-* **Pass C, trace** — `{"main": [14, 27, 31, 55]}`, an ordered list of numbered junctions.
-  Anything on a traced route is protected from deletion. This is what makes deleting the
-  rest safe: keep what is on a sensible route, rather than deleting by heuristic and
-  hoping.
+* **Pass B, prune** (implemented) — `{"6": {"verdict": "drop", "why": "ends in the
+  marsh"}}` over candidates Pass A could not prove. `unsure` is treated as `keep`, so a
+  weak model degrades into doing nothing rather than into breaking the graph.
+* **Pass C, trace** (prompt written, not implemented) — `{"main": [14, 27, 31, 55]}`, an
+  ordered list of numbered junctions. Anything on a traced route is protected from
+  deletion. This is what makes deleting the rest safe: keep what is on a sensible route,
+  rather than deleting by heuristic and hoping. Needs a junction-numbering candidate
+  generator distinct from §6.1's two kinds — deferred, see §7.
 
 No design vessel. The prompt asks for the path most boats take; where two boat classes
 genuinely diverge, the model returns both and says why. `nodes.node_depth` already exists,
 so per-vessel filtering stays downstream.
+
+### 6.1 What Pass B actually looks at (`graph_cleanup/candidates.py`)
+
+Two candidate kinds, chosen because both render unambiguously with one numbered marker:
+
+* **`dead_end_stub`** — walk a degree-1 node inward to its first junction. 7,368 exist on
+  the cleaned MD graph (build #40); most are legitimate (a marina entrance, a creek), some
+  are medial-axis artifacts into a marsh. Capped at `--max-stub-length-m` (default 3000 m)
+  — a longer dead end is assumed to be a real charted approach, not a fragment, and asking
+  "keep or drop this obviously-real thing" wastes a review on a question with one answer.
+* **`small_component`** — a connected component other than the largest, capped at
+  `--max-component-size` (default 30 nodes). The cleaned MD graph's *second*-largest
+  component alone is 7,818 nodes — almost certainly real, unstitched water, not a
+  single-verdict candidate; bulk-judging something that size from one tile would be
+  exactly the "one bug becomes a hundred patches" mistake §3 warns against.
+
+A small component that is itself a dangling line would otherwise generate a
+`small_component` candidate *and* separate `dead_end_stub` candidates for the same nodes
+— confusing and redundant. `find_all` computes components first and excludes their nodes
+from the stub search.
+
+**Anchor placement matters and was wrong on the first pass.** `_walk_stub` returns
+`[tip, ..., junction]`; the first version anchored the numbered marker (and measured
+"nearest POI" from) `path[-1]` — the junction, shared with the rest of the graph — instead
+of `path[0]`, the actual dangling tip where the question "does this lead anywhere" has to
+be judged. Caught by a unit test with a real assertion on the anchor id, not by inspection;
+confirmed visually afterward (§6.4) that the marker lands on the tip.
+
+Not attempted: the ~34% of edges that are merely *unused* rather than provably redundant
+(Pass A §4 only removes ~2,161 of them). A useful "this duplicates that other path"
+candidate needs a pairing between the unused edge and whichever kept edge serves the same
+journey; getting that pairing wrong produces a confusing tile rather than a useful one.
+Left as documented future work (§7) rather than shipped half-considered.
+
+### 6.2 Tiling and work items (`graph_cleanup/tiles.py`, `prepare.py`)
+
+Candidates are bucketed directly into ~6 km cells (`--tile-m`) — only a cell with at least
+one candidate's anchor produces a tile, so tile count is proportional to how much judgement
+is needed, not to the region's raw area. A cell with more than `max_per_tile` (default 25)
+candidates is recursively re-bucketed at half the cell size; the recursion's real stopping
+condition is a ~1.1 m cell-size floor, not a depth count — an early version capped depth at
+4, which silently left oversized, unreadable tiles for a genuinely crowded spot (many stubs
+in one small marina).
+
+Each tile writes four files: `chart.png` (context, no graph), `candidates.png` (graph +
+numbered markers), `context.json` (facts sent to the model), and a `manifest.json` **not**
+sent to the model — it carries the full node list per number, which `context.json`
+deliberately omits (a 30-node component's raw id list is noise to a reviewer and would
+bloat the prompt for nothing) but which `runner.answers_to_ops` needs to turn a verdict
+back into the exact nodes it was about.
+
+### 6.3 Backends and the runner (`graph_cleanup/backends/`, `runner.py`)
+
+Every backend implements one method, `answer_tile(tile_dir) -> str`, so the runner doesn't
+know which one it's driving:
+
+* `MockBackend` — deterministic, offline, not a review of any kind. Exists to test the
+  harness (and to dry-run a real region's tile counts/sizes) without an API key.
+* `ClaudeBackend` — `client.messages.create`, `model="claude-sonnet-5"`, adaptive thinking,
+  `output_config.effort` (default `medium`), the system prompt cached (`cache_control:
+  ephemeral`) since it is identical across every tile in a run. Plus `submit_batch`/
+  `poll_batch`/`collect_batch` using the Message Batches API for the full gold-set run —
+  **untested against a live key**, see §6.5.
+
+`runner.run_tile` parses and validates a backend's JSON (every referenced number must exist
+in that tile, every verdict must be `keep`/`drop`/`unsure`), retrying once before giving up;
+a tile that never validates is marked `unanswered` and contributes no ops — never a silent
+drop. `run_all` writes `<tile>/answer.json` as soon as each tile is answered, so a killed
+run resumes by skipping tiles that already have one. `answers_to_ops` turns every `drop`
+into `Op` records: a `small_component` drop removes every node in it; a `dead_end_stub`
+drop removes the stub's own chain (`nodes[:-1]`, excluding the junction) — confidence is a
+flat 0.7 (there is nothing in a `keep`/`drop`/`why` answer to read a real number from),
+marking these as needing the human sign-off the tier-5 override workflow (README.md
+"Community override workflow") already calls for.
+
+### 6.4 Verification
+
+Full harness run end-to-end against the real cleaned MD graph and real chart data at the
+Coltons Point bbox, `MockBackend`: 104 candidates → 16 tiles → 76 `drop`/28 `keep`
+verdicts → 110 ops. `candidates.png` inspected directly (not just counts) — numbered
+markers land on the dead-end tips, not on shared junctions (§6.1's anchor fix), and the
+tile also shows the dense skeleton mesh near Cuckold Creek that a real reviewer would need
+to judge as a separate class of noise from the two candidate kinds implemented so far.
+
+### 6.5 Not run for real — no credentials available in this environment
+
+This session had no `ANTHROPIC_API_KEY`, no `ant auth login` profile, and no `ant` CLI —
+`ClaudeBackend` and the batch functions are written directly from the Anthropic SDK's
+documented request/response shapes (not guessed), installed and import-checked
+(`anthropic` 1.5.0), but **never executed against a live key**. Before trusting
+`submit_batch` for a paid run: `review_region.py --backend claude --limit 2` first, read
+the two verdicts, confirm they're sane.
+
+**Rough cost estimate**, from the real Coltons Point measurement (104 candidates / 16
+tiles) and Sonnet 5 pricing ($2/$10 per MTok): two 1536×1536 images (~3,100 tokens each per
+the standard image-token estimate) + `context.json` (a few hundred tokens for ~6-7
+candidates) ≈ 7,000-8,000 input tokens/tile after the cached system prompt, plus a few
+hundred output tokens for the JSON verdict and whatever adaptive thinking at `effort:
+medium` spends. That puts the Coltons Point pilot at well under $1, and the plan's ~300-tile
+gold-set sample (`--sample-tiles 300`) at roughly $10-20 — an estimate, not a measurement;
+confirm with `response.usage` on the first real batch.
 
 ## 7. Known limits / follow-ups
 
@@ -284,3 +388,20 @@ so per-vessel filtering stays downstream.
   triangle-level navmesh interior (a tint stands in for it), no depth colour banding
   within `depare_polygons` (single flat fill). Neither blocked the Coltons Point check;
   revisit if a Pass B/C candidate turns out to need finer chart detail than the tint.
+- **Pass B has not been run against a live Sonnet key** (§6.5) — everything up to and
+  including the mock-backend full-harness run is verified; the actual gold-set spend is
+  not.
+- Pass C (route tracing, §6) has a prompt but no junction-numbering candidate generator —
+  needed before "which of these five parallel lines is real" can be asked of a model.
+- Only two candidate kinds exist (§6.1). The ~34% merely-unused (not provably redundant)
+  edge set has no candidate generator yet, and needs a same-journey pairing to be useful
+  rather than confusing.
+- Rendering was the dominant per-tile cost before the layer cache: a bbox-filtered
+  `read_file` re-scans the whole source file every call regardless of tile size (~3-4s
+  against the real 84 MB `depare_polygons.geojson`, measured), so preparing many tiles
+  from one region paid that cost per tile, per layer — ~14s/tile measured on the first
+  Coltons Point run (16 tiles, MockBackend, 4m26s). Fixed by caching each whole layer
+  once per process and slicing it in memory (`render._LAYER_CACHE`, `.cx[]`), turning an
+  O(tiles × layers) disk-scan cost into O(layers): the same 16-tile Coltons Point run
+  after the fix took 27s (~1.7s/tile, ~8x). §6.4's verification predates the fix; the
+  16-tile / 104-candidate numbers there are still accurate, only the wall-clock changed.
