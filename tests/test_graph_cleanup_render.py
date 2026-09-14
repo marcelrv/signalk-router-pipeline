@@ -236,6 +236,65 @@ def test_load_navmesh_regions_uses_lat_lon_vertex_order(tmp_path):
     assert len(found) == 1
 
 
+def test_render_diff_marks_removed_edges_and_nodes(tmp_path):
+    """The core promise of render_diff: an edge/node present in `before` but
+    gone from `after` must be drawn (as `removed`), and the counts in the
+    title/legend must match what was actually removed -- not just "it doesn't
+    crash". Two synthetic databases sharing one node in common (so removal is
+    unambiguous) and an isolated dropped node with no incident edge."""
+    def make_db(path, nodes, edges):
+        conn = sqlite3.connect(path)
+        conn.executescript("""
+            CREATE TABLE nodes (id INTEGER PRIMARY KEY, lat REAL, lon REAL,
+                node_depth REAL, region_id INTEGER, node_kind_id INTEGER,
+                source_tier INTEGER, source_id INTEGER);
+            CREATE TABLE edges (source INTEGER, target INTEGER, distance REAL,
+                min_depth REAL, drval1 REAL, max_air_draft REAL, min_width REAL,
+                cost_factor REAL, distance_to_land REAL, edge_type_id INTEGER,
+                traffic_mode INTEGER, crosses_land INTEGER, crosses_obstacle INTEGER,
+                edge_kind_id INTEGER, source_tier INTEGER, source_id INTEGER,
+                width_profile TEXT, requires_lock INTEGER, lock_id INTEGER);
+            CREATE TABLE navmesh_regions (id INTEGER PRIMARY KEY,
+                boundary_geometry TEXT, vertices TEXT, triangles TEXT,
+                triangle_adjacency TEXT, boundary_node_ids TEXT);
+        """)
+        conn.executemany("INSERT INTO nodes VALUES (?,?,?,10,1,0,1,2)", nodes)
+        row = (100.0, 10.0, 5.0, 99.0, 200.0, 1.0, 500.0, 0, 0, 0, 0, 0, 1, 2, None, 0, None)
+        for a, b in edges:
+            for s, t in ((a, b), (b, a)):
+                conn.execute(f"INSERT INTO edges VALUES ({s},{t}," + ",".join("?" * 17) + ")", row)
+        conn.commit()
+        conn.close()
+
+    before_db = tmp_path / "before.sqlite"
+    after_db = tmp_path / "after.sqlite"
+    # before: a 4-node chain (1-2-3) plus an isolated dead node 4
+    make_db(before_db, [(1, 52.0, 4.0), (2, 52.0, 4.001), (3, 52.0, 4.002),
+                        (4, 52.01, 4.01)], [(1, 2), (2, 3)])
+    # after: only the first edge survives; node 3 and isolated node 4 are gone
+    make_db(after_db, [(1, 52.0, 4.0), (2, 52.0, 4.001)], [(1, 2)])
+
+    from graph_cleanup.graph import RoutingGraph, edge_key
+
+    g_before, g_after = RoutingGraph.load(str(before_db)), RoutingGraph.load(str(after_db))
+    removed_edges, removed_nodes = render.diff_removed(g_before, g_after)
+    assert set(removed_edges) == {edge_key(2, 3)}
+    # Node 3 is both an endpoint of the removed edge *and* reported as a removed
+    # node -- deliberate, not a double-count bug: on a multi-node dropped stub
+    # (the common real case) this puts a dot at every vanished vertex along the
+    # dashed line, not just at its far end, which is what made the real Coltons
+    # Point render legible. Node 4 has no incident edge at all and must still
+    # show up here, or an isolated drop_node would be invisible in the diff.
+    assert set(removed_nodes) == {3, 4}
+    assert 2 not in removed_nodes, "node 2 survives (kept edge 1-2) and must not appear"
+
+    out = tmp_path / "diff.png"
+    bbox = (3.9, 51.9, 4.05, 52.05)
+    render.render_diff(bbox, str(out), str(before_db), str(after_db))
+    assert out.exists()
+    assert out.stat().st_size > 1000
+
+
 def test_render_with_navmesh_region_does_not_crash(tmp_path):
     db = tmp_path / "g.sqlite"
     conn = sqlite3.connect(db)

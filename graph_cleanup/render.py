@@ -428,3 +428,146 @@ def before_after(bbox: BBox, before_db: str, after_db: str, out_dir: str,
                config=RenderConfig(title=f"{labels[1]}: {os.path.basename(after_db)} "
                                         f"({len(g_after.nodes)}n/{len(g_after.edges)}e)"))
     return before_path, after_path
+
+
+def diff_removed(g_before: RoutingGraph, g_after: RoutingGraph):
+    """What `render_diff` draws in red: edges in `g_before` gone from
+    `g_after`, and nodes gone from `g_after` that aren't already implied by a
+    removed edge (an isolated dropped node with no incident edge -- rare, but
+    a `drop_node` on an already-degree-0 node produces exactly this).
+
+    Split out from `render_diff` so the diff itself -- which edges/nodes count
+    as removed -- has a return value a test can assert on directly, instead of
+    only being checkable by decoding pixels out of the rendered PNG.
+    """
+    removed_edges = {k: e for k, e in g_before.edges.items() if k not in g_after.edges}
+    kept_edge_endpoints = {n for (u, v) in g_after.edges for n in (u, v)}
+    removed_nodes = {nid: n for nid, n in g_before.nodes.items()
+                     if nid not in g_after.nodes and nid not in kept_edge_endpoints}
+    return removed_edges, removed_nodes
+
+
+def render_diff(bbox: BBox, out_path: str, before_db: str, after_db: str,
+                input_dir: Optional[str] = None,
+                config: Optional[RenderConfig] = None) -> str:
+    """One picture, not two: everything the cleanup removed drawn in red over
+    what survived, on the real chart. Built because a side-by-side pair asks the
+    reader to spot a difference across two images; a single overlay puts the
+    difference itself on the page -- what a cleanup run actually did is exactly
+    the red ink, nothing else to compare by eye.
+
+    Kept edges/nodes (present in both databases, matched by id -- valid because
+    node ids are coordinate-derived, `nautical_routing_pipeline._coord_to_id`)
+    draw in the ordinary `SOURCE_STYLE` colours. Removed edges draw as a bold
+    dashed red line **beneath** the kept graph; every node gone from `after`
+    that isn't an endpoint of a *surviving* edge gets a red dot too (see
+    `diff_removed`) -- deliberately including edge endpoints, not just
+    standalone drops, so a multi-node dropped stub shows a dot at every vertex
+    along its dashed line, not only at its far end.
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.lines import Line2D
+
+    cfg = config or RenderConfig()
+    g_before = RoutingGraph.load(before_db)
+    g_after = RoutingGraph.load(after_db)
+    removed_edges, removed_nodes = diff_removed(g_before, g_after)
+
+    # Render the surviving graph exactly as render_tile would, then draw the
+    # removed layer directly onto the same axes before saving.
+    min_lon, min_lat, max_lon, max_lat = bbox
+    lat_mid = (min_lat + max_lat) / 2.0
+    aspect = math.cos(math.radians(lat_mid))
+    fig_w, fig_h = cfg.width_px / cfg.dpi, cfg.height_px / cfg.dpi
+    fig, ax = plt.subplots(figsize=(fig_w, fig_h), dpi=cfg.dpi)
+    ax.set_xlim(min_lon, max_lon)
+    ax.set_ylim(min_lat, max_lat)
+    ax.set_aspect(1.0 / aspect)
+    ax.set_facecolor("#eef6fb")
+
+    legend_handles = []
+    if cfg.show_context and input_dir:
+        for name, face, edge, z, label in CONTEXT_LAYERS:
+            if name == "land_polygons" and not cfg.show_land:
+                continue
+            gdf = _load_layer(input_dir, name, bbox, geom_types=("Polygon", "MultiPolygon"))
+            if gdf is not None:
+                gdf.plot(ax=ax, facecolor=face, edgecolor=edge, linewidth=0.5, zorder=z)
+
+    n_removed_drawn = 0
+    for (u, v), e in removed_edges.items():
+        a, b = g_before.nodes.get(u), g_before.nodes.get(v)
+        if a is None or b is None:
+            continue
+        if not _in_bbox(a.lat, a.lon, bbox) and not _in_bbox(b.lat, b.lon, bbox):
+            continue
+        ax.plot([a.lon, b.lon], [a.lat, b.lat], color="#d81e1e", linewidth=1.8,
+                alpha=0.9, zorder=7, linestyle=(0, (3, 2)), solid_capstyle="round")
+        n_removed_drawn += 1
+    rx, ry = [], []
+    for n in removed_nodes.values():
+        if _in_bbox(n.lat, n.lon, bbox):
+            rx.append(n.lon)
+            ry.append(n.lat)
+    if rx:
+        ax.scatter(rx, ry, s=10, color="#d81e1e", zorder=7.5, linewidths=0)
+
+    seen_styles = set()
+    for (u, v), e in g_after.edges.items():
+        a, b = g_after.nodes.get(u), g_after.nodes.get(v)
+        if a is None or b is None:
+            continue
+        if not _in_bbox(a.lat, a.lon, bbox) and not _in_bbox(b.lat, b.lon, bbox):
+            continue
+        if e.edge_kind_id == 1:
+            color, lw, alpha, label = NAVMESH_BOUNDARY_STYLE
+        else:
+            color, lw, alpha, label = SOURCE_STYLE.get(e.source_id, SOURCE_STYLE[None])
+        ax.plot([a.lon, b.lon], [a.lat, b.lat], color=color, linewidth=lw,
+                alpha=alpha, zorder=8, solid_capstyle="round")
+        seen_styles.add(label)
+    xs, ys = [], []
+    for n in g_after.nodes.values():
+        if _in_bbox(n.lat, n.lon, bbox):
+            xs.append(n.lon)
+            ys.append(n.lat)
+    if xs:
+        ax.scatter(xs, ys, s=cfg.node_size, color="#333333", zorder=9, linewidths=0)
+
+    if cfg.show_legend:
+        if n_removed_drawn or rx:
+            legend_handles.append(Line2D([0], [0], color="#d81e1e", linewidth=1.8,
+                                         linestyle=(0, (3, 2)),
+                                         label=f"removed ({len(removed_edges)} edges, "
+                                               f"{len(removed_nodes)} nodes)"))
+        for color, lw, alpha, label in list(SOURCE_STYLE.values()) + [NAVMESH_BOUNDARY_STYLE]:
+            if label in seen_styles:
+                legend_handles.append(Line2D([0], [0], color=color, linewidth=max(lw, 1.2),
+                                             alpha=alpha, label=f"kept: {label}"))
+
+    _draw_graticule(ax, bbox)
+    _draw_scale_bar(ax, bbox, aspect)
+    if cfg.title:
+        ax.set_title(cfg.title, fontsize=8)
+    elif cfg.title is None:
+        dn = len(g_before.nodes) - len(g_after.nodes)
+        de = len(g_before.edges) - len(g_after.edges)
+        ax.set_title(f"removed by cleanup: -{dn} nodes / -{de} edges "
+                     f"({os.path.basename(before_db)} -> {os.path.basename(after_db)})",
+                     fontsize=8)
+    if cfg.show_legend and legend_handles:
+        ax.legend(handles=legend_handles, loc="upper left", fontsize=4.5,
+                 framealpha=0.85, borderpad=0.4, handlelength=1.5)
+
+    ax.set_xticks([])
+    ax.set_yticks([])
+    for spine in ax.spines.values():
+        spine.set_visible(False)
+
+    os.makedirs(os.path.dirname(os.path.abspath(out_path)) or ".", exist_ok=True)
+    fig.tight_layout(pad=0.3)
+    fig.savefig(out_path, dpi=cfg.dpi)
+    plt.close(fig)
+    return out_path

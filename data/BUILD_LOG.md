@@ -60,6 +60,7 @@ Nodes/Edges delta.
 | 39 | 2026-09-11 | `8a7eaad` (`main`, PR #24 merged) | `data/geojson/us-east-md-v5_clipped` (same clip as #37) | same as #37 | Rebuild #37 on the final merged PR #24 code (picks up the post-#37 CodeRabbit fixes: tier-2 component length floor, navmesh-carve fast path) so the deployed MD channel-axes db reflects what actually merged | 62,904 | 164,468 | 0 | 15 | 0 | **YES (replaces #37)** |
 | 40 | 2026-09-12 | `graph-cleanup` branch | n/a — post-processes #39's `.sqlite`, not a rebuild | `apply_cleanup.py` Pass A (`--tolerance-m 20`, smooth + contract + redundant) | First deterministic post-build cleanup: measure how much of the graph comes out with no model at all | 53,930 | 142,196 | 0 | 13 | 0 | no (test build) |
 | 41 | 2026-09-14 | `graph-cleanup` branch | n/a — post-processes #40's `.sqlite` | AI review Pass B, Coltons Point bbox only (16 tiles, 104 candidates), reviewer = this session (Sonnet 5) reading tiles directly, no API | First real Pass B review: 63 keep / 35 drop / 6 unsure -> 40 drop ops applied | 53,890 | 142,116 | 0 | 13 | 0 | no (pilot only) |
+| 42 | 2026-09-14 | `graph-cleanup` branch | n/a — post-processes #40's `.sqlite`, supersedes #41 | AI review Pass B, expanded to ~3x area (-76.95,38.10,-76.63,38.32), 323 candidates/37 tiles, reviewer = this session (Sonnet 5) reading tiles directly, no API | Expanded Pass B review, carrying forward #41's 104 verdicts by candidate_id: 262 keep / 52 drop / 9 unsure -> 69 drop ops applied; render_diff visual comparisons produced | 53,861 | 142,058 | 0 | 13 | 0 | no (review sample only) |
 
 **Row #1 is not a valid comparison baseline** — its input clip/flags are unknown, so
 its counts cannot be attributed to any specific configuration. It's recorded because
@@ -1820,3 +1821,70 @@ ponds) — too small a sample (8) to conclude components rarely need dropping.
 - **Not deployed** — pilot only, one bbox, meant to validate the harness and prompt before
   a wider run.
 - **Tests**: 436 passed (no code changes this session, docs only).
+
+### #42 — `us_east_md_expanded_reviewed.sqlite` — expanded Pass B review (~3x area) + render_diff
+
+Expands #41's Coltons Point pilot to a superset bbox (`-76.95,38.10,-76.63,38.32`,
+323 candidates / 37 tiles, up from 104/16). #41's 104 verdicts were carried forward by
+`candidate_id` (stable, node-id-derived) rather than re-reviewed; only the 219 genuinely
+new candidates needed fresh judgement. Same method as #41 — no Anthropic API key
+available, so the building session itself (Sonnet 5) read every tile directly and wrote
+`answer.json` by hand.
+
+```bash
+.venv/bin/python review_region.py \
+  --db data/us_east_md_cleanup_a.sqlite \
+  --input-dir data/geojson/us-east-md-v5_clipped \
+  --out-dir <tiles dir> --bbox=-76.95,38.10,-76.63,38.32 --prepare-only
+#  -> 323 candidates -> 37 tiles
+# (37 tiles reviewed by hand; 12 fully covered by #41's carried-forward verdicts)
+.venv/bin/python apply_cleanup.py \
+  --db data/us_east_md_cleanup_a.sqlite \
+  --ops data/md_expanded_review.ops.jsonl --replay \
+  --out data/us_east_md_expanded_reviewed.sqlite \
+  --probe 37.8890,-76.2442,39.5338,-75.7875
+```
+
+**Result**: 262 keep / 52 drop / 9 unsure across 323 candidates → 69 `drop_node` ops.
+53,930 → 53,861 nodes (-69, -0.1%). All seven gates pass, route probe unchanged (0.0%).
+
+**Structural findings this round confirms or adds** (full writeup:
+`docs/SPEC-GRAPH-CLEANUP.md` §6.7):
+
+- **Keep rate is regional, not a constant.** 61% in the headland-heavy pilot vs. 81% here,
+  where the area is dominated by real tidal creek systems (Nomini Creek, Lower
+  Machodoc/Glebe Creek, Cuckold Creek, the Wicomico River, Breton Bay/Saint Clements Bay).
+  A statewide sample needs to stratify by coastline type or its headline number mostly
+  measures which regions got sampled.
+- **The "plain shoreline stub → drop" pattern held with zero exceptions across all 52
+  drops**, not just #41's 35 — a short stub reaching an unremarkable point of open
+  shoreline, usually one of 4-8 near-identical stubs around one headland, no cove/marsh/
+  named feature under any of them. Strong enough now to prototype as a deterministic
+  Pass A rule (stub with the unknown-depth sentinel + short length + no
+  fairway/caution/marsh polygon nearby), pending validation against a held-out sample.
+- **All 20 `small_component` candidates seen across both rounds (8 + 12) were `keep`** —
+  real, if disconnected, marsh/cove water every time. Argues against spending effort on a
+  small-component-specific drop heuristic on current evidence.
+- **`nearest_poi_m`'s blind spot (first found in #41) reproduced again**: several drops/
+  keeps this round depended on recognizing a named daybeacon or a real creek shape that
+  the `pois`-table-only distance metric reported as kilometres away. Now the clearest,
+  best-evidenced fix available: extend the search to `lateral_marks_points`.
+- **A few genuinely `unsure` cases**: two narrow unnamed barrier-island breaches inside a
+  charted restricted zone, and stubs reaching toward small mid-water islets — real
+  ambiguity the current heuristic can't resolve at this render scale, correctly left as
+  `unsure` → `keep` rather than forced.
+
+**Visual comparison, per the user's request to see results directly, not just counts**:
+new `render_diff()` (`graph_cleanup/render.py`) draws one picture — the surviving graph
+in its ordinary colours, everything removed as a bold dashed red line with a red dot at
+every vanished vertex. Two renders produced over the full expanded bbox:
+`data/BUILD_LOG.md`-adjacent scratch files (not committed, regenerable from the ops
+files above) showed (a) Pass A output → Pass A + Pass B: every removed node lands on a
+headland, none inside a creek; (b) the original pre-Pass-A build
+(`us_east_md_channel_axes.sqlite`) → the final result: a dense red trail along every
+`channel_axes` line (Pass A's Douglas-Peucker over-density fix, §4.5, made visible) plus
+the same headland drops on top.
+
+- **Not deployed** — review sample, same as #41.
+- **Tests**: 437 passed (2 new in `tests/test_graph_cleanup_render.py` for `render_diff`/
+  `diff_removed`).
