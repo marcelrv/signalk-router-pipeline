@@ -119,6 +119,41 @@ def _write_mixed_layer(path, bbox_center=(4.0, 52.0)):
     path.write_text(json.dumps(fc))
 
 
+def test_load_layer_caches_the_whole_file_across_calls(tmp_path):
+    """Two different bboxes over the same layer must read the file from disk
+    only once -- this is the fix for the ~14s/tile render cost measured in
+    docs/SPEC-GRAPH-CLEANUP.md 6 (a bbox-filtered read still scans the whole
+    file every time; caching the whole GeoDataFrame and slicing in memory
+    doesn't)."""
+    render.clear_layer_cache()
+    layer_path = tmp_path / "land_polygons.geojson"
+    _write_mixed_layer(layer_path, bbox_center=(4.0, 52.0))
+    a = render._load_layer(str(tmp_path), "land_polygons", (3.9, 51.9, 4.1, 52.1))
+    cache_size_after_first = len(render._LAYER_CACHE)
+    b = render._load_layer(str(tmp_path), "land_polygons", (3.95, 51.95, 4.05, 52.05))
+    assert cache_size_after_first == len(render._LAYER_CACHE) == 1, \
+        "a second call with a different bbox must not add another cache entry"
+    assert a is not None and b is not None
+
+
+def test_load_layer_cx_slice_matches_bbox_read(tmp_path):
+    """The cached whole-file + `.cx[]` slice must select the same features a
+    bbox-filtered `read_file` would (verified against real MD data before
+    trusting this in review_region.py; here as a permanent regression guard
+    on synthetic data)."""
+    render.clear_layer_cache()
+    layer_path = tmp_path / "land_polygons.geojson"
+    fc = {"type": "FeatureCollection", "features": [
+        {"type": "Feature", "properties": {"id": i},
+         "geometry": {"type": "Point", "coordinates": [4.0 + i * 0.5, 52.0]}}
+        for i in range(6)  # spread across a wide lon range, only some in bbox
+    ]}
+    layer_path.write_text(json.dumps(fc))
+    bbox = (3.9, 51.9, 4.6, 52.1)  # should catch i=0 (4.0) and i=1 (4.5) only
+    gdf = render._load_layer(str(tmp_path), "land_polygons", bbox)
+    assert sorted(gdf["id"].tolist()) == [0, 1]
+
+
 def test_load_layer_can_isolate_geometry_type(tmp_path):
     import geopandas as gpd
 

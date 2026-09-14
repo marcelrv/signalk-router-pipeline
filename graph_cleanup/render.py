@@ -142,20 +142,52 @@ def _load_navmesh_regions(db_path: str, bbox: BBox):
         conn.close()
 
 
+# Process-local cache of whole, unfiltered layers, keyed by absolute path.
+# **Why this exists:** a bbox-filtered `gpd.read_file(path, bbox=...)` still
+# scans the whole file to find what's in the box -- measured at ~3-4s per call
+# against the real MD `depare_polygons.geojson` (84 MB), regardless of how
+# small the tile is. Loading that same file whole, once, took 2.9s. A run
+# preparing many tiles from the same region (which every real use of this
+# module is) was therefore paying the full-file cost again for every tile, of
+# every layer -- the dominant cost in build #40's Coltons Point pilot
+# (`docs/SPEC-GRAPH-CLEANUP.md` §6: ~14s/tile, almost entirely this). Caching
+# the whole GeoDataFrame once and slicing it per tile with `.cx[...]` (an
+# in-memory spatial-index lookup, not a re-read) turns an O(tiles x layers)
+# disk-scan cost into O(layers) -- what would have been ~70 minutes of
+# rendering for a 300-tile statewide run drops to roughly the time to load
+# each layer once, a few seconds total.
+_LAYER_CACHE: Dict[str, "object"] = {}
+
+
+def clear_layer_cache() -> None:
+    """Drop every cached layer. Call this between regions (different
+    `input_dir`) if memory matters more than re-render speed, or in tests that
+    must not see another test's cached data."""
+    _LAYER_CACHE.clear()
+
+
 def _load_layer(input_dir: str, name: str, bbox: BBox, geom_types: Optional[Sequence[str]] = None):
-    """Load one clipped layer, optionally restricted to the given geometry
-    types -- see the `CONTEXT_LAYERS`/`POINT_LAYERS` docstring for why this
-    split matters. Silent-fails to None on a missing or unreadable file: a
-    tile should still render with whatever context is available."""
+    """Load one clipped layer, restricted to `bbox` and optionally to the
+    given geometry types -- see the `CONTEXT_LAYERS`/`POINT_LAYERS` docstring
+    for why that split matters. Silent-fails to None on a missing or unreadable
+    file: a tile should still render with whatever context is available."""
     import geopandas as gpd
 
-    path = os.path.join(input_dir, f"{name}.geojson")
-    if not os.path.exists(path):
+    path = os.path.abspath(os.path.join(input_dir, f"{name}.geojson"))
+    if path not in _LAYER_CACHE:
+        if not os.path.exists(path):
+            _LAYER_CACHE[path] = None
+        else:
+            try:
+                _LAYER_CACHE[path] = gpd.read_file(path)
+            except Exception:
+                _LAYER_CACHE[path] = None
+
+    full = _LAYER_CACHE[path]
+    if full is None or len(full) == 0:
         return None
-    try:
-        gdf = gpd.read_file(path, bbox=bbox)
-    except Exception:
-        return None
+    min_lon, min_lat, max_lon, max_lat = bbox
+    gdf = full.cx[min_lon:max_lon, min_lat:max_lat]
     if geom_types is not None:
         gdf = gdf[gdf.geometry.geom_type.isin(geom_types)]
     return gdf if len(gdf) else None
