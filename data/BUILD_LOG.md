@@ -59,6 +59,7 @@ Nodes/Edges delta.
 | 32 | 2026-09-07 | `453586c` (PR #22, `_safe_negative_buffer` fix) | `data/geojson/fl_atl_n1a_reclip` (re-derived via `data/raw/us-east-coast/FL`) | same tuning config as #13, run under `ulimit -v 11GB` | `fl_atl_n1a` retry after root-causing and fixing its OOM (see Details) | 12,207 | 31,491 | 0 | 16 | 0 | **YES** |
 | 39 | 2026-09-11 | `8a7eaad` (`main`, PR #24 merged) | `data/geojson/us-east-md-v5_clipped` (same clip as #37) | same as #37 | Rebuild #37 on the final merged PR #24 code (picks up the post-#37 CodeRabbit fixes: tier-2 component length floor, navmesh-carve fast path) so the deployed MD channel-axes db reflects what actually merged | 62,904 | 164,468 | 0 | 15 | 0 | **YES (replaces #37)** |
 | 40 | 2026-09-12 | `graph-cleanup` branch | n/a — post-processes #39's `.sqlite`, not a rebuild | `apply_cleanup.py` Pass A (`--tolerance-m 20`, smooth + contract + redundant) | First deterministic post-build cleanup: measure how much of the graph comes out with no model at all | 53,930 | 142,196 | 0 | 13 | 0 | no (test build) |
+| 41 | 2026-09-14 | `graph-cleanup` branch | n/a — post-processes #40's `.sqlite` | AI review Pass B, Coltons Point bbox only (16 tiles, 104 candidates), reviewer = this session (Sonnet 5) reading tiles directly, no API | First real Pass B review: 63 keep / 35 drop / 6 unsure -> 40 drop ops applied | 53,890 | 142,116 | 0 | 13 | 0 | no (pilot only) |
 
 **Row #1 is not a valid comparison baseline** — its input clip/flags are unknown, so
 its counts cannot be attributed to any specific configuration. It's recorded because
@@ -1759,3 +1760,63 @@ at generation time, as §10.6 item 1 already says.
 - **Not installed live** — this is the first cleanup build; visual before/after at Coltons
   Point still outstanding (the check SPEC-GRAPH-DENSITY.md §9.4 has flagged as missing
   since #34).
+
+### #41 — `us_east_md_sonnet_reviewed.sqlite` — first real Pass B review (Coltons Point pilot)
+
+First real run of Pass B (`docs/SPEC-GRAPH-CLEANUP.md` §6.6), on top of #40's cleaned
+database, restricted to the Coltons Point bbox (`-76.90,38.15,-76.68,38.27`) via
+`review_region.py --bbox`. **No Anthropic API key was available in the building
+session** — the 16 tiles were reviewed by the session itself (running as Claude Sonnet 5)
+reading `chart.png`/`candidates.png`/`context.json` directly and writing `answer.json` by
+hand in the exact schema the pipeline expects, using normal Claude Code usage rather than
+metered API billing. `graph_cleanup/backends/claude.py` (the scripted API path) remains
+unexercised against a live key.
+
+```bash
+.venv/bin/python review_region.py \
+  --db data/us_east_md_cleanup_a.sqlite \
+  --input-dir data/geojson/us-east-md-v5_clipped \
+  --out-dir <tiles dir> --bbox=-76.90,38.15,-76.68,38.27 --prepare-only
+#  -> 104 candidates (6,867 statewide, restricted to 104 in-bbox): 6,639 dead_end_stub,
+#     228 small_component -> 16 tiles
+# (16 tiles reviewed by hand against the real chart, per docs/SPEC-GRAPH-CLEANUP.md 6.6)
+.venv/bin/python apply_cleanup.py \
+  --db data/us_east_md_cleanup_a.sqlite \
+  --ops data/md_coltons_sonnet_review.ops.jsonl --replay \
+  --out data/us_east_md_sonnet_reviewed.sqlite \
+  --probe 37.8890,-76.2442,39.5338,-75.7875
+```
+
+**Result**: 63 keep / 35 drop / 6 unsure across 104 candidates -> 40 `drop_node` ops (a
+`small_component` or multi-node stub drop removes more than one node per verdict). 53,930
+-> 53,890 nodes (-40, -0.1% — expected at pilot scale, one bbox of one state). All seven
+gates pass, including POI-pair reachability (0 lost) and the 187 km route probe (0.0%
+change).
+
+**The result that matters is qualitative, not the node count.** The same 104 candidates
+were also answered by `MockBackend` for comparison: 76 drop / 28 keep / 0 unsure -> 110
+ops — nearly **triple** the real review's drop count. Root cause, found only by actually
+looking at the rendered tiles: `nearest_poi_m` (candidates.py's main signal) is measured
+against the `pois` table only, which has no entries for lateral marks, lights, or named
+daybeacons — so a stub sitting right next to "Combs Creek Daybeacon 4" or inside a named,
+marked tidal creek can still show a `nearest_poi_m` of several kilometres. A distance-only
+rule (what `MockBackend` uses, and what a naive Pass-A heuristic would use) systematically
+over-drops real water for this reason. **Action item, not yet implemented**: extend the
+nearest-feature search in `candidates.py` to also cover `lateral_marks_points` and named
+waterway lines, not just `pois`.
+
+**A generalizable pattern did emerge from the real review**: every `dead_end_stub` marked
+`drop` (35/35) was a short stub reaching a plain, unremarkable point of open shoreline —
+no cove, marsh, marina, or named feature — usually one of a cluster of 4-8 such stubs
+around the same headland. Every `keep` reached real charted marsh/creek water, sat near a
+named channel, or was the tail end of an already-marked fairway. Candidate rule for a
+future deterministic Pass A pass (needs a larger sample before trusting it): a stub with
+the unknown-depth sentinel, short length, and a corridor touching no
+fairway/caution/marsh-classified polygon is very likely droppable without a model at all.
+
+All 8 `small_component` candidates in this sample were kept (real, if disconnected, marsh
+ponds) — too small a sample (8) to conclude components rarely need dropping.
+
+- **Not deployed** — pilot only, one bbox, meant to validate the harness and prompt before
+  a wider run.
+- **Tests**: 436 passed (no code changes this session, docs only).

@@ -352,7 +352,7 @@ markers land on the dead-end tips, not on shared junctions (§6.1's anchor fix),
 tile also shows the dense skeleton mesh near Cuckold Creek that a real reviewer would need
 to judge as a separate class of noise from the two candidate kinds implemented so far.
 
-### 6.5 Not run for real — no credentials available in this environment
+### 6.5 `ClaudeBackend`/the Batches API: not run for real — no credentials available
 
 This session had no `ANTHROPIC_API_KEY`, no `ant auth login` profile, and no `ant` CLI —
 `ClaudeBackend` and the batch functions are written directly from the Anthropic SDK's
@@ -369,6 +369,68 @@ hundred output tokens for the JSON verdict and whatever adaptive thinking at `ef
 medium` spends. That puts the Coltons Point pilot at well under $1, and the plan's ~300-tile
 gold-set sample (`--sample-tiles 300`) at roughly $10-20 — an estimate, not a measurement;
 confirm with `response.usage` on the first real batch.
+
+Note what this section is *not* saying: it is not saying Pass B itself is unverified.
+§6.6 covers a full real review, done a different way.
+
+### 6.6 A real review, done without the API — Claude Code itself as the backend
+
+Claude Pro/Max subscription usage (claude.ai, and interactive Claude Code sessions) and
+the Anthropic Console API are different products with different billing — a subscription
+does not fund `ClaudeBackend`'s per-token API calls. But nothing about Pass B requires
+that specific path: the review is "read two images and a JSON file, write a JSON verdict",
+and a Claude Code session already does exactly that with its `Read` tool. So the actual
+gold-set pilot for build #40's Coltons Point tiles was done by having the building session
+(running as Sonnet 5) read all 16 prepared tiles directly and write `answer.json` into each
+by hand, in the exact schema `runner.answers_to_ops`/`review_region.py` already expect —
+zero API spend, normal Claude Code usage instead.
+
+**This is a real result, not a demo.** All 104 candidates across all 16 tiles answered
+(zero `unanswered`), reasoning recorded per candidate, applied through the full pipeline
+including a fresh gate check:
+
+| | mock backend (rule-based) | real review (this session) |
+|---|---|---|
+| `keep` | 28 | 63 |
+| `drop` | 76 | 35 |
+| `unsure` | 0 | 6 |
+| ops produced | 110 | 40 |
+
+The two disagree by a lot, and the disagreement is informative, not noise. The mock's rule
+(`drop` past a fixed `nearest_poi_m` threshold) turned out to systematically over-drop,
+for a reason found only by actually looking at the charts: **`nearest_poi_m` is measured
+against the `pois` table only, which does not include lateral marks, lights, or named
+daybeacons** — so a stub sitting right next to "Combs Creek Daybeacon 4" or in the middle
+of a named, marked, real tidal creek can still show a `nearest_poi_m` of several kilometres,
+because the nearest *POI-table* entry happens to be a distant channel. Real review caught
+this every time by looking at the rendered chart context, not the number alone; a purely
+numeric backend cannot. **Action item, not yet done: extend `nearest_poi` to also search
+lateral marks (`lateral_marks_points`) and named waterway lines, not just the `pois`
+table** — this would remove the single biggest source of misleading context in the current
+`context.json`.
+
+**A second, more useful pattern emerged and generalizes past this one region**: every
+`dead_end_stub` judged `drop` fit one shape — a short stub reaching a *plain, unremarkable
+point of open shoreline*, with no cove, marsh, marina, or named feature under it, usually
+part of a small cluster of 4-8 such stubs around the same headland. Every `keep` fit a
+different, equally consistent shape — the stub reaches real charted marsh/creek water, sits
+near a named channel or marked feature, or is the last few metres of an already-marked
+fairway. This is a plausible candidate for a **third deterministic Pass A rule**: a stub
+whose `min_depth_m` is the unknown sentinel, whose length is short, and whose corridor
+touches no `caution`/`fairway`/marsh-classified water polygon is very likely droppable
+without needing a model at all — worth measuring against a larger sample before trusting
+it as a rule, but the pattern held with no exceptions across the 35 stubs actually dropped
+here.
+
+**One candidate kind showed no artifacts in this sample**: all 8 `small_component`
+candidates were judged `keep` (real, if disconnected, marsh ponds) — 8 is too small a
+sample to conclude components rarely need dropping, but worth tracking as more tiles are
+reviewed.
+
+Applied and gated exactly like Pass A's own ops (`apply_cleanup.py --replay`): all seven
+gates pass, 53,930 → 53,890 nodes (-40, -0.1% — expected at this pilot's scale, one bbox
+out of the whole state). The result was not deployed; it exists to validate the harness and
+the prompt before spending on a wider run, which is what it did.
 
 ## 7. Known limits / follow-ups
 
