@@ -53,6 +53,9 @@ def _validate(raw: str, context: dict) -> Dict[str, dict]:
     unknown = got - expected
     if unknown:
         raise ValueError(f"answer references numbers not in this tile: {unknown}")
+    missing = expected - got
+    if missing:
+        raise ValueError(f"answer omits numbers from this tile: {missing}")
     for n, entry in parsed.items():
         if not isinstance(entry, dict) or "verdict" not in entry:
             raise ValueError(f"entry {n!r} is missing 'verdict': {entry!r}")

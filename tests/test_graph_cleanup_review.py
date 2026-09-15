@@ -180,6 +180,49 @@ def test_build_tiles_splits_a_crowded_cell():
     assert sum(len(t.candidates) for t in tiles) == len(cands)
 
 
+def test_build_tiles_bbox_covers_a_stub_extending_past_the_anchor_cell():
+    """A candidate is bucketed by its anchor (the free tip) alone, but the
+    stub's junction end (the opposite end of the chain) can sit well outside
+    that cell -- real candidates in this project run past 1 km. The tile's
+    bbox must cover every node in the candidate, not just its cell + padding,
+    or the far end/context a reviewer needs can fall outside the image."""
+    g = RoutingGraph()
+    # Compute real cell size at this latitude rather than guessing offsets in
+    # degrees -- the tip sits mid-cell, the junction end a bit over two full
+    # cells away, which no amount of padding on the tip's own cell can cover.
+    lat_mid = 52.0
+    _, lon_step = T._cell_size_deg(lat_mid, tile_m=6000.0)
+    base_lon = 10 * lon_step
+    tip_lon = base_lon + lon_step / 2.0
+    junction_lon = base_lon + 2.5 * lon_step
+    mid_lon = (tip_lon + junction_lon) / 2.0
+    # Two short branches (4, 5) off node 3 make it a genuine degree-3
+    # junction, not just the chain's other dead end.
+    _add_node(g, 1, lat_mid, tip_lon)          # tip / anchor
+    _add_node(g, 2, lat_mid, mid_lon)
+    _add_node(g, 3, lat_mid, junction_lon)     # junction end, 2+ cells from the tip
+    _add_node(g, 4, lat_mid + 0.0005, junction_lon + 0.0005)
+    _add_node(g, 5, lat_mid + 0.0005, junction_lon - 0.0005)
+    _add_edge(g, 1, 2)
+    _add_edge(g, 2, 3)
+    _add_edge(g, 3, 4)
+    _add_edge(g, 3, 5)
+    for (u, v) in list(g.edges):
+        g.edges[edge_key(u, v)].distance = g.edge_length_m(u, v)
+
+    cands = C.find_dead_end_stubs(g, max_length_m=1e9)
+    stub = next(c for c in cands if c.anchor == 1)
+    assert stub.nodes[-1] == 3, "fixture sanity check: the junction end is node 3"
+
+    tiles = T.build_tiles(g, [stub], tile_m=6000.0)
+    assert len(tiles) == 1
+    min_lon, min_lat, max_lon, max_lat = tiles[0].bbox
+    junction = g.nodes[3]
+    assert min_lon <= junction.lon <= max_lon, \
+        "the junction end must not fall outside the tile's bbox"
+    assert min_lat <= junction.lat <= max_lat
+
+
 # ----------------------------------------------------------------- prepare
 
 def _fake_geojson_dir(tmp_path):
@@ -270,6 +313,25 @@ def test_validate_rejects_bad_verdict():
     context = {"candidates": [{"n": 1, "kind": "dead_end_stub"}]}
     with pytest.raises(ValueError):
         runner._validate('{"1": {"verdict": "maybe"}}', context)
+
+
+def test_validate_rejects_a_truncated_answer_missing_candidates():
+    """A response answering only some of a tile's candidates must not be
+    accepted as this tile's final answer -- otherwise a truncated response
+    marks the tile "answered" and resume permanently skips the omitted
+    candidates, never actually reviewing them."""
+    context = {"candidates": [{"n": 1, "kind": "dead_end_stub"},
+                              {"n": 2, "kind": "dead_end_stub"}]}
+    with pytest.raises(ValueError, match="omits"):
+        runner._validate('{"1": {"verdict": "keep"}}', context)
+
+
+def test_validate_accepts_an_answer_covering_every_candidate():
+    context = {"candidates": [{"n": 1, "kind": "dead_end_stub"},
+                              {"n": 2, "kind": "dead_end_stub"}]}
+    result = runner._validate(
+        '{"1": {"verdict": "keep"}, "2": {"verdict": "drop"}}', context)
+    assert set(result.keys()) == {"1", "2"}
 
 
 def test_answers_to_ops_only_emits_drops(tmp_path):

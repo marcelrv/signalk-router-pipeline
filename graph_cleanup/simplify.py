@@ -120,7 +120,7 @@ def _effective_tolerance(g: RoutingGraph, chain: Sequence[int], tolerance_m: flo
     half = _chain_half_width(g, chain)
     if half is None:
         return tolerance_m
-    return min(tolerance_m, max(1.0, half * width_fraction))
+    return min(tolerance_m, half * width_fraction)
 
 
 def _enforce_max_spacing(pts: Sequence[Tuple[float, float]], keep: List[int],
@@ -220,7 +220,7 @@ def smooth_chains(g: RoutingGraph, strength: float = 0.5, passes: int = 2,
         half = _chain_half_width(g, chain)
         if half is None:
             continue
-        budget = max(1.0, half * width_fraction)
+        budget = half * width_fraction
         lat0 = g.nodes[chain[0]].lat
         orig = [_local_xy(g.nodes[n].lat, g.nodes[n].lon, lat0) for n in chain]
         if max(_turn_angles(orig), default=0.0) < min_turn_deg:

@@ -120,6 +120,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     print(f"writing tiles to {args.out_dir}")
     prepare.write_all(all_tiles, g, args.out_dir, input_dir=args.input_dir)
+    # This run's own tile directories, not a scan of --out-dir -- reusing
+    # --out-dir across runs with a different --bbox/--sample-tiles would
+    # otherwise pick up stale directories left over from an earlier, out-of-
+    # scope run and silently answer/emit ops for them too.
+    current_tile_dirs = [os.path.join(args.out_dir, tile.id) for tile in all_tiles]
 
     if args.prepare_only:
         print("prepared, not answered (--prepare-only). "
@@ -143,7 +148,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
               f"effort={kwargs.get('effort', DEFAULT_EFFORT)}")
         print("this spends real money -- Ctrl-C now if that wasn't the intent.")
 
-    tile_dirs = _find_tile_dirs(args.out_dir)
+    tile_dirs = current_tile_dirs
     if args.limit:
         pending = tile_dirs if args.no_resume else [
             d for d in tile_dirs if not os.path.exists(os.path.join(d, "answer.json"))]
@@ -156,8 +161,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     if args.ops_out:
         author = args.author or f"ai:{model_name}"
-        all_tile_dirs = _find_tile_dirs(args.out_dir)
-        result_ops = runner.answers_to_ops(all_tile_dirs, author=author)
+        result_ops = runner.answers_to_ops(current_tile_dirs, author=author)
         n = ops_mod.write_ops(args.ops_out, result_ops, append=False)
         print(f"wrote {n} drop ops to {args.ops_out} (author={author})")
 

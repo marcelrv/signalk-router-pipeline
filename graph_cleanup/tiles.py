@@ -90,6 +90,19 @@ def _bucket(g: RoutingGraph, candidates: Sequence[Candidate],
             continue
         min_lat, max_lat = ilat * lat_step, (ilat + 1) * lat_step
         min_lon, max_lon = ilon * lon_step, (ilon + 1) * lon_step
+        # A candidate is bucketed by its anchor alone, but a multi-node stub
+        # or component can extend well past the cell its anchor falls in (a
+        # long dead-end stub anchored near a cell edge, say -- real candidates
+        # in this project run past 1 km). Expand the raw bounds to cover every
+        # member node's own coordinate before padding, or the far end/context
+        # a reviewer needs can fall outside the rendered tile entirely.
+        for c in members:
+            for nid in c.nodes:
+                n = g.nodes.get(nid)
+                if n is None:
+                    continue
+                min_lat, max_lat = min(min_lat, n.lat), max(max_lat, n.lat)
+                min_lon, max_lon = min(min_lon, n.lon), max(max_lon, n.lon)
         bbox = _pad_bbox(min_lat, min_lon, max_lat, max_lon, lat_step, lon_step,
                          pad_fraction)
         tile_id = f"t{depth}_{ilat}_{ilon}"

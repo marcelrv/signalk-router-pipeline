@@ -2168,13 +2168,17 @@ with real margin.
 ```
 [PASS] crosses_land: 0 -> 0
 [PASS] largest_component_by_length: 0.8625 -> 0.8620 (+0.05pp, limit 0.5pp)
-[PASS] poi_pair_reachability: 48228 pairs -> 48228, 0 lost
+[PASS] poi_pair_reachability: 48539 pairs -> 48539, 0 lost
 [FAIL] poi_snap_drift: 2 POIs snap >50m further than before
 [PASS] counts: nodes 62904 -> 51919 (-17.5%), edges 82233 -> 64808 (-21.2%)
 [PASS] hubs: 0 nodes with out-degree > 30, max 15
 ```
 
-(`route_shape` not run — no probe pairs supplied.)
+(`route_shape` not run — no probe pairs supplied. The reachable-pairs count above is
+higher than this build's first measurement, 48228 — re-run after a code review found and
+fixed a real bug in `NodeIndex.nearest()`'s bucket search, §11.5, which was undercounting
+reachable pairs by snapping some POIs to the wrong node near a cell boundary. Zero lost
+either way; the fix only corrected pairs that should already have counted as reachable.)
 
 **The one caveat**: `poi_snap_drift` fails on exactly one real-world location, not two
 unrelated ones — both flagged POIs are duplicate entries for the **William P. Lane Jr.
@@ -2206,3 +2210,103 @@ at one specific pixel-hop distance) can sit right at a threshold chosen from the
 isolated test and be invisible until a real full build is measured directly. Bracket
 a real build's own remaining edge-length distribution (bucketed, as done above) before
 trusting a piece-level recommendation.
+
+### 11.5 Code review on the PR bundling §11 with the pre-existing `graph_cleanup`
+### package — 12 valid findings fixed
+
+A CodeRabbit review of the branch that bundled this work with the earlier Pass A/B
+`graph_cleanup` package (`docs/SPEC-GRAPH-CLEANUP.md`) raised 15 findings. Each was
+checked directly against the code before acting on it — 12 were real and fixed, 3 were
+not (CodeRabbit misread `validate.py`'s own loss-sign convention on two, and was misled
+by a stale docstring on a third that contradicted its own function body). Full
+per-finding reasoning lives in the PR review; summary of what changed, since two of
+these are load-bearing for numbers already reported above:
+
+- **`graph_cleanup/trace.py`, `largest_component_length_fraction`**: picked the
+  node-count-largest component (`comps[0]`) rather than the one with the greatest total
+  edge length, contradicting its own docstring and the rule this whole file exists to
+  enforce (§6.1). Fixed to sum every component's own edge length in one pass and take
+  the max. Verified this did not silently affect any number already reported in this
+  document: the node-count leader is also the length leader by a huge margin on both
+  real MD builds measured (11,640 km vs. 1,469 km runner-up) — but the bug was real and
+  would not stay lucky on every graph.
+- **`graph_cleanup/trace.py`, `NodeIndex.nearest()`**: returned as soon as the first
+  non-empty search ring had any candidate, without checking whether a closer node
+  existed in the next ring out — a classic bucket-search bug, wrong for a query point
+  near a cell boundary. Feeds POI snapping, used by `poi_pair_reachability`/
+  `poi_snap_drift`. Fixed to keep expanding while a closer node could still exist in an
+  unexplored ring. **This one did change a number already reported**: re-running §11.4's
+  gates after the fix found `poi_pair_reachability` at 48,539 pairs, not 48,228 — some
+  POIs had been snapping to the wrong (farther, wrong-side-of-a-boundary) node and
+  under-counting reachable pairs. Zero pairs were ever lost either way; the corrected
+  figure is now in §11.4's gate output above. The `poi_snap_drift` result (the
+  Chesapeake Bay Bridge caveat) was unaffected by this fix.
+- **`graph_cleanup/graph.py`**: `remove_node`/`splice_out`/`move_node` never checked
+  `self.protected` directly — only `simplify.py`'s op *generation* did, so
+  `ops.apply()`'s `--replay` path (used for every AI-reviewed ops file in this project,
+  e.g. builds #41/#42) could remove or move a protected node from a malformed or
+  hand-edited ops file. Fixed: all three now refuse a protected node outright.
+- **`graph_cleanup/graph.py`, `_merge_edges`**: a spliced edge's distance was
+  recomputed as the straight-line chord, not the sum of the two edges it replaced —
+  shorter on any curved chain (common here; this file's own turn-angle measurements),
+  contradicting `splice_out`'s documented promise that a merge can never look cheaper
+  than what it replaces. Fixed: the cost factor is now scaled up (on top of, not
+  instead of, the existing worst-of-the-two floor) so the merged weight is never less
+  than the combined original weight.
+- **`apply_cleanup.py`**: wrote the ops file before the gate check and the `--dry-run`
+  return, contradicting both the "FAILED gates; nothing written" and "dry run, nothing
+  written" messages printed right after. Fixed: the write now happens after both.
+- **`graph_cleanup/runner.py`, `_validate`**: rejected unknown candidate numbers but not
+  missing ones, so a truncated backend response could be accepted as a tile's final
+  answer and be skipped forever on resume, contradicting the documented "retry once,
+  then mark unanswered" contract (a missing verdict already defaulted to safe `keep`
+  downstream, so this was a completeness gap, not a safety one). Fixed: the parsed key
+  set must now exactly match the tile's candidates.
+- **`graph_cleanup/render.py`**: an edge was dropped from a rendered tile if *both*
+  endpoints were outside the bbox, so a long edge spanning clean across a tile with
+  neither endpoint inside it vanished entirely instead of showing the segment that
+  crosses through. Fixed with proper segment-vs-box (Liang-Barsky) clipping in all
+  three affected loops (`render_tile`, `render_diff` x2). Separately, `render_diff`
+  only ever drew polygon context layers, never the buoys/lights/marks or navmesh-region
+  shading `render_tile` includes — plausibly part of why the mesh-fill overview images
+  built for this section's own motivating complaint read as confusing. Both renderers
+  now share one `_draw_chart_context` helper with the full context.
+- **`graph_cleanup/simplify.py`**: a `max(1.0, ...)` floor could push the simplification
+  tolerance (and the smoothing budget) above the documented width-based safety fraction
+  for a charted channel narrower than ~4m. Fixed: no floor, matching the width fraction
+  exactly as documented.
+- **`graph_cleanup/tiles.py`**: a tile's bbox was computed from its grid cell alone, not
+  from every member candidate's own node coordinates, so a long dead-end stub anchored
+  near a cell edge could have its junction end fall outside the rendered image — real
+  risk given this project's own candidates run past 1.5 km. Fixed: the raw bounds now
+  expand to cover every member node before padding.
+- **`nautical_routing_pipeline.py`, `_merge_close_skeleton_junctions`**: the cluster
+  representative's tie-break on equal `dist_val` depended on Python set iteration order
+  (`members` is built from `junctions`, a set), which this file's own reproducibility
+  contract (see `MEDIAL_AXIS_SEED`) explicitly does not allow. Fixed: ties now break on
+  the pixel tuple itself, a deterministic secondary key.
+- **`review_region.py`**: `_find_tile_dirs(args.out_dir)` glob-scanned the whole output
+  directory rather than this run's own tile selection, so reusing `--out-dir` across a
+  `--bbox`/`--sample-tiles` change (a real pattern this project has used, expanding
+  Pass B's review area across sessions) could silently mix a stale, out-of-scope tile's
+  answer into a fresh run's `--ops-out`. Fixed: both the answering step and `--ops-out`
+  generation now use this run's own tile list.
+
+**Not changed** (findings judged invalid): a pair of `data/BUILD_LOG.md` entries
+reporting a positive `loss_pp` for a decreased component-length ratio are correct as
+written — that is `validate.py`'s own "how much was lost" convention (paired with an
+explicit "limit Xpp" in the same breath), not a sign error; a §11.4 sentence naming the
+gate suite "seven gates" as a section header is not a claim that all seven ran, and the
+actual per-gate PASS/FAIL breakdown and the `route_shape`-not-run note already follow
+immediately below it; and the junction-merge splice's spliced-chord land-crossing risk
+is already caught by `_sanity_check_no_land_crossings`'s existing skeleton-edge
+`sjoin(predicate="intersects")` pass against the land layer, which genuinely strips
+(not just flags) any skeleton edge — including a junction-merge-spliced one — found to
+cross land; that function's own docstring is stale on this point (says "informational...
+never stripped"), which is a separate, minor, pre-existing documentation bug, not a
+missing safety net.
+
+**Tests**: 477 passed (21 new — `tests/test_graph_cleanup_trace.py` is a new file; the
+rest added to existing files for each fix above). Every fix that could plausibly regress
+silently was checked by reverting just that file and confirming its new test(s) fail
+without the fix, not only that they pass with it.

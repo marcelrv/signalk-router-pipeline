@@ -169,8 +169,14 @@ class RoutingGraph:
         return True
 
     def remove_node(self, node: int) -> bool:
-        """Remove the node and every edge incident on it."""
-        if node not in self.nodes:
+        """Remove the node and every edge incident on it.
+
+        Refuses a protected node (navmesh seam / POI-snapped) directly, so this
+        invariant holds for every caller -- including `ops.apply()`'s replay
+        path, which calls this without going through `simplify.py`'s own
+        protected-aware op generation.
+        """
+        if node not in self.nodes or node in self.protected:
             return False
         for nb in list(self.adj.get(node, ())):
             self.remove_edge(node, nb)
@@ -185,9 +191,10 @@ class RoutingGraph:
 
         Refuses when the neighbours are already directly connected -- splicing
         there would silently discard the longer way round and change the graph's
-        shape rather than just its resolution.
+        shape rather than just its resolution. Also refuses a protected node
+        (navmesh seam / POI-snapped) directly -- see `remove_node`.
         """
-        if self.degree(node) != 2:
+        if node in self.protected or self.degree(node) != 2:
             return False
         a, b = tuple(self.adj[node])
         if edge_key(a, b) in self.edges:
@@ -205,9 +212,10 @@ class RoutingGraph:
         Note this does *not* re-key the node: the coordinate-derived ID now
         disagrees with the coordinate. That is deliberate -- re-keying would
         break every other op in the same file that names this node, and the ID's
-        only contract is stability, not invertibility.
+        only contract is stability, not invertibility. Refuses a protected node
+        (navmesh seam / POI-snapped) directly -- see `remove_node`.
         """
-        if node not in self.nodes:
+        if node not in self.nodes or node in self.protected:
             return False
         rec = self.nodes[node]
         rec.lat, rec.lon = lat, lon
@@ -220,15 +228,29 @@ class RoutingGraph:
             vals = [v for v in (x, y) if v is not None]
             return min(vals) if vals else None
 
+        # The straight chord a-b is shorter than the path it replaces whenever
+        # the spliced-out node sits off the direct line (a curved chain --
+        # common here, see docs/SPEC-GRAPH-DENSITY.md's own turn-angle
+        # measurements). Taking only the higher of the two cost factors then
+        # isn't enough to keep the promise below: scale the cost factor up so
+        # the merged weight is never less than what it replaces, on top of
+        # (never instead of) the existing worst-of-the-two floor.
+        distance = self.edge_length_m(a, b)
+        combined_weight = e1.weight + e2.weight
+        cost_factor = max(e1.cost_factor or 1.0, e2.cost_factor or 1.0)
+        if distance > 0:
+            cost_factor = max(cost_factor, combined_weight / distance)
         return EdgeRec(
-            distance=self.edge_length_m(a, b),
+            distance=distance,
             min_depth=worst_min(e1.min_depth, e2.min_depth),
             drval1=worst_min(e1.drval1, e2.drval1),
             max_air_draft=worst_min(e1.max_air_draft, e2.max_air_draft),
             min_width=worst_min(e1.min_width, e2.min_width),
             # Highest cost factor: the merged edge must not look cheaper than
-            # the most expensive stretch it stands in for.
-            cost_factor=max(e1.cost_factor or 1.0, e2.cost_factor or 1.0),
+            # the most expensive stretch it stands in for -- by weight, not
+            # just by this per-metre factor (see the chord-shortening note
+            # above).
+            cost_factor=cost_factor,
             distance_to_land=worst_min(e1.distance_to_land, e2.distance_to_land),
             edge_type_id=e1.edge_type_id,
             traffic_mode=e1.traffic_mode if e1.traffic_mode == e2.traffic_mode else 0,

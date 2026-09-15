@@ -125,13 +125,53 @@ def test_splice_inherits_worst_attributes():
                                     min_width=300.0, crosses_land=0)
     g.edges[edge_key(2, 3)] = _edge(min_depth=3.5, cost_factor=1.8, source_tier=4,
                                     min_width=60.0, crosses_land=1)
+    e1_weight = g.edge(1, 2).weight
+    e2_weight = g.edge(2, 3).weight
     assert g.splice_out(2)
     merged = g.edge(1, 3)
     assert merged.min_depth == 3.5, "shallowest depth must survive"
-    assert merged.cost_factor == 1.8, "most expensive cost factor must survive"
+    assert merged.cost_factor >= 1.8, "most expensive cost factor must survive as a floor"
     assert merged.source_tier == 4, "least trustworthy tier must survive"
     assert merged.min_width == 60.0
     assert merged.crosses_land == 1, "a land crossing must not be smoothed away"
+    assert merged.weight >= e1_weight + e2_weight - 1e-6, \
+        "a spliced chain must never look cheaper than the two edges it replaces"
+
+
+def test_splice_on_a_curved_chain_never_produces_a_cheaper_shortcut():
+    """The straight chord a-b is shorter than the path a-node-b it replaces
+    whenever the spliced-out node sits off the direct line -- exactly the
+    common case for this project's own wobbly coastal_water chains. Taking
+    only the higher of the two cost factors is not enough on its own to keep
+    splice_out's documented promise that a merge can never look cheaper than
+    what it replaces; the cost factor must be scaled up to compensate for the
+    corner cut, on top of the existing worst-of-the-two floor."""
+    g = RoutingGraph()
+    # A right-angle bend: 1 -> 2 -> 3, with node 2 well off the direct 1-3
+    # line, so distance(1,3) is meaningfully shorter than distance(1,2) +
+    # distance(2,3) (Pythagoras: chord ~1.41x a leg, vs. two legs ~2x).
+    g.nodes[1] = NodeRec(id=1, lat=52.000, lon=4.000, node_depth=10.0, region_id=1,
+                         node_kind_id=0, source_tier=1, source_id=2)
+    g.nodes[2] = NodeRec(id=2, lat=52.000, lon=4.001, node_depth=10.0, region_id=1,
+                         node_kind_id=0, source_tier=1, source_id=2)
+    g.nodes[3] = NodeRec(id=3, lat=52.001, lon=4.001, node_depth=10.0, region_id=1,
+                         node_kind_id=0, source_tier=1, source_id=2)
+    g.adj = {1: {2}, 2: {1, 3}, 3: {2}}
+    g.edges[edge_key(1, 2)] = _edge(cost_factor=1.0, distance=g.edge_length_m(1, 2))
+    g.edges[edge_key(2, 3)] = _edge(cost_factor=1.0, distance=g.edge_length_m(2, 3))
+    e1_weight = g.edge(1, 2).weight
+    e2_weight = g.edge(2, 3).weight
+    straight_chord_m = g.edge_length_m(1, 3)
+    assert straight_chord_m < g.edge(1, 2).distance + g.edge(2, 3).distance, \
+        "fixture sanity check: the chord must actually be shorter than the path"
+
+    assert g.splice_out(2)
+    merged = g.edge(1, 3)
+    assert merged.weight >= e1_weight + e2_weight - 1e-6
+    # The un-compensated cost factor (max of the two inputs, both 1.0) would
+    # have produced a materially cheaper shortcut on this fixture -- confirm
+    # the fix actually engaged, not just that the floor happened to be enough.
+    assert merged.cost_factor > 1.0
 
 
 def test_splice_refuses_when_neighbours_already_joined():
@@ -148,6 +188,38 @@ def test_splice_recomputes_distance():
     before = g.edge(1, 2).distance + g.edge(2, 3).distance
     g.splice_out(2)
     assert g.edge(1, 3).distance == pytest.approx(before, rel=1e-3)
+
+
+# ---------------------------------------------------- protected-node enforcement
+#
+# `simplify.py`'s own op generation already skips protected nodes, but that is
+# not the only way an op reaches these mutation methods: `ops.apply()`'s
+# `--replay` path (a real, used path -- e.g. applying an AI-reviewed
+# ops.jsonl) calls remove_node/splice_out/move_node directly. The invariant
+# must hold at that layer too, or a malformed/hand-edited ops file could
+# silently remove or move a navmesh seam or POI-snapped node.
+
+def test_remove_node_refuses_a_protected_node():
+    g = _line_graph(_straight(3))
+    g.protected = {2}
+    assert not g.remove_node(2)
+    assert 2 in g.nodes
+
+
+def test_splice_out_refuses_a_protected_node():
+    g = _line_graph(_straight(3))
+    g.protected = {2}
+    assert not g.splice_out(2)
+    assert 2 in g.nodes
+    assert g.degree(2) == 2
+
+
+def test_move_node_refuses_a_protected_node():
+    g = _line_graph(_straight(3))
+    g.protected = {2}
+    original_lat, original_lon = g.nodes[2].lat, g.nodes[2].lon
+    assert not g.move_node(2, 52.5, 5.5)
+    assert (g.nodes[2].lat, g.nodes[2].lon) == (original_lat, original_lon)
 
 
 # -------------------------------------------------------------------- simplify
@@ -196,6 +268,17 @@ def test_tolerance_is_capped_by_charted_width():
     tol_w = simplify._effective_tolerance(wide, next(iter_chains(wide)), 20.0, 0.25)
     assert tol_n == pytest.approx(5.0), "a 40 m channel caps the tolerance at 5 m"
     assert tol_w == 20.0, "a wide channel takes the requested tolerance"
+
+
+def test_tolerance_cap_has_no_one_metre_floor_on_a_very_narrow_channel():
+    """A charted half-width * width_fraction below 1 m must stand on its own --
+    a floor here would let the tolerance (and the smoothing budget, same
+    pattern) exceed the documented fraction of the charted width for exactly
+    the narrowest, most safety-sensitive channels."""
+    very_narrow = _line_graph(_straight(6), min_width=2.0)  # half-width 1 m
+    chain = next(iter_chains(very_narrow))
+    tol = simplify._effective_tolerance(very_narrow, chain, 20.0, 0.25)
+    assert tol == pytest.approx(0.25), "no floor: 1m half-width * 0.25 fraction"
 
 
 def test_unknown_width_sentinel_is_not_treated_as_a_wide_channel():
