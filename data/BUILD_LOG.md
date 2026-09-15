@@ -61,6 +61,7 @@ Nodes/Edges delta.
 | 40 | 2026-09-12 | `graph-cleanup` branch | n/a — post-processes #39's `.sqlite`, not a rebuild | `apply_cleanup.py` Pass A (`--tolerance-m 20`, smooth + contract + redundant) | First deterministic post-build cleanup: measure how much of the graph comes out with no model at all | 53,930 | 142,196 | 0 | 13 | 0 | no (test build) |
 | 41 | 2026-09-14 | `graph-cleanup` branch | n/a — post-processes #40's `.sqlite` | AI review Pass B, Coltons Point bbox only (16 tiles, 104 candidates), reviewer = this session (Sonnet 5) reading tiles directly, no API | First real Pass B review: 63 keep / 35 drop / 6 unsure -> 40 drop ops applied | 53,890 | 142,116 | 0 | 13 | 0 | no (pilot only) |
 | 42 | 2026-09-14 | `graph-cleanup` branch | n/a — post-processes #40's `.sqlite`, supersedes #41 | AI review Pass B, expanded to ~3x area (-76.95,38.10,-76.63,38.32), 323 candidates/37 tiles, reviewer = this session (Sonnet 5) reading tiles directly, no API | Expanded Pass B review, carrying forward #41's 104 verdicts by candidate_id: 262 keep / 52 drop / 9 unsure -> 69 drop ops applied; render_diff visual comparisons produced | 53,861 | 142,058 | 0 | 13 | 0 | no (review sample only) |
+| 43 | 2026-09-15 | this commit (`skeleton_junction_merge_m` fix, on top of `a859e41`) | `data/geojson/us-east-md-v5_clipped` (same clip as #39) | same as #39 plus `--skeleton-junction-merge-m 35.0` | SPEC-GRAPH-DENSITY.md §11 — fix `coastal_water` mesh-fill (short junction-to-junction edges `_prune_skeleton_spurs` never touches), found reviewing Pass B results visually. Third attempt: 20.0 and 30.0 (both discarded, not logged) barely moved the target location because 502/602 of its junction edges sit at a quantized ~30.4m raster distance; 35.0 clears it | 51,919 | 129,618 | 0 | 15 | 0 | no (see Details — `poi_snap_drift` caveat, not yet decided) |
 
 **Row #1 is not a valid comparison baseline** — its input clip/flags are unknown, so
 its counts cannot be attributed to any specific configuration. It's recorded because
@@ -1888,3 +1889,105 @@ the same headland drops on top.
 - **Not deployed** — review sample, same as #41.
 - **Tests**: 437 passed (2 new in `tests/test_graph_cleanup_render.py` for `render_diff`/
   `diff_removed`).
+
+### #43 — `us_east_md_junction_merge_v3.sqlite` — fix `coastal_water` mesh-fill (root cause, `skeleton_junction_merge_m`)
+
+Found while reviewing #42's `render_diff` output visually (per the user's request):
+a dense ~190-node patch near Cuckold Creek that turned out to be statewide (85% of
+`coastal_water` nodes have degree >= 4, only 14.9% the expected degree-2). Root cause
+and fix design: `docs/SPEC-GRAPH-DENSITY.md` §11. Unlike #40-42 (post-hoc
+`graph_cleanup` ops on a built `.sqlite`), this is a `nautical_routing_pipeline.py`
+generation-time fix — a full rebuild, not a replay.
+
+```bash
+ulimit -Sv $((11*1024*1024))
+.venv/bin/python3 nautical_routing_pipeline.py \
+  --input-dir data/geojson/us-east-md-v5_clipped \
+  --output data/us_east_md_junction_merge_v3.sqlite \
+  --country US --name "us-east-md-v5-junction-merge-v3" \
+  --description "US coastal waters (us-east-md-v5-junction-merge-v3), based on NOAA ENCs" \
+  --tags '["noaa","enc","coastal"]' \
+  --url "https://github.com/marcelrv/signalk-router-data" \
+  --license "Public Domain (NOAA)" --copyright "NOAA Office of Coast Survey" \
+  --depth-ceiling 6.0 \
+  --coverage-bbox="-77.4,37.88,-74.68,39.63" \
+  --sagitta-cap 250.0 --max-segment-m 2000 \
+  --axis-dedup-cap 100.0 --axis-dedup-floor-m 100.0 \
+  --min-navmesh-radius-m 1200.0 \
+  --connector-merge-m 5.0 \
+  --inland-densify-max-segment-m 120.0 \
+  --pass2-max-fanin-per-node 6 \
+  --pass0-target-fanin-cap 4 \
+  --node-merge-m 5.0 \
+  --narrow-fragment-reclass-max-fraction 0.5 \
+  --pass0-fanin-cap 6 \
+  --pass0-cross-type-first \
+  --skeleton-boundary-simplify-m 20.0 \
+  --skeleton-junction-merge-m 35.0 \
+  --channel-axes
+```
+
+Same as build #39's command with one additive flag (`--skeleton-junction-merge-m
+35.0`) — `derive_channel_axes.py` was not re-run; `channel_axes_lines.geojson` was
+already current from #39-#42.
+
+**Three attempts — the first two are the actual finding here, not a footnote.** A
+piece-level test (§11.3: a standalone ~4.4km polygon clipped directly from the source
+GeoJSON, fed straight to `build_skeleton_network`) measured a clean 45% node reduction
+at 20.0m and recommended it. A full MD rebuild at 20.0m barely moved the motivating
+location (Cuckold Creek: 190 → 192 nodes) — the real pipeline processes this whole
+water body as one enormous piece (`build_skeleton_network` called with polygon bounds
+spanning `-77.38,37.88` to `-75.57,39.61`, not the small standalone clip the piece-level
+test used), and 502 of the 602 junction-to-junction edges remaining in the real build's
+Cuckold Creek blob sit at a single quantized raster distance of ~30.4m — a
+`pixel_size_m=10.0` (the ceiling) rasterization artifact invisible to the piece-level
+test, which happened to rasterize differently. A second attempt at 30.0m (still below
+30.4m) also barely moved it (186 nodes). **35.0m**, tried third, clears the cluster with
+real margin.
+
+| location | metric | baseline (#39) | 20.0 (discarded) | 30.0 (discarded) | **35.0 (this build)** |
+|---|---|---|---|---|---|
+| Cuckold Creek blob (1.7km² box) | nodes | 190 | 192 | 186 | **33** |
+| Cuckold Creek blob | internal edges | 622 | 628 | 614 | **92** |
+| statewide | nodes | 62,904 | 60,029 (-4.6%) | not measured | **51,919 (-17.5%)** |
+| statewide | edges (undirected) | 82,233 | 77,683 (-5.5%) | not measured | **64,808 (-21.2%)** |
+
+`graph_cleanup/validate.py`'s seven gates, this build vs. baseline #39:
+
+```
+[PASS] crosses_land: 0 -> 0
+[PASS] largest_component_by_length: 0.8625 -> 0.8620 (+0.05pp, limit 0.5pp)
+[PASS] poi_pair_reachability: 48228 pairs -> 48228, 0 lost
+[FAIL] poi_snap_drift: 2 POIs snap >50m further than before
+[PASS] counts: nodes 62904 -> 51919 (-17.5%), edges 82233 -> 64808 (-21.2%)
+[PASS] hubs: 0 nodes with out-degree > 30, max 15
+```
+
+(`route_shape` not run — no probe pairs supplied.)
+
+**The `poi_snap_drift` caveat**: both flagged POIs are the same real-world landmark —
+duplicate entries for the William P. Lane Jr. Memorial (Chesapeake Bay) Bridge, ~140m
+apart (`38.98458,-76.34537`: 13m→169m, +156m; `38.98580,-76.34502`: 137m→213m, +76m).
+This is open water in the upper Chesapeake Bay — the same class of area as Cuckold
+Creek — and the fix thinned a locally dense mesh there too (74→47 nodes in a 1km box
+around the bridge). POI-pair reachability is unaffected; this reads as a plausible,
+benign consequence of removing genuine mesh-fill near a large linear landmark rather
+than a routing defect, but it is exactly the kind of headline-looks-fine regression
+`validate.py` exists to catch (builds #11/#12), so it is **not waved off** — not yet
+decided whether to accept it, raise `max_snap_drift_m` for open-water contexts, or
+investigate further.
+
+- **Not deployed** — pending the `poi_snap_drift` decision above and a visual
+  re-render of Cuckold Creek to confirm the picture itself (not just the counts) reads
+  clean, and re-examination of the buoy/fairway-connection appearance from the
+  original visual complaint now that the surrounding clutter is thinned.
+- **A real bug caught mid-implementation, not by any synthetic test**: an early version
+  of the fix assumed `nx.Graph.edges()` returns `(u, v)` in the same order the edge was
+  added with; ~26% of edges on the real piece come back reversed, which silently
+  spliced the merge substitution into the wrong end and fragmented the largest
+  component into 3 pieces on the real Cuckold Creek piece (488→222/56/5 nodes) — not
+  caught by any of the 15 synthetic-fixture tests written first, only by piece-level
+  testing against real geometry. Fixed (`_splice_junction_merge_into_edge_pts`,
+  matches pixels to ends via their own known `lonlat`) with dedicated regression tests
+  pinning both orderings. Full story: `docs/SPEC-GRAPH-DENSITY.md` §11.2.
+- **Tests**: 456 passed (19 new in `tests/test_skeleton_junction_merge.py`).
