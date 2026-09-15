@@ -24,8 +24,14 @@ verification COMPLETE — `data/BUILD_LOG.md` #34) fixes this via
 17-35% node reduction) and then against a full region rebuild (72.7% boundary-vertex
 reduction, 10.4%/10.9% node/edge reduction in the reported area, `crosses_land=0`).
 See §10.1 for the caveat that a second, different location nearby is NOT fixed by
-this mechanism. See `data/BUILD_LOG.md` for every real build's measured effect
-before assuming any of these should ship enabled by default.
+this mechanism. §11 (implemented, real-build verification COMPLETE — `data/BUILD_LOG.md`
+#43) fixes that second mechanism: short junction-to-junction edges §9 never touches,
+via `skeleton_junction_merge_m`. Cuckold Creek, MD dropped from 190 to 33 mesh-fill
+nodes at the validated real-build value (35.0m — a piece-level-only test initially
+suggested 20.0m, which turned out to miss a raster quantization artifact entirely; see
+§11.4). One `validate.py` gate (`poi_snap_drift`) has an open, narrow caveat near the
+Chesapeake Bay Bridge — not yet deployed. See `data/BUILD_LOG.md` for every real
+build's measured effect before assuming any of these should ship enabled by default.
 Complements: `SPEC-RECOMMENDED-TRACK.md`, `SPEC-FAIRWAY-HARMONIZATION.md`
 Scope: `nautical_routing_pipeline.py` (`build_skeleton_network`, `_resample_long_skeleton_edges`, `_skeleton_raster_to_graph`, `ClassificationConfig`)
 Measured against: `data/zeeland_full.sqlite` (48,553 nodes / 137,718 directed edges), RWS source GeoJSON
@@ -1994,3 +2000,313 @@ independently reconfirmed by this investigation's own fan-in/fan-out measurement
   to be worth a dedicated fix**, or whether fixing #1/#2 alone (ring density)
   already resolves the visible symptom without needing #3 — worth measuring again
   after a #1/#2 rebuild before investing in #3.
+
+## 11. `coastal_water` mesh-fill: short junction-to-junction edges — IMPLEMENTED
+
+Found while reviewing the AI graph-cleanup Pass A/B results visually (`render_diff()`,
+`docs/SPEC-GRAPH-CLEANUP.md` §6.4/§6.7 already flagged this at Cuckold Creek, MD as a
+known, unimplemented gap): a dense patch of "hundreds of nodes" at ~25m spacing,
+degree 6-8, in open water southwest of Cuckold Creek — a 2D triangulated mesh, not a
+1D routing skeleton.
+
+### 11.1 Symptom and root cause, confirmed on real geometry
+
+Statewide measurement on `data/us_east_md_cleanup_a.sqlite` (built with
+`--skeleton-boundary-simplify-m 20.0` already applied, build #39/#40): of 42,901
+`coastal_water` nodes, only 14.9% are degree-2 (the expected value for a clean
+skeleton). **85% have degree >= 4** (43.7% exactly degree-6, matching a Delaunay-style
+2D triangulation's interior-point signature far more than a routing skeleton's). The
+single Cuckold Creek patch alone is 190 nodes, degree 6-8, spanning ~1.7km².
+
+Root cause: `_extract_medial_axis_skeleton` (`skimage.morphology.medial_axis` on a
+rasterized water mask) is very sensitive to small boundary irregularities. §9 already
+diagnosed this class of problem and fixed the *boundary-noise* half of it
+(`skeleton_boundary_simplify_m`) — but its own code comment already flagged the
+remainder: "the density is topological (junction count), not a resampling artifact."
+`_prune_skeleton_spurs` only removes short **dead-end** (one side degree-1) edges; it
+never touches short **junction-to-junction** (both sides degree>=3) edges, which is
+exactly the mesh-fill pattern — a wide bay with a detailed coastline converges many
+*genuine* branches into a dense tangle instead of pruning any of them away.
+
+Confirmed this is a distinct population from real branch spacing: 86,310
+junction-to-junction `coastal_water` edges statewide, 27.8% shorter than 30m, 51.8%
+shorter than 50m — a large near-noise-length population, distinct from genuinely-spaced
+real junctions (p75=191m, p90=472m).
+
+`node_merge_m`/`connector_merge_m` do not help: both are proximity-dedup of
+independently-computed *duplicate* points (capped at 20m, below the ~25m mesh
+spacing), deliberately not meant to merge distinct real features.
+
+### 11.2 Fix: `skeleton_junction_merge_m` — IMPLEMENTED
+
+`ClassificationConfig.skeleton_junction_merge_m` (`--skeleton-junction-merge-m`,
+default `0.0` = disabled). In `build_skeleton_network`, immediately after
+`_prune_skeleton_spurs`: `_merge_close_skeleton_junctions(G, cfg.skeleton_junction_merge_m)`
+clusters `G`'s junction pixels (degree>=3, post-spur-pruning) connected by an edge
+shorter than the tolerance (union-find), and returns a map from every
+non-representative cluster member to the cluster's single highest-distance-transform
+member's lon/lat — i.e. the real, already-valid skeleton pixel deepest from any water
+boundary, never a synthetic centroid. `SKELETON_JUNCTION_MERGE_MAX_M = 100.0` bounds
+it, well below the measured p75/p90 (191m/472m) of genuinely-spaced real junctions.
+
+**Key implementation property**: `_skeleton_raster_to_graph`'s graph `G` (pixel-tuple
+nodes) is only scaffolding for chain-walking the raster into edges carrying a `pts`
+(lon/lat polyline) attribute — the real routing-graph nodes are minted downstream, per
+edge, purely from `_get_or_create_node(pts[0]...)`/`(pts[-1]...)`'s coordinate-based
+dedup. So the fix doesn't contract `G` at all: `_splice_junction_merge_into_edge_pts`
+splices the cluster's representative coordinate into the matching end of each affected
+edge's `pts`, and `_get_or_create_node`'s existing dedup does the actual merging for
+free. An edge collapsed entirely inside one cluster ends up with identical first/last
+points, so the existing `if u == v: continue` guard (present already, for a different
+original reason) drops it like any other degenerate chain.
+
+**Real bug caught during implementation, not by any synthetic fixture**: `nx.Graph.edges()`
+does not guarantee `(u, v)` comes back in the same order the edge was originally added
+with — confirmed directly: ~26% of edges on the real Cuckold Creek piece come back
+reversed relative to `pts[0]`/`pts[-1]`. An early version assumed `u~pts[0]` always,
+which silently spliced the representative into the *wrong* end on reversed edges and
+fragmented the largest connected component into 3 pieces (488→222/56/5-node split) on
+the real piece — while every synthetic unit-test fixture happened not to trip it,
+despite also containing reversed-order edges. Fixed by matching each pixel to its end
+via its own known `lonlat` rather than trusting iteration order, and pulled the
+splice logic into its own function (`_splice_junction_merge_into_edge_pts`) with
+dedicated tests pinning both orderings explicitly
+(`tests/test_skeleton_junction_merge.py::TestSpliceJunctionMergeIntoEdgePts`) — this is
+exactly the class of bug real-geometry piece-level testing exists to catch (§9.2/§9.4's
+own established discipline) and synthetic fixtures alone did not.
+
+**Land-crossing safety** follows the same structural argument as §9.3's boundary
+simplify, by a different mechanism: the representative is always an already-real,
+already-rasterized-as-water skeleton pixel, so this carries no land-crossing risk
+beyond what every edge's `crosses_land` classification already checks at build time —
+no new geometry is invented.
+
+### 11.3 Validated directly against real geometry before wider rollout
+
+Piece-level measurement (§9.2's own methodology): the real `coastal_water` polygon
+covering Cuckold Creek, clipped from `data/geojson/us-east-md-v5_clipped/coastal_water_polygons.geojson`,
+run through `build_skeleton_network` directly with `skeleton_boundary_simplify_m=20.0`
+(matching build #39) at several `skeleton_junction_merge_m` values:
+
+| tolerance | nodes | edges | % degree-2 | # degree>=4 | max degree | components |
+|---|---|---|---|---|---|---|
+| 0 (off) | 488 | 1,308 | 4.1% | 468 | 8 | 1 |
+| 15m | 267 | 552 | 10.9% | 238 | 14 | 1 |
+| 25m | 266 | 550 | 10.9% | 237 | 14 | 1 |
+| 40m | 264 | 542 | 12.1% | 232 | 22 | 1 |
+| 60m | 262 | 538 | 12.2% | 230 | 22 | 1 |
+
+**A 45% node-count reduction at 15-25m** on this isolated piece, connectivity
+preserved (1 component throughout — the ordering fix above), max degree well under
+`validate.py`'s hub gate (30) through 25m. This looked like a solid recommendation —
+**it was not**; see §11.4's real-build correction below. The piece remains far from a
+"clean" 1D skeleton at any tolerance tested here (10.9% degree-2 vs. the ~85% a clean
+skeleton should show) — this is a genuinely wide, complex bay with real branching, not
+pure chart noise, so a full return to degree-2-dominant was never the expected outcome;
+the goal is eliminating the mesh-fill *signature*, which a correctly-chosen tolerance
+does (§11.4).
+
+Synthetic coverage: `tests/test_skeleton_junction_merge.py` (19 tests) — a
+`_wide_notched_blob_wgs84` fixture (sawtooth notches on all four sides of a wide
+square, unlike §9's single-edge-notched channel) reproduces the real signature
+directly (84 raw nodes, only 27% degree-2); disabled-by-default byte-identical
+coverage; connectivity-preservation and degree-reduction assertions on the synthetic
+fixture; direct unit tests of `_merge_close_skeleton_junctions` (cluster
+representative selection, far-junctions untouched, dead-end neighbors never folded in,
+multi-node chain clustering) and of `_splice_junction_merge_into_edge_pts` (both edge
+orderings, partial-merge, no-op); validation boundary tests. Full suite: 456/456
+passing.
+
+### 11.4 Real-build verification: the piece-level 20.0m recommendation was wrong — EXECUTED, fixed at 35.0m
+
+Same discipline as §9.4/§8.5, this time run to completion — and it caught a real
+problem the piece-level test above did not, exactly the reason this repo insists on
+real-build verification before trusting a piece-level number.
+
+**First attempt, `--skeleton-junction-merge-m 20.0` (build attempt, discarded, not
+logged)**: full MD rebuild, otherwise identical to build #39's command. Result: the
+Cuckold Creek blob **barely moved** — 190 → 192 nodes, 622 → 628 edges, essentially
+unchanged. The `crosses_land`/`largest_component_by_length`/`poi_pair_reachability`
+gates all still passed (nothing was *broken*), but the fix visibly wasn't doing its job
+at the one location it was built to fix.
+
+**Root cause**: §11.3's piece-level test clipped a small (~4.4km) standalone polygon
+directly from the source GeoJSON and fed it straight to `build_skeleton_network` —
+different from what the real pipeline does, which classifies water into
+wide/narrow sub-regions first and processes an enormous, nearly-whole-Chesapeake-Bay
+connected piece for this area (confirmed directly: one real piece's polygon bounds
+span `(-77.38, 37.88)` to `(-75.57, 39.61)`, with 3,738 junctions merged across it —
+the fix *was* running, just not locally at Cuckold Creek). Measuring the actual
+junction-to-junction edge lengths remaining in the real build's Cuckold Creek blob
+after the 20.0m attempt found **502 of 602 edges sitting at a single quantized raster
+distance of ~30.4m** — a `pixel_size_m=10.0` (the ceiling — this piece's bounding-box
+min-dimension is huge, so `pixel_size_for` clips to the max) rasterization artifact:
+most of this blob's real junction spacing lands at almost exactly the same few-pixel-hop
+distance, and it happened to sit just above both a 20.0m and (tried next) a 30.0m
+threshold. The piece-level test's own small polygon apparently rasterized this same
+water body differently enough (different classified shape feeding
+`build_skeleton_network`, not a difference in pixel size — both pieces compute
+`pixel_size_m=10.0`, confirmed) to not hit the same quantization wall, which is exactly
+why it missed this.
+
+**Second attempt, 30.0m (discarded, not logged)**: same result — 190 → 186 nodes. The
+30.4m quantized cluster sits *just* above 30.0 (`< merge_tol_m` is strict).
+
+**Third attempt, 35.0m — the one logged as build #43**: clears the quantized cluster
+with real margin.
+
+| location | metric | baseline (#39) | 20.0m | 30.0m | **35.0m** |
+|---|---|---|---|---|---|
+| Cuckold Creek blob | nodes | 190 | 192 | 186 | **33** |
+| Cuckold Creek blob | internal edges | 622 | 628 | 614 | **92** |
+| Cuckold Creek blob | jj edges at the ~30m quantized cluster | (n/a, pre-fix) | present | present | **gone** (distribution jumps straight from 35m to 70m) |
+| statewide | nodes | 62,904 | 60,029 (-4.6%) | (not re-measured) | **51,919 (-17.5%)** |
+| statewide | edges (undirected) | 82,233 | 77,683 (-5.5%) | (not re-measured) | **64,808 (-21.2%)** |
+
+`graph_cleanup/validate.py`'s seven gates, build #43 (35.0m) vs. baseline #39:
+
+```
+[PASS] crosses_land: 0 -> 0
+[PASS] largest_component_by_length: 0.8625 -> 0.8620 (+0.05pp, limit 0.5pp)
+[PASS] poi_pair_reachability: 48539 pairs -> 48539, 0 lost
+[FAIL] poi_snap_drift: 2 POIs snap >50m further than before
+[PASS] counts: nodes 62904 -> 51919 (-17.5%), edges 82233 -> 64808 (-21.2%)
+[PASS] hubs: 0 nodes with out-degree > 30, max 15
+```
+
+(`route_shape` not run — no probe pairs supplied. The reachable-pairs count above is
+higher than this build's first measurement, 48228 — re-run after a code review found and
+fixed a real bug in `NodeIndex.nearest()`'s bucket search, §11.5, which was undercounting
+reachable pairs by snapping some POIs to the wrong node near a cell boundary. Zero lost
+either way; the fix only corrected pairs that should already have counted as reachable.)
+
+**The one caveat**: `poi_snap_drift` fails on exactly one real-world location, not two
+unrelated ones — both flagged POIs are duplicate entries for the **William P. Lane Jr.
+Memorial (Chesapeake Bay) Bridge**, ~140m apart: `38.98458,-76.34537` (13m → 169m,
++156m) and `38.98580,-76.34502` (137m → 213m, +76m). This is the upper Chesapeake Bay —
+open, wide water, the same class of area as Cuckold Creek, and the fix thinned a
+locally dense mesh there too (74 → 47 nodes in a 1km box around the bridge). POI-pair
+reachability is unaffected (the bridge is still fully reachable, just from a node
+~170-210m away instead of ~13-137m), `crosses_land` and hub gates are clean, and 170m
+from a landmark the size of a major bay bridge is a plausible, benign consequence of
+removing genuine mesh-fill rather than evidence of a real routing defect — but this is
+exactly the kind of headline-looks-fine regression `validate.py`'s own docstring warns
+about (builds #11/#12), so it is flagged here rather than silently accepted. **Not yet
+decided**: whether to accept this as a known, narrow tradeoff, raise
+`max_snap_drift_m` for this kind of open-water context, or investigate further before
+this build replaces any live database.
+
+**Recommended value: 35.0m**, not the 20.0m §11.3's isolated piece-level test
+suggested — logged as `data/BUILD_LOG.md` build #43
+(`data/us_east_md_junction_merge_v3.sqlite`). **Not deployed** — same status as builds
+#41/#42, pending a decision on the `poi_snap_drift` caveat above and a visual
+re-render of Cuckold Creek to confirm the picture itself reads clean now.
+
+**Lesson for the next tolerance-tuning session on this codebase**: a piece-level
+measurement using a hand-clipped standalone polygon is a fast, useful *sanity check*,
+but is not a substitute for measuring the *real* piece the classification pipeline
+actually produces — raster quantization artifacts (a whole population of edges sitting
+at one specific pixel-hop distance) can sit right at a threshold chosen from the
+isolated test and be invisible until a real full build is measured directly. Bracket
+a real build's own remaining edge-length distribution (bucketed, as done above) before
+trusting a piece-level recommendation.
+
+### 11.5 Code review on the PR bundling §11 with the pre-existing `graph_cleanup`
+### package — 12 valid findings fixed
+
+A CodeRabbit review of the branch that bundled this work with the earlier Pass A/B
+`graph_cleanup` package (`docs/SPEC-GRAPH-CLEANUP.md`) raised 15 findings. Each was
+checked directly against the code before acting on it — 12 were real and fixed, 3 were
+not (CodeRabbit misread `validate.py`'s own loss-sign convention on two, and was misled
+by a stale docstring on a third that contradicted its own function body). Full
+per-finding reasoning lives in the PR review; summary of what changed, since two of
+these are load-bearing for numbers already reported above:
+
+- **`graph_cleanup/trace.py`, `largest_component_length_fraction`**: picked the
+  node-count-largest component (`comps[0]`) rather than the one with the greatest total
+  edge length, contradicting its own docstring and the rule this whole file exists to
+  enforce (§6.1). Fixed to sum every component's own edge length in one pass and take
+  the max. Verified this did not silently affect any number already reported in this
+  document: the node-count leader is also the length leader by a huge margin on both
+  real MD builds measured (11,640 km vs. 1,469 km runner-up) — but the bug was real and
+  would not stay lucky on every graph.
+- **`graph_cleanup/trace.py`, `NodeIndex.nearest()`**: returned as soon as the first
+  non-empty search ring had any candidate, without checking whether a closer node
+  existed in the next ring out — a classic bucket-search bug, wrong for a query point
+  near a cell boundary. Feeds POI snapping, used by `poi_pair_reachability`/
+  `poi_snap_drift`. Fixed to keep expanding while a closer node could still exist in an
+  unexplored ring. **This one did change a number already reported**: re-running §11.4's
+  gates after the fix found `poi_pair_reachability` at 48,539 pairs, not 48,228 — some
+  POIs had been snapping to the wrong (farther, wrong-side-of-a-boundary) node and
+  under-counting reachable pairs. Zero pairs were ever lost either way; the corrected
+  figure is now in §11.4's gate output above. The `poi_snap_drift` result (the
+  Chesapeake Bay Bridge caveat) was unaffected by this fix.
+- **`graph_cleanup/graph.py`**: `remove_node`/`splice_out`/`move_node` never checked
+  `self.protected` directly — only `simplify.py`'s op *generation* did, so
+  `ops.apply()`'s `--replay` path (used for every AI-reviewed ops file in this project,
+  e.g. builds #41/#42) could remove or move a protected node from a malformed or
+  hand-edited ops file. Fixed: all three now refuse a protected node outright.
+- **`graph_cleanup/graph.py`, `_merge_edges`**: a spliced edge's distance was
+  recomputed as the straight-line chord, not the sum of the two edges it replaced —
+  shorter on any curved chain (common here; this file's own turn-angle measurements),
+  contradicting `splice_out`'s documented promise that a merge can never look cheaper
+  than what it replaces. Fixed: the cost factor is now scaled up (on top of, not
+  instead of, the existing worst-of-the-two floor) so the merged weight is never less
+  than the combined original weight.
+- **`apply_cleanup.py`**: wrote the ops file before the gate check and the `--dry-run`
+  return, contradicting both the "FAILED gates; nothing written" and "dry run, nothing
+  written" messages printed right after. Fixed: the write now happens after both.
+- **`graph_cleanup/runner.py`, `_validate`**: rejected unknown candidate numbers but not
+  missing ones, so a truncated backend response could be accepted as a tile's final
+  answer and be skipped forever on resume, contradicting the documented "retry once,
+  then mark unanswered" contract (a missing verdict already defaulted to safe `keep`
+  downstream, so this was a completeness gap, not a safety one). Fixed: the parsed key
+  set must now exactly match the tile's candidates.
+- **`graph_cleanup/render.py`**: an edge was dropped from a rendered tile if *both*
+  endpoints were outside the bbox, so a long edge spanning clean across a tile with
+  neither endpoint inside it vanished entirely instead of showing the segment that
+  crosses through. Fixed with proper segment-vs-box (Liang-Barsky) clipping in all
+  three affected loops (`render_tile`, `render_diff` x2). Separately, `render_diff`
+  only ever drew polygon context layers, never the buoys/lights/marks or navmesh-region
+  shading `render_tile` includes — plausibly part of why the mesh-fill overview images
+  built for this section's own motivating complaint read as confusing. Both renderers
+  now share one `_draw_chart_context` helper with the full context.
+- **`graph_cleanup/simplify.py`**: a `max(1.0, ...)` floor could push the simplification
+  tolerance (and the smoothing budget) above the documented width-based safety fraction
+  for a charted channel narrower than ~4m. Fixed: no floor, matching the width fraction
+  exactly as documented.
+- **`graph_cleanup/tiles.py`**: a tile's bbox was computed from its grid cell alone, not
+  from every member candidate's own node coordinates, so a long dead-end stub anchored
+  near a cell edge could have its junction end fall outside the rendered image — real
+  risk given this project's own candidates run past 1.5 km. Fixed: the raw bounds now
+  expand to cover every member node before padding.
+- **`nautical_routing_pipeline.py`, `_merge_close_skeleton_junctions`**: the cluster
+  representative's tie-break on equal `dist_val` depended on Python set iteration order
+  (`members` is built from `junctions`, a set), which this file's own reproducibility
+  contract (see `MEDIAL_AXIS_SEED`) explicitly does not allow. Fixed: ties now break on
+  the pixel tuple itself, a deterministic secondary key.
+- **`review_region.py`**: `_find_tile_dirs(args.out_dir)` glob-scanned the whole output
+  directory rather than this run's own tile selection, so reusing `--out-dir` across a
+  `--bbox`/`--sample-tiles` change (a real pattern this project has used, expanding
+  Pass B's review area across sessions) could silently mix a stale, out-of-scope tile's
+  answer into a fresh run's `--ops-out`. Fixed: both the answering step and `--ops-out`
+  generation now use this run's own tile list.
+
+**Not changed** (findings judged invalid): a pair of `data/BUILD_LOG.md` entries
+reporting a positive `loss_pp` for a decreased component-length ratio are correct as
+written — that is `validate.py`'s own "how much was lost" convention (paired with an
+explicit "limit Xpp" in the same breath), not a sign error; a §11.4 sentence naming the
+gate suite "seven gates" as a section header is not a claim that all seven ran, and the
+actual per-gate PASS/FAIL breakdown and the `route_shape`-not-run note already follow
+immediately below it; and the junction-merge splice's spliced-chord land-crossing risk
+is already caught by `_sanity_check_no_land_crossings`'s existing skeleton-edge
+`sjoin(predicate="intersects")` pass against the land layer, which genuinely strips
+(not just flags) any skeleton edge — including a junction-merge-spliced one — found to
+cross land; that function's own docstring is stale on this point (says "informational...
+never stripped"), which is a separate, minor, pre-existing documentation bug, not a
+missing safety net.
+
+**Tests**: 477 passed (21 new — `tests/test_graph_cleanup_trace.py` is a new file; the
+rest added to existing files for each fix above). Every fix that could plausibly regress
+silently was checked by reverting just that file and confirming its new test(s) fail
+without the fix, not only that they pass with it.

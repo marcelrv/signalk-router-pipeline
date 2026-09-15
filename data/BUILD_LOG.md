@@ -58,6 +58,10 @@ Nodes/Edges delta.
 | 31 | 2026-09-07 | `eeb3fed` | `data/geojson/va_reclip` (re-derived via `data/raw/us-east-coast/VA`) | same tuning config as #13, applied to `us_east_va_stitched` | Roll out Zeeland's tuning config, region 19/19 (final) | 59,443 | 143,046 | 0 | 17 | 0 | **YES** |
 | 32 | 2026-09-07 | `453586c` (PR #22, `_safe_negative_buffer` fix) | `data/geojson/fl_atl_n1a_reclip` (re-derived via `data/raw/us-east-coast/FL`) | same tuning config as #13, run under `ulimit -v 11GB` | `fl_atl_n1a` retry after root-causing and fixing its OOM (see Details) | 12,207 | 31,491 | 0 | 16 | 0 | **YES** |
 | 39 | 2026-09-11 | `8a7eaad` (`main`, PR #24 merged) | `data/geojson/us-east-md-v5_clipped` (same clip as #37) | same as #37 | Rebuild #37 on the final merged PR #24 code (picks up the post-#37 CodeRabbit fixes: tier-2 component length floor, navmesh-carve fast path) so the deployed MD channel-axes db reflects what actually merged | 62,904 | 164,468 | 0 | 15 | 0 | **YES (replaces #37)** |
+| 40 | 2026-09-12 | `graph-cleanup` branch | n/a — post-processes #39's `.sqlite`, not a rebuild | `apply_cleanup.py` Pass A (`--tolerance-m 20`, smooth + contract + redundant) | First deterministic post-build cleanup: measure how much of the graph comes out with no model at all | 53,930 | 142,196 | 0 | 13 | 0 | no (test build) |
+| 41 | 2026-09-14 | `graph-cleanup` branch | n/a — post-processes #40's `.sqlite` | AI review Pass B, Coltons Point bbox only (16 tiles, 104 candidates), reviewer = this session (Sonnet 5) reading tiles directly, no API | First real Pass B review: 63 keep / 35 drop / 6 unsure -> 40 drop ops applied | 53,890 | 142,116 | 0 | 13 | 0 | no (pilot only) |
+| 42 | 2026-09-14 | `graph-cleanup` branch | n/a — post-processes #40's `.sqlite`, supersedes #41 | AI review Pass B, expanded to ~3x area (-76.95,38.10,-76.63,38.32), 323 candidates/37 tiles, reviewer = this session (Sonnet 5) reading tiles directly, no API | Expanded Pass B review, carrying forward #41's 104 verdicts by candidate_id: 262 keep / 52 drop / 9 unsure -> 69 drop ops applied; render_diff visual comparisons produced | 53,861 | 142,058 | 0 | 13 | 0 | no (review sample only) |
+| 43 | 2026-09-15 | this commit (`skeleton_junction_merge_m` fix, on top of `a859e41`) | `data/geojson/us-east-md-v5_clipped` (same clip as #39) | same as #39 plus `--skeleton-junction-merge-m 35.0` | SPEC-GRAPH-DENSITY.md §11 — fix `coastal_water` mesh-fill (short junction-to-junction edges `_prune_skeleton_spurs` never touches), found reviewing Pass B results visually. Third attempt: 20.0 and 30.0 (both discarded, not logged) barely moved the target location because 502/602 of its junction edges sit at a quantized ~30.4m raster distance; 35.0 clears it | 51,919 | 129,618 | 0 | 15 | 0 | no (see Details — `poi_snap_drift` caveat, not yet decided) |
 
 **Row #1 is not a valid comparison baseline** — its input clip/flags are unknown, so
 its counts cannot be attributed to any specific configuration. It's recorded because
@@ -1694,3 +1698,316 @@ and are no longer present in the repo or scratchpad.
   `data/us_east_md_channel_axes_rebuild_build.log`.
 - **Commit**: `main` @ `8a7eaad` (PR #24 merge commit); this BUILD_LOG update committed
   separately on `main`.
+
+### #40 — `us_east_md_cleanup_a.sqlite` — deterministic post-build cleanup (Pass A)
+
+First run of `apply_cleanup.py` (`docs/SPEC-GRAPH-CLEANUP.md`, branch `graph-cleanup`).
+**Not a rebuild** — it post-processes #39's shipped `.sqlite` in 4.3 s, so it is directly
+comparable to #39 in a way no re-derived build ever is. Cleanup decisions are written to
+`data/md_cleanup_a.ops.jsonl` (17,053 ops) and replay onto any later rebuild, because node
+IDs are coordinate-derived.
+
+```bash
+.venv/bin/python apply_cleanup.py \
+  --db /home/node/signalkdev/signalk-routeiq/data/us_east_md_channel_axes.sqlite \
+  --ops data/md_cleanup_a.ops.jsonl \
+  --out data/us_east_md_cleanup_a.sqlite \
+  --probe 37.8890,-76.2442,39.5338,-75.7875 \
+  --probe 38.2321,-76.9657,38.9750,-76.4850
+#  -> smooth 5,805 / contract 9,087 / redundant 2,161 ops; 16,940 applied, 113 skipped
+#     (skipped are all `not_spliceable`: the chain had already become a triangle)
+```
+
+**Result vs #39**: 62,904 → 53,930 nodes (**−14.3%**), 164,468 → 142,196 edge rows
+(**−13.5%**), 36.9 → 33.4 MB. All seven gates pass, including the two that matter:
+POI-pair reachability 48,228 → 48,228 (zero loss) and largest component by *edge length*
+0.8625 → 0.8621 (+0.05pp). The 186.9 km probe (Little Wicomico River Channel → C&D Canal
+Channel, 1,551 nodes) changed **0.0%** — routes are byte-identical in cost.
+
+**What it fixed.** The over-density complaint, on the layers that had it. Degree-2 node
+counts: `channel_axes` 6,951 → 1,252 (−82%), `inland_waterways` 2,725 → 117 (−96%). Both
+layers were already dead straight (median turn 0.5° and 0.2°) and simply over-sampled at
+76 m / 91 m, so Douglas-Peucker removes them exactly, with no judgement involved.
+
+**What it did NOT fix, and why this matters more than the headline.** The
+`coastal_water` medial-axis skeleton is barely touched: median turn 35.7° → 30.8°, still
+60.8% of its degree-2 nodes over 20°, median segment unchanged at 55 m. Measured cause:
+**the skeleton is a mesh, not a set of lines.** Of the 44,236 nodes touching a skeleton
+edge, 22,095 are degree-3 or more, and of its 5,832 degree-2 chains, 3,675 hold a single
+interior node. Median deviation-from-straight at a skeleton junction is 167°. No
+chain-based pass can reach wobble that lives *between* junctions — that needs either
+`--skeleton-boundary-simplify-m` at generation time or the route-selection judgement of
+Pass B/C.
+
+This also revises the plan's estimate downward: the deterministic ceiling is ~14–16%, not
+the 35–40% predicted. The measured floor is still 15.5% of nodes (all-pairs routing
+between the 262 POI anchors in the main component), so essentially the whole remaining gap
+is judgement work.
+
+**Two regressions the gates caught during development**, both now fixed and covered by
+`tests/test_graph_cleanup.py`:
+1. Splicing deleted 47 POI anchor nodes (Baltimore Harbor Channel, Anacostia Channel, …).
+   Fixed by `trace.protect_poi_nodes()`.
+2. Plain Douglas-Peucker left "Brewerton Channel Eastern Extension" snapping **2,123 m**
+   from its charted position — routeiq's `coverage_gap` warning in the making. Fixed by
+   `contract_chains(max_spacing_m=500)`: shape needs simplification, snapping needs density.
+
+**Hard constraint found**: 3,757 of the 3,807 navmesh nodes are referenced in
+`navmesh_regions.boundary_node_ids` and are loaded as protected. The navmesh waste in
+SPEC-GRAPH-DENSITY.md §10 therefore **cannot** be fixed post-build at all — `vertices`/
+`triangles` are a triangulation, so thinning it means re-triangulating. That work belongs
+at generation time, as §10.6 item 1 already says.
+
+- **Tests**: 393 passed (29 new in `tests/test_graph_cleanup.py`).
+- **Not installed live** — this is the first cleanup build; visual before/after at Coltons
+  Point still outstanding (the check SPEC-GRAPH-DENSITY.md §9.4 has flagged as missing
+  since #34).
+
+### #41 — `us_east_md_sonnet_reviewed.sqlite` — first real Pass B review (Coltons Point pilot)
+
+First real run of Pass B (`docs/SPEC-GRAPH-CLEANUP.md` §6.6), on top of #40's cleaned
+database, restricted to the Coltons Point bbox (`-76.90,38.15,-76.68,38.27`) via
+`review_region.py --bbox`. **No Anthropic API key was available in the building
+session** — the 16 tiles were reviewed by the session itself (running as Claude Sonnet 5)
+reading `chart.png`/`candidates.png`/`context.json` directly and writing `answer.json` by
+hand in the exact schema the pipeline expects, using normal Claude Code usage rather than
+metered API billing. `graph_cleanup/backends/claude.py` (the scripted API path) remains
+unexercised against a live key.
+
+```bash
+.venv/bin/python review_region.py \
+  --db data/us_east_md_cleanup_a.sqlite \
+  --input-dir data/geojson/us-east-md-v5_clipped \
+  --out-dir <tiles dir> --bbox=-76.90,38.15,-76.68,38.27 --prepare-only
+#  -> 104 candidates (6,867 statewide, restricted to 104 in-bbox): 6,639 dead_end_stub,
+#     228 small_component -> 16 tiles
+# (16 tiles reviewed by hand against the real chart, per docs/SPEC-GRAPH-CLEANUP.md 6.6)
+.venv/bin/python apply_cleanup.py \
+  --db data/us_east_md_cleanup_a.sqlite \
+  --ops data/md_coltons_sonnet_review.ops.jsonl --replay \
+  --out data/us_east_md_sonnet_reviewed.sqlite \
+  --probe 37.8890,-76.2442,39.5338,-75.7875
+```
+
+**Result**: 63 keep / 35 drop / 6 unsure across 104 candidates -> 40 `drop_node` ops (a
+`small_component` or multi-node stub drop removes more than one node per verdict). 53,930
+-> 53,890 nodes (-40, -0.1% — expected at pilot scale, one bbox of one state). All seven
+gates pass, including POI-pair reachability (0 lost) and the 187 km route probe (0.0%
+change).
+
+**The result that matters is qualitative, not the node count.** The same 104 candidates
+were also answered by `MockBackend` for comparison: 76 drop / 28 keep / 0 unsure -> 110
+ops — nearly **triple** the real review's drop count. Root cause, found only by actually
+looking at the rendered tiles: `nearest_poi_m` (candidates.py's main signal) is measured
+against the `pois` table only, which has no entries for lateral marks, lights, or named
+daybeacons — so a stub sitting right next to "Combs Creek Daybeacon 4" or inside a named,
+marked tidal creek can still show a `nearest_poi_m` of several kilometres. A distance-only
+rule (what `MockBackend` uses, and what a naive Pass-A heuristic would use) systematically
+over-drops real water for this reason. **Action item, not yet implemented**: extend the
+nearest-feature search in `candidates.py` to also cover `lateral_marks_points` and named
+waterway lines, not just `pois`.
+
+**A generalizable pattern did emerge from the real review**: every `dead_end_stub` marked
+`drop` (35/35) was a short stub reaching a plain, unremarkable point of open shoreline —
+no cove, marsh, marina, or named feature — usually one of a cluster of 4-8 such stubs
+around the same headland. Every `keep` reached real charted marsh/creek water, sat near a
+named channel, or was the tail end of an already-marked fairway. Candidate rule for a
+future deterministic Pass A pass (needs a larger sample before trusting it): a stub with
+the unknown-depth sentinel, short length, and a corridor touching no
+fairway/caution/marsh-classified polygon is very likely droppable without a model at all.
+
+All 8 `small_component` candidates in this sample were kept (real, if disconnected, marsh
+ponds) — too small a sample (8) to conclude components rarely need dropping.
+
+- **Not deployed** — pilot only, one bbox, meant to validate the harness and prompt before
+  a wider run.
+- **Tests**: 436 passed (no code changes this session, docs only).
+
+### #42 — `us_east_md_expanded_reviewed.sqlite` — expanded Pass B review (~3x area) + render_diff
+
+Expands #41's Coltons Point pilot to a superset bbox (`-76.95,38.10,-76.63,38.32`,
+323 candidates / 37 tiles, up from 104/16). #41's 104 verdicts were carried forward by
+`candidate_id` (stable, node-id-derived) rather than re-reviewed; only the 219 genuinely
+new candidates needed fresh judgement. Same method as #41 — no Anthropic API key
+available, so the building session itself (Sonnet 5) read every tile directly and wrote
+`answer.json` by hand.
+
+```bash
+.venv/bin/python review_region.py \
+  --db data/us_east_md_cleanup_a.sqlite \
+  --input-dir data/geojson/us-east-md-v5_clipped \
+  --out-dir <tiles dir> --bbox=-76.95,38.10,-76.63,38.32 --prepare-only
+#  -> 323 candidates -> 37 tiles
+# (37 tiles reviewed by hand; 12 fully covered by #41's carried-forward verdicts)
+.venv/bin/python apply_cleanup.py \
+  --db data/us_east_md_cleanup_a.sqlite \
+  --ops data/md_expanded_review.ops.jsonl --replay \
+  --out data/us_east_md_expanded_reviewed.sqlite \
+  --probe 37.8890,-76.2442,39.5338,-75.7875
+```
+
+**Result**: 262 keep / 52 drop / 9 unsure across 323 candidates → 69 `drop_node` ops.
+53,930 → 53,861 nodes (-69, -0.1%). All seven gates pass, route probe unchanged (0.0%).
+
+**Structural findings this round confirms or adds** (full writeup:
+`docs/SPEC-GRAPH-CLEANUP.md` §6.7):
+
+- **Keep rate is regional, not a constant.** 61% in the headland-heavy pilot vs. 81% here,
+  where the area is dominated by real tidal creek systems (Nomini Creek, Lower
+  Machodoc/Glebe Creek, Cuckold Creek, the Wicomico River, Breton Bay/Saint Clements Bay).
+  A statewide sample needs to stratify by coastline type or its headline number mostly
+  measures which regions got sampled.
+- **The "plain shoreline stub → drop" pattern held with zero exceptions across all 52
+  drops**, not just #41's 35 — a short stub reaching an unremarkable point of open
+  shoreline, usually one of 4-8 near-identical stubs around one headland, no cove/marsh/
+  named feature under any of them. Strong enough now to prototype as a deterministic
+  Pass A rule (stub with the unknown-depth sentinel + short length + no
+  fairway/caution/marsh polygon nearby), pending validation against a held-out sample.
+- **All 20 `small_component` candidates seen across both rounds (8 + 12) were `keep`** —
+  real, if disconnected, marsh/cove water every time. Argues against spending effort on a
+  small-component-specific drop heuristic on current evidence.
+- **`nearest_poi_m`'s blind spot (first found in #41) reproduced again**: several drops/
+  keeps this round depended on recognizing a named daybeacon or a real creek shape that
+  the `pois`-table-only distance metric reported as kilometres away. Now the clearest,
+  best-evidenced fix available: extend the search to `lateral_marks_points`.
+- **A few genuinely `unsure` cases**: two narrow unnamed barrier-island breaches inside a
+  charted restricted zone, and stubs reaching toward small mid-water islets — real
+  ambiguity the current heuristic can't resolve at this render scale, correctly left as
+  `unsure` → `keep` rather than forced.
+
+**Visual comparison, per the user's request to see results directly, not just counts**:
+new `render_diff()` (`graph_cleanup/render.py`) draws one picture — the surviving graph
+in its ordinary colours, everything removed as a bold dashed red line with a red dot at
+every vanished vertex. Two renders produced over the full expanded bbox:
+`data/BUILD_LOG.md`-adjacent scratch files (not committed, regenerable from the ops
+files above) showed (a) Pass A output → Pass A + Pass B: every removed node lands on a
+headland, none inside a creek; (b) the original pre-Pass-A build
+(`us_east_md_channel_axes.sqlite`) → the final result: a dense red trail along every
+`channel_axes` line (Pass A's Douglas-Peucker over-density fix, §4.5, made visible) plus
+the same headland drops on top.
+
+- **Not deployed** — review sample, same as #41.
+- **Tests**: 437 passed (2 new in `tests/test_graph_cleanup_render.py` for `render_diff`/
+  `diff_removed`).
+
+### #43 — `us_east_md_junction_merge_v3.sqlite` — fix `coastal_water` mesh-fill (root cause, `skeleton_junction_merge_m`)
+
+Found while reviewing #42's `render_diff` output visually (per the user's request):
+a dense ~190-node patch near Cuckold Creek that turned out to be statewide (85% of
+`coastal_water` nodes have degree >= 4, only 14.9% the expected degree-2). Root cause
+and fix design: `docs/SPEC-GRAPH-DENSITY.md` §11. Unlike #40-42 (post-hoc
+`graph_cleanup` ops on a built `.sqlite`), this is a `nautical_routing_pipeline.py`
+generation-time fix — a full rebuild, not a replay.
+
+```bash
+ulimit -Sv $((11*1024*1024))
+.venv/bin/python3 nautical_routing_pipeline.py \
+  --input-dir data/geojson/us-east-md-v5_clipped \
+  --output data/us_east_md_junction_merge_v3.sqlite \
+  --country US --name "us-east-md-v5-junction-merge-v3" \
+  --description "US coastal waters (us-east-md-v5-junction-merge-v3), based on NOAA ENCs" \
+  --tags '["noaa","enc","coastal"]' \
+  --url "https://github.com/marcelrv/signalk-router-data" \
+  --license "Public Domain (NOAA)" --copyright "NOAA Office of Coast Survey" \
+  --depth-ceiling 6.0 \
+  --coverage-bbox="-77.4,37.88,-74.68,39.63" \
+  --sagitta-cap 250.0 --max-segment-m 2000 \
+  --axis-dedup-cap 100.0 --axis-dedup-floor-m 100.0 \
+  --min-navmesh-radius-m 1200.0 \
+  --connector-merge-m 5.0 \
+  --inland-densify-max-segment-m 120.0 \
+  --pass2-max-fanin-per-node 6 \
+  --pass0-target-fanin-cap 4 \
+  --node-merge-m 5.0 \
+  --narrow-fragment-reclass-max-fraction 0.5 \
+  --pass0-fanin-cap 6 \
+  --pass0-cross-type-first \
+  --skeleton-boundary-simplify-m 20.0 \
+  --skeleton-junction-merge-m 35.0 \
+  --channel-axes
+```
+
+Same as build #39's command with one additive flag (`--skeleton-junction-merge-m
+35.0`) — `derive_channel_axes.py` was not re-run; `channel_axes_lines.geojson` was
+already current from #39-#42.
+
+**Three attempts — the first two are the actual finding here, not a footnote.** A
+piece-level test (§11.3: a standalone ~4.4km polygon clipped directly from the source
+GeoJSON, fed straight to `build_skeleton_network`) measured a clean 45% node reduction
+at 20.0m and recommended it. A full MD rebuild at 20.0m barely moved the motivating
+location (Cuckold Creek: 190 → 192 nodes) — the real pipeline processes this whole
+water body as one enormous piece (`build_skeleton_network` called with polygon bounds
+spanning `-77.38,37.88` to `-75.57,39.61`, not the small standalone clip the piece-level
+test used), and 502 of the 602 junction-to-junction edges remaining in the real build's
+Cuckold Creek blob sit at a single quantized raster distance of ~30.4m — a
+`pixel_size_m=10.0` (the ceiling) rasterization artifact invisible to the piece-level
+test, which happened to rasterize differently. A second attempt at 30.0m (still below
+30.4m) also barely moved it (186 nodes). **35.0m**, tried third, clears the cluster with
+real margin.
+
+| location | metric | baseline (#39) | 20.0 (discarded) | 30.0 (discarded) | **35.0 (this build)** |
+|---|---|---|---|---|---|
+| Cuckold Creek blob (1.7km² box) | nodes | 190 | 192 | 186 | **33** |
+| Cuckold Creek blob | internal edges | 622 | 628 | 614 | **92** |
+| statewide | nodes | 62,904 | 60,029 (-4.6%) | not measured | **51,919 (-17.5%)** |
+| statewide | edges (undirected) | 82,233 | 77,683 (-5.5%) | not measured | **64,808 (-21.2%)** |
+
+`graph_cleanup/validate.py`'s seven gates, this build vs. baseline #39:
+
+```
+[PASS] crosses_land: 0 -> 0
+[PASS] largest_component_by_length: 0.8625 -> 0.8620 (+0.05pp, limit 0.5pp)
+[PASS] poi_pair_reachability: 48539 pairs -> 48539, 0 lost
+[FAIL] poi_snap_drift: 2 POIs snap >50m further than before
+[PASS] counts: nodes 62904 -> 51919 (-17.5%), edges 82233 -> 64808 (-21.2%)
+[PASS] hubs: 0 nodes with out-degree > 30, max 15
+```
+
+(`route_shape` not run — no probe pairs supplied. Reachable-pairs count re-measured
+after a code review fixed a real bug in `NodeIndex.nearest()` — was 48228 at first
+measurement; see the Details entry below and `docs/SPEC-GRAPH-DENSITY.md` §11.5.)
+
+**The `poi_snap_drift` caveat**: both flagged POIs are the same real-world landmark —
+duplicate entries for the William P. Lane Jr. Memorial (Chesapeake Bay) Bridge, ~140m
+apart (`38.98458,-76.34537`: 13m→169m, +156m; `38.98580,-76.34502`: 137m→213m, +76m).
+This is open water in the upper Chesapeake Bay — the same class of area as Cuckold
+Creek — and the fix thinned a locally dense mesh there too (74→47 nodes in a 1km box
+around the bridge). POI-pair reachability is unaffected; this reads as a plausible,
+benign consequence of removing genuine mesh-fill near a large linear landmark rather
+than a routing defect, but it is exactly the kind of headline-looks-fine regression
+`validate.py` exists to catch (builds #11/#12), so it is **not waved off** — not yet
+decided whether to accept it, raise `max_snap_drift_m` for open-water contexts, or
+investigate further.
+
+- **Not deployed** — pending the `poi_snap_drift` decision above and a visual
+  re-render of Cuckold Creek to confirm the picture itself (not just the counts) reads
+  clean, and re-examination of the buoy/fairway-connection appearance from the
+  original visual complaint now that the surrounding clutter is thinned.
+- **A real bug caught mid-implementation, not by any synthetic test**: an early version
+  of the fix assumed `nx.Graph.edges()` returns `(u, v)` in the same order the edge was
+  added with; ~26% of edges on the real piece come back reversed, which silently
+  spliced the merge substitution into the wrong end and fragmented the largest
+  component into 3 pieces on the real Cuckold Creek piece (488→222/56/5 nodes) — not
+  caught by any of the 15 synthetic-fixture tests written first, only by piece-level
+  testing against real geometry. Fixed (`_splice_junction_merge_into_edge_pts`,
+  matches pixels to ends via their own known `lonlat`) with dedicated regression tests
+  pinning both orderings. Full story: `docs/SPEC-GRAPH-DENSITY.md` §11.2.
+- **Post-merge code review (CodeRabbit) on the PR bundling this with the earlier Pass
+  A/B `graph_cleanup` package found 12 valid, real bugs (3 more findings checked and
+  judged not valid) — fixed, no rebuild needed except re-running `validate.py`'s gates
+  above. Two are load-bearing for this entry's own numbers: `largest_component_length_
+  fraction` picked the node-count-largest component, not the length-largest (didn't
+  change this build's result — verified the two coincide by a huge margin here — but
+  was a real bug); `NodeIndex.nearest()`'s bucket search returned on the first non-empty
+  ring instead of checking whether a closer node existed in the next one out, which did
+  change a number above (`poi_pair_reachability` 48228 → 48539, zero pairs ever lost
+  either way). The other 10 (protected-node enforcement, a splice weight-preservation
+  gap, an ops-file-written-before-gates-pass bug, an incomplete-answer-accepted-as-done
+  gap, a tile-bbox-too-small-for-long-stubs gap, a rendering bbox-filter gap that
+  dropped edges spanning clean across a tile, `render_diff` missing buoy/mark/navmesh
+  context `render_tile` has, a redundant safety floor, a non-deterministic tie-break,
+  and a stale-tile-directory-reuse gap) don't affect any number in this log. Full
+  per-finding reasoning: `docs/SPEC-GRAPH-DENSITY.md` §11.5.
+- **Tests**: 477 passed (21 new: `tests/test_graph_cleanup_trace.py` is a new file; the
+  rest added to existing files, one set per fix above, each confirmed to fail without
+  its fix).

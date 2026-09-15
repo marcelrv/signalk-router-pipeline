@@ -8,3 +8,5 @@ scipy>=1.10.0
 scikit-image>=0.22   # medial_axis + distance transform in one call (skeleton centerlines)
 rasterio>=1.3         # polygon rasterization + affine transform bookkeeping
 triangle>=20230923    # constrained Delaunay (PSLG) triangulation for navmesh_regions
+matplotlib>=3.7       # graph_cleanup/render.py -- chart/graph tiles for visual review
+anthropic>=1.5        # graph_cleanup/backends/claude.py -- Pass B/C AI review backend
