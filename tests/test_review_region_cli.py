@@ -88,6 +88,55 @@ def test_mock_backend_end_to_end_writes_ops(tmp_path):
     assert ops_out.exists()
 
 
+def test_reusing_out_dir_ignores_a_stale_tile_from_an_earlier_run(tmp_path):
+    """A stale tile directory left in --out-dir by an earlier, differently-
+    scoped run (a different --bbox or --sample-tiles) must not be answered or
+    included in --ops-out -- only this run's own tiles. `_find_tile_dirs`
+    globs the whole directory and would previously pick up anything with a
+    context.json, mixing an out-of-scope answer into a fresh run's output."""
+    db = tmp_path / "g.sqlite"
+    _make_db(db)
+    input_dir = tmp_path / "geo"
+    _make_geojson(input_dir)
+    out_dir = tmp_path / "tiles"
+
+    # A stale tile directory, as if left over from an earlier run with a
+    # different scope: its own context.json/manifest.json/answer.json,
+    # naming a node this run's own database doesn't even have -- so if it
+    # were picked up, it would show up as an extra drop op.
+    stale_dir = out_dir / "t0_stale_9999"
+    stale_dir.mkdir(parents=True)
+    (stale_dir / "context.json").write_text(json.dumps({
+        "tile_id": "t0_stale_9999", "bbox": [0, 0, 1, 1],
+        "candidates": [{"n": 1, "kind": "dead_end_stub", "candidate_id": "stub:999999"}],
+    }))
+    (stale_dir / "manifest.json").write_text(json.dumps({
+        # Two nodes: dead_end_stub drops nodes[:-1] (everything but the
+        # junction end), so this must have more than one node to produce a
+        # real op -- a single-node list would drop nothing regardless.
+        "1": {"candidate_id": "stub:999999", "kind": "dead_end_stub",
+              "nodes": [999999, 999998]},
+    }))
+    (stale_dir / "answer.json").write_text(json.dumps({
+        "1": {"verdict": "drop", "why": "stale, out-of-scope answer"},
+    }))
+
+    ops_out = tmp_path / "ai.ops.jsonl"
+    rc = review_region.main(["--db", str(db), "--input-dir", str(input_dir),
+                             "--out-dir", str(out_dir), "--backend", "mock",
+                             "--ops-out", str(ops_out)])
+    assert rc == 0
+
+    from graph_cleanup import ops as ops_mod
+    written_ops = list(ops_mod.read_ops(str(ops_out)))
+    assert all(op.node != 999999 for op in written_ops), \
+        "the stale tile's answer must not leak into this run's ops"
+
+    # The stale directory itself is untouched by this run.
+    assert json.loads((stale_dir / "answer.json").read_text())["1"]["why"] == \
+        "stale, out-of-scope answer"
+
+
 def test_bbox_filters_candidates(tmp_path, capsys):
     db = tmp_path / "g.sqlite"
     _make_db(db)

@@ -5795,7 +5795,14 @@ class NauticalRoutingPipeline:
         for members in clusters.values():
             if len(members) < 2:
                 continue
-            representative = max(members, key=lambda p: G.nodes[p]["dist_val"])
+            # `members` is populated from `junctions`, a set -- iteration
+            # order isn't guaranteed, so a tie on `dist_val` must not be
+            # broken by it: the pixel tuple itself is the deterministic
+            # secondary key, or two independently-built adjacent regions
+            # could disagree about a shared seam node's representative,
+            # violating this file's bit-for-bit reproducibility contract
+            # (see MEDIAL_AXIS_SEED for the same class of concern elsewhere).
+            representative = min(members, key=lambda p: (-G.nodes[p]["dist_val"], p))
             rep_lonlat = G.nodes[representative]["lonlat"]
             for p in members:
                 if p != representative:

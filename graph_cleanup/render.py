@@ -203,48 +203,28 @@ def _scale_bar_length_m(bbox: BBox) -> float:
     return 50000.0
 
 
-def render_tile(bbox: BBox, out_path: str,
-                 graph: Optional[RoutingGraph] = None,
-                 input_dir: Optional[str] = None,
-                 config: Optional[RenderConfig] = None,
-                 numbered_nodes: Optional[Dict[int, int]] = None) -> str:
-    """Render one PNG: chart context (if `input_dir` given) with the graph
-    (if `graph` given) drawn over it. At least one of the two must be given.
-
-    `numbered_nodes` maps a node id to a display number, for a Pass B/C
-    candidates image -- drawn as a boxed label at the node's position.
+def _draw_chart_context(ax, bbox: BBox, cfg: RenderConfig, legend_handles: list,
+                        input_dir: Optional[str] = None,
+                        source_db: Optional[str] = None) -> None:
+    """Everything on the chart that isn't the routing graph itself: navmesh
+    region shading, polygon context layers, point layers (obstructions/safe-
+    water marks), and lateral marks. Shared by `render_tile` and `render_diff`
+    so a removal diff shows the same hazard/navigation context a reviewer
+    gets from an ordinary tile -- a diff that only drew polygon layers hid
+    exactly the buoys/marks a reviewer needs to judge a removal by.
     """
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
+    if not cfg.show_context:
+        return
     from matplotlib.lines import Line2D
     from matplotlib.patches import Rectangle
 
-    if graph is None and input_dir is None:
-        raise ValueError("render_tile needs a graph, an input_dir, or both")
-
-    cfg = config or RenderConfig()
-    min_lon, min_lat, max_lon, max_lat = bbox
-    lat_mid = (min_lat + max_lat) / 2.0
-    aspect = math.cos(math.radians(lat_mid))  # so 1 deg lon == aspect deg lat, visually
-
-    fig_w = cfg.width_px / cfg.dpi
-    fig_h = cfg.height_px / cfg.dpi
-    fig, ax = plt.subplots(figsize=(fig_w, fig_h), dpi=cfg.dpi)
-    ax.set_xlim(min_lon, max_lon)
-    ax.set_ylim(min_lat, max_lat)
-    ax.set_aspect(1.0 / aspect)
-    ax.set_facecolor("#eef6fb")
-
-    legend_handles = []
-
-    if graph is not None and graph.source_db and cfg.show_context:
+    if source_db:
         from matplotlib.patches import Polygon as MplPolygon
 
         # zorder 3.5: above every CONTEXT_LAYERS polygon (max zorder 3, e.g.
         # depare_polygons at 1 painting opaque over anything underneath), below
         # marks/edges/nodes -- otherwise the tint is invisibly painted over.
-        regions = _load_navmesh_regions(graph.source_db, bbox)
+        regions = _load_navmesh_regions(source_db, bbox)
         drew_region = False
         for geom in regions:
             coords = geom.get("coordinates") or []
@@ -263,53 +243,92 @@ def render_tile(bbox: BBox, out_path: str,
                                             label="navmesh region (funnel-routed, "
                                                   "interior not shown as edges)"))
 
-    if cfg.show_context and input_dir:
-        for name, face, edge, z, label in CONTEXT_LAYERS:
-            if name == "land_polygons" and not cfg.show_land:
-                continue
-            gdf = _load_layer(input_dir, name, bbox, geom_types=("Polygon", "MultiPolygon"))
-            if gdf is None:
-                continue
-            gdf.plot(ax=ax, facecolor=face, edgecolor=edge, linewidth=0.5, zorder=z)
-            if label and cfg.show_legend:
-                legend_handles.append(Rectangle((0, 0), 1, 1, facecolor=face,
-                                                edgecolor=edge if edge != "none" else face,
-                                                label=label))
+    if not input_dir:
+        return
 
-        for name, face, edge, marker, size, z, label in POINT_LAYERS:
-            gdf = _load_layer(input_dir, name, bbox, geom_types=("Point",))
-            if gdf is None:
-                continue
-            # 'x' is an unfilled (stroke-only) marker -- matplotlib warns and
-            # ignores edgecolor for those, so only pass it for filled markers.
-            kw = dict(edgecolor=edge, linewidth=0.4) if marker != "x" else dict(linewidth=1.2)
-            ax.scatter(gdf.geometry.x, gdf.geometry.y, marker=marker, s=size,
-                      color=face, zorder=z, **kw)
+    for name, face, edge, z, label in CONTEXT_LAYERS:
+        if name == "land_polygons" and not cfg.show_land:
+            continue
+        gdf = _load_layer(input_dir, name, bbox, geom_types=("Polygon", "MultiPolygon"))
+        if gdf is None:
+            continue
+        gdf.plot(ax=ax, facecolor=face, edgecolor=edge, linewidth=0.5, zorder=z)
+        if label and cfg.show_legend:
+            legend_handles.append(Rectangle((0, 0), 1, 1, facecolor=face,
+                                            edgecolor=edge if edge != "none" else face,
+                                            label=label))
+
+    for name, face, edge, marker, size, z, label in POINT_LAYERS:
+        gdf = _load_layer(input_dir, name, bbox, geom_types=("Point",))
+        if gdf is None:
+            continue
+        # 'x' is an unfilled (stroke-only) marker -- matplotlib warns and
+        # ignores edgecolor for those, so only pass it for filled markers.
+        kw = dict(edgecolor=edge, linewidth=0.4) if marker != "x" else dict(linewidth=1.2)
+        ax.scatter(gdf.geometry.x, gdf.geometry.y, marker=marker, s=size,
+                  color=face, zorder=z, **kw)
+        if cfg.show_legend:
+            legend_handles.append(Line2D([], [], marker=marker, linestyle="",
+                                         color=face, markeredgecolor=edge,
+                                         label=label))
+
+    if cfg.show_marks:
+        marks = _load_layer(input_dir, "lateral_marks_points", bbox)
+        if marks is not None:
+            for _, row in marks.iterrows():
+                catlam = row.get("CATLAM")
+                color = "#2e8b57" if catlam == CATLAM_PORT else (
+                    "#c0392b" if catlam == CATLAM_STARBOARD else "#555555")
+                pt = row.geometry
+                ax.scatter([pt.x], [pt.y], marker="^", s=22, color=color,
+                          edgecolor="black", linewidth=0.3, zorder=6)
+                name = row.get("OBJNAM")
+                if name:
+                    ax.annotate(str(name), (pt.x, pt.y), fontsize=3.2,
+                               color="#333333", zorder=6,
+                               xytext=(2, 2), textcoords="offset points")
             if cfg.show_legend:
-                legend_handles.append(Line2D([], [], marker=marker, linestyle="",
-                                             color=face, markeredgecolor=edge,
-                                             label=label))
+                legend_handles.append(Line2D([], [], marker="^", linestyle="",
+                                             color="#2e8b57", label="port mark"))
+                legend_handles.append(Line2D([], [], marker="^", linestyle="",
+                                             color="#c0392b", label="starboard mark"))
 
-        if cfg.show_marks:
-            marks = _load_layer(input_dir, "lateral_marks_points", bbox)
-            if marks is not None:
-                for _, row in marks.iterrows():
-                    catlam = row.get("CATLAM")
-                    color = "#2e8b57" if catlam == CATLAM_PORT else (
-                        "#c0392b" if catlam == CATLAM_STARBOARD else "#555555")
-                    pt = row.geometry
-                    ax.scatter([pt.x], [pt.y], marker="^", s=22, color=color,
-                              edgecolor="black", linewidth=0.3, zorder=6)
-                    name = row.get("OBJNAM")
-                    if name:
-                        ax.annotate(str(name), (pt.x, pt.y), fontsize=3.2,
-                                   color="#333333", zorder=6,
-                                   xytext=(2, 2), textcoords="offset points")
-                if cfg.show_legend:
-                    legend_handles.append(Line2D([], [], marker="^", linestyle="",
-                                                 color="#2e8b57", label="port mark"))
-                    legend_handles.append(Line2D([], [], marker="^", linestyle="",
-                                                 color="#c0392b", label="starboard mark"))
+
+def render_tile(bbox: BBox, out_path: str,
+                 graph: Optional[RoutingGraph] = None,
+                 input_dir: Optional[str] = None,
+                 config: Optional[RenderConfig] = None,
+                 numbered_nodes: Optional[Dict[int, int]] = None) -> str:
+    """Render one PNG: chart context (if `input_dir` given) with the graph
+    (if `graph` given) drawn over it. At least one of the two must be given.
+
+    `numbered_nodes` maps a node id to a display number, for a Pass B/C
+    candidates image -- drawn as a boxed label at the node's position.
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.lines import Line2D
+
+    if graph is None and input_dir is None:
+        raise ValueError("render_tile needs a graph, an input_dir, or both")
+
+    cfg = config or RenderConfig()
+    min_lon, min_lat, max_lon, max_lat = bbox
+    lat_mid = (min_lat + max_lat) / 2.0
+    aspect = math.cos(math.radians(lat_mid))  # so 1 deg lon == aspect deg lat, visually
+
+    fig_w = cfg.width_px / cfg.dpi
+    fig_h = cfg.height_px / cfg.dpi
+    fig, ax = plt.subplots(figsize=(fig_w, fig_h), dpi=cfg.dpi)
+    ax.set_xlim(min_lon, max_lon)
+    ax.set_ylim(min_lat, max_lat)
+    ax.set_aspect(1.0 / aspect)
+    ax.set_facecolor("#eef6fb")
+
+    legend_handles = []
+    _draw_chart_context(ax, bbox, cfg, legend_handles, input_dir=input_dir,
+                        source_db=graph.source_db if graph is not None else None)
 
     if graph is not None:
         seen_styles = set()
@@ -318,7 +337,7 @@ def render_tile(bbox: BBox, out_path: str,
             a, b = graph.nodes.get(u), graph.nodes.get(v)
             if a is None or b is None:
                 continue
-            if not _in_bbox(a.lat, a.lon, bbox) and not _in_bbox(b.lat, b.lon, bbox):
+            if not _segment_intersects_bbox(a.lat, a.lon, b.lat, b.lon, bbox):
                 continue
             if e.edge_kind_id == 1:  # navmesh_boundary
                 color, lw, alpha, label = NAVMESH_BOUNDARY_STYLE
@@ -376,6 +395,39 @@ def render_tile(bbox: BBox, out_path: str,
 def _in_bbox(lat: float, lon: float, bbox: BBox) -> bool:
     min_lon, min_lat, max_lon, max_lat = bbox
     return min_lon <= lon <= max_lon and min_lat <= lat <= max_lat
+
+
+def _segment_intersects_bbox(lat0: float, lon0: float, lat1: float, lon1: float,
+                             bbox: BBox) -> bool:
+    """True if the segment from (lat0,lon0) to (lat1,lon1) touches `bbox` at
+    all -- including a long edge that spans clean across the box with both
+    endpoints outside it (a simplified/contracted or removed edge can easily
+    be longer than one tile), which an endpoints-only check drops entirely.
+    Liang-Barsky line clipping against the axis-aligned box.
+    """
+    if _in_bbox(lat0, lon0, bbox) or _in_bbox(lat1, lon1, bbox):
+        return True
+    min_lon, min_lat, max_lon, max_lat = bbox
+    dlon, dlat = lon1 - lon0, lat1 - lat0
+    t0, t1 = 0.0, 1.0
+    for p, q in ((-dlon, lon0 - min_lon), (dlon, max_lon - lon0),
+                 (-dlat, lat0 - min_lat), (dlat, max_lat - lat0)):
+        if p == 0:
+            if q < 0:
+                return False  # parallel to this edge and entirely outside it
+            continue
+        r = q / p
+        if p < 0:
+            if r > t1:
+                return False
+            if r > t0:
+                t0 = r
+        else:
+            if r < t0:
+                return False
+            if r < t1:
+                t1 = r
+    return t0 <= t1
 
 
 def _draw_graticule(ax, bbox: BBox, target_lines: int = 4) -> None:
@@ -488,20 +540,15 @@ def render_diff(bbox: BBox, out_path: str, before_db: str, after_db: str,
     ax.set_facecolor("#eef6fb")
 
     legend_handles = []
-    if cfg.show_context and input_dir:
-        for name, face, edge, z, label in CONTEXT_LAYERS:
-            if name == "land_polygons" and not cfg.show_land:
-                continue
-            gdf = _load_layer(input_dir, name, bbox, geom_types=("Polygon", "MultiPolygon"))
-            if gdf is not None:
-                gdf.plot(ax=ax, facecolor=face, edgecolor=edge, linewidth=0.5, zorder=z)
+    _draw_chart_context(ax, bbox, cfg, legend_handles, input_dir=input_dir,
+                        source_db=g_after.source_db)
 
     n_removed_drawn = 0
     for (u, v), e in removed_edges.items():
         a, b = g_before.nodes.get(u), g_before.nodes.get(v)
         if a is None or b is None:
             continue
-        if not _in_bbox(a.lat, a.lon, bbox) and not _in_bbox(b.lat, b.lon, bbox):
+        if not _segment_intersects_bbox(a.lat, a.lon, b.lat, b.lon, bbox):
             continue
         ax.plot([a.lon, b.lon], [a.lat, b.lat], color="#d81e1e", linewidth=1.8,
                 alpha=0.9, zorder=7, linestyle=(0, (3, 2)), solid_capstyle="round")
@@ -519,7 +566,7 @@ def render_diff(bbox: BBox, out_path: str, before_db: str, after_db: str,
         a, b = g_after.nodes.get(u), g_after.nodes.get(v)
         if a is None or b is None:
             continue
-        if not _in_bbox(a.lat, a.lon, bbox) and not _in_bbox(b.lat, b.lon, bbox):
+        if not _segment_intersects_bbox(a.lat, a.lon, b.lat, b.lon, bbox):
             continue
         if e.edge_kind_id == 1:
             color, lw, alpha, label = NAVMESH_BOUNDARY_STYLE

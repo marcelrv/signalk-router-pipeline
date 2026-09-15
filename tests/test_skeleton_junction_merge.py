@@ -131,6 +131,20 @@ class TestMergeCloseSkeletonJunctionsUnit:
         G, A, B = self._two_junction_graph(gap_m=25.0)
         assert p._merge_close_skeleton_junctions(G, 25.0) == {}
 
+    def test_tied_dist_val_breaks_deterministically_on_the_pixel_tuple(self):
+        """`members` is built from a set (`junctions`), so its iteration order
+        is not something the representative choice may depend on -- a tie on
+        `dist_val` must fall back to a deterministic secondary key (the pixel
+        tuple itself), or two independently-built adjacent regions could
+        disagree about a shared seam node's representative."""
+        p = _pipeline()
+        G, A, B = self._two_junction_graph(gap_m=10.0)
+        G.nodes[A]["dist_val"] = 5.0
+        G.nodes[B]["dist_val"] = 5.0  # tied -- A < B by tuple order (("A",) < ("B",))
+        merge_map = p._merge_close_skeleton_junctions(G, 25.0)
+        assert merge_map == {B: G.nodes[A]["lonlat"]}, \
+            "on a tie, the lexicographically smaller pixel tuple wins, not iteration order"
+
     def test_dead_end_neighbour_of_a_junction_is_never_merged(self):
         """A single degree-1 endpoint sitting close to a junction must never be
         folded in -- only genuine degree>=3 junction pixels are eligible, or a

@@ -1957,13 +1957,15 @@ real margin.
 ```
 [PASS] crosses_land: 0 -> 0
 [PASS] largest_component_by_length: 0.8625 -> 0.8620 (+0.05pp, limit 0.5pp)
-[PASS] poi_pair_reachability: 48228 pairs -> 48228, 0 lost
+[PASS] poi_pair_reachability: 48539 pairs -> 48539, 0 lost
 [FAIL] poi_snap_drift: 2 POIs snap >50m further than before
 [PASS] counts: nodes 62904 -> 51919 (-17.5%), edges 82233 -> 64808 (-21.2%)
 [PASS] hubs: 0 nodes with out-degree > 30, max 15
 ```
 
-(`route_shape` not run — no probe pairs supplied.)
+(`route_shape` not run — no probe pairs supplied. Reachable-pairs count re-measured
+after a code review fixed a real bug in `NodeIndex.nearest()` — was 48228 at first
+measurement; see the Details entry below and `docs/SPEC-GRAPH-DENSITY.md` §11.5.)
 
 **The `poi_snap_drift` caveat**: both flagged POIs are the same real-world landmark —
 duplicate entries for the William P. Lane Jr. Memorial (Chesapeake Bay) Bridge, ~140m
@@ -1990,4 +1992,22 @@ investigate further.
   testing against real geometry. Fixed (`_splice_junction_merge_into_edge_pts`,
   matches pixels to ends via their own known `lonlat`) with dedicated regression tests
   pinning both orderings. Full story: `docs/SPEC-GRAPH-DENSITY.md` §11.2.
-- **Tests**: 456 passed (19 new in `tests/test_skeleton_junction_merge.py`).
+- **Post-merge code review (CodeRabbit) on the PR bundling this with the earlier Pass
+  A/B `graph_cleanup` package found 12 valid, real bugs (3 more findings checked and
+  judged not valid) — fixed, no rebuild needed except re-running `validate.py`'s gates
+  above. Two are load-bearing for this entry's own numbers: `largest_component_length_
+  fraction` picked the node-count-largest component, not the length-largest (didn't
+  change this build's result — verified the two coincide by a huge margin here — but
+  was a real bug); `NodeIndex.nearest()`'s bucket search returned on the first non-empty
+  ring instead of checking whether a closer node existed in the next one out, which did
+  change a number above (`poi_pair_reachability` 48228 → 48539, zero pairs ever lost
+  either way). The other 10 (protected-node enforcement, a splice weight-preservation
+  gap, an ops-file-written-before-gates-pass bug, an incomplete-answer-accepted-as-done
+  gap, a tile-bbox-too-small-for-long-stubs gap, a rendering bbox-filter gap that
+  dropped edges spanning clean across a tile, `render_diff` missing buoy/mark/navmesh
+  context `render_tile` has, a redundant safety floor, a non-deterministic tie-break,
+  and a stale-tile-directory-reuse gap) don't affect any number in this log. Full
+  per-finding reasoning: `docs/SPEC-GRAPH-DENSITY.md` §11.5.
+- **Tests**: 477 passed (21 new: `tests/test_graph_cleanup_trace.py` is a new file; the
+  rest added to existing files, one set per fix above, each confirmed to fail without
+  its fix).

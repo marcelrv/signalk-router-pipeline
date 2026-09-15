@@ -115,8 +115,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         g = RoutingGraph.load(args.db)
         result = ops_mod.apply(g, ops, min_confidence=args.min_confidence,
                                authors=args.author)
-        ops_mod.write_ops(args.ops, ops, append=False)
-        print(f"  wrote {len(ops)} ops to {args.ops}")
 
     print(result.summary())
     if result.skipped_reasons:
@@ -138,6 +136,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if args.dry_run:
         print(f"\ndry run, nothing written ({time.time() - t0:.1f}s)")
         return 0
+
+    if not args.replay:
+        ops_mod.write_ops(args.ops, ops, append=False)
+        print(f"  wrote {len(ops)} ops to {args.ops}")
 
     print(f"writing {args.out}")
     g.save(args.out)

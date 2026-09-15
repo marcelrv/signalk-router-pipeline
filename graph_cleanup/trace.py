@@ -97,12 +97,18 @@ def components(g: RoutingGraph) -> List[Set[int]]:
 
 
 def largest_component_length_fraction(g: RoutingGraph) -> float:
-    """Share of total edge length inside the largest component.
+    """Share of total edge length inside the component with the greatest
+    total edge length.
 
     Measured by length, never by node count. `docs/SPEC-GRAPH-DENSITY.md` 6.1:
     the node-count form "sent two investigations chasing a 2.61pp 'regression'
     that does not exist" -- and it is exactly wrong for this work, where the
     whole point is to remove nodes without removing reachable water.
+
+    `components()` sorts by node count, so `comps[0]` is not guaranteed to be
+    the component with the greatest edge length -- a component with fewer,
+    longer edges could outweigh a node-count leader made of many short ones.
+    Sum each component's own edge length in one pass instead of assuming.
     """
     comps = components(g)
     if not comps:
@@ -110,10 +116,16 @@ def largest_component_length_fraction(g: RoutingGraph) -> float:
     total = g.total_edge_length_m()
     if total <= 0:
         return 0.0
-    biggest = comps[0]
-    inside = sum(e.distance or 0.0 for (u, v), e in g.edges.items()
-                 if u in biggest and v in biggest)
-    return inside / total
+    comp_of: Dict[int, int] = {}
+    for i, comp in enumerate(comps):
+        for n in comp:
+            comp_of[n] = i
+    lengths = [0.0] * len(comps)
+    for (u, v), e in g.edges.items():
+        i = comp_of.get(u)
+        if i is not None and comp_of.get(v) == i:
+            lengths[i] += e.distance or 0.0
+    return max(lengths) / total
 
 
 class NodeIndex:
@@ -130,10 +142,21 @@ class NodeIndex:
         return (int(math.floor(lat / self.cell)), int(math.floor(lon / self.cell)))
 
     def nearest(self, lat: float, lon: float, max_rings: int = 6) -> Optional[int]:
-        """Nearest node, widening the search ring until something is found."""
+        """Nearest node, widening the search ring until it is provably found.
+
+        Returning as soon as a ring contains any candidate is not enough: a
+        node just across a cell boundary can be closer than one found in an
+        earlier ring, since the query point can sit anywhere within its own
+        cell, including right at an edge. A cell in ring R (R >= 1) can hold a
+        point no closer than `(R - 1) * cell` degrees away, so once a
+        candidate is found, further rings are only worth searching while that
+        bound is still less than the best distance found so far.
+        """
         klat, klon = self._key(lat, lon)
+        best, best_d = None, INF
         for ring in range(max_rings + 1):
-            best, best_d = None, INF
+            if best is not None and (ring - 1) * self.cell > math.sqrt(best_d):
+                break
             for dla in range(-ring, ring + 1):
                 for dlo in range(-ring, ring + 1):
                     if ring and max(abs(dla), abs(dlo)) != ring:
@@ -143,9 +166,7 @@ class NodeIndex:
                         d = (n.lat - lat) ** 2 + (n.lon - lon) ** 2
                         if d < best_d:
                             best, best_d = nid, d
-            if best is not None:
-                return best
-        return None
+        return best
 
 
 def load_pois(db_path: str) -> List[Tuple[float, float, str]]:

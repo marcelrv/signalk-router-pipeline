@@ -91,6 +91,32 @@ def test_in_bbox():
     assert not render._in_bbox(52.05, 5.0, bbox)
 
 
+def test_segment_intersects_bbox_with_an_endpoint_inside():
+    bbox = (4.0, 52.0, 4.1, 52.1)
+    assert render._segment_intersects_bbox(52.05, 4.05, 60.0, 10.0, bbox)
+
+
+def test_segment_intersects_bbox_crossing_straight_through_with_both_ends_outside():
+    """A long edge (a simplified/contracted chain, or a removed stub whose far
+    end sits well outside a review tile) can span clean across the box with
+    neither endpoint inside it -- the old endpoints-only check dropped this
+    from the image entirely."""
+    bbox = (4.0, 52.0, 4.1, 52.1)
+    assert render._segment_intersects_bbox(52.05, 3.9, 52.05, 4.2, bbox)
+
+
+def test_segment_intersects_bbox_entirely_outside_is_still_excluded():
+    bbox = (4.0, 52.0, 4.1, 52.1)
+    assert not render._segment_intersects_bbox(60.0, 10.0, 61.0, 11.0, bbox)
+
+
+def test_segment_intersects_bbox_passing_near_but_missing_the_box():
+    """A segment whose bounding box overlaps the tile's but that doesn't
+    actually cross into it (passes just outside a corner) must not intersect."""
+    bbox = (4.0, 52.0, 4.1, 52.1)
+    assert not render._segment_intersects_bbox(51.9, 3.9, 52.0 - 1e-6, 4.0 - 1e-6, bbox)
+
+
 def test_scale_bar_length_is_a_round_number():
     bbox = (4.0, 52.0, 4.1, 52.1)  # roughly 6.8 km wide at this latitude
     length = render._scale_bar_length_m(bbox)
@@ -293,6 +319,62 @@ def test_render_diff_marks_removed_edges_and_nodes(tmp_path):
     render.render_diff(bbox, str(out), str(before_db), str(after_db))
     assert out.exists()
     assert out.stat().st_size > 1000
+
+
+def test_render_diff_draws_the_same_chart_context_as_render_tile(tmp_path, monkeypatch):
+    """render_diff used to draw only CONTEXT_LAYERS (polygons), omitting the
+    buoys/lights/marks and navmesh-region shading render_tile includes -- a
+    reviewer judging a removal from the diff alone was missing exactly the
+    hazard/navigation context they need. Both renderers must now go through
+    the same `_draw_chart_context` helper, with real navmesh-region context
+    (the surviving/`after` graph's own source_db) and the input_dir passed
+    through."""
+    conn = sqlite3.connect
+    def make_db(path):
+        c = conn(path)
+        c.executescript("""
+            CREATE TABLE nodes (id INTEGER PRIMARY KEY, lat REAL, lon REAL,
+                node_depth REAL, region_id INTEGER, node_kind_id INTEGER,
+                source_tier INTEGER, source_id INTEGER);
+            CREATE TABLE edges (source INTEGER, target INTEGER, distance REAL,
+                min_depth REAL, drval1 REAL, max_air_draft REAL, min_width REAL,
+                cost_factor REAL, distance_to_land REAL, edge_type_id INTEGER,
+                traffic_mode INTEGER, crosses_land INTEGER, crosses_obstacle INTEGER,
+                edge_kind_id INTEGER, source_tier INTEGER, source_id INTEGER,
+                width_profile TEXT, requires_lock INTEGER, lock_id INTEGER);
+            CREATE TABLE navmesh_regions (id INTEGER PRIMARY KEY,
+                boundary_geometry TEXT, vertices TEXT, triangles TEXT,
+                triangle_adjacency TEXT, boundary_node_ids TEXT);
+        """)
+        c.executemany("INSERT INTO nodes VALUES (?,?,?,10,1,0,1,2)",
+                      [(1, 52.0, 4.0), (2, 52.0, 4.001)])
+        row = (100.0, 10.0, 5.0, 99.0, 200.0, 1.0, 500.0, 0, 0, 0, 0, 0, 1, 2, None, 0, None)
+        for s, t in ((1, 2), (2, 1)):
+            c.execute(f"INSERT INTO edges VALUES ({s},{t}," + ",".join("?" * 17) + ")", row)
+        c.commit()
+        c.close()
+
+    before_db, after_db = tmp_path / "before.sqlite", tmp_path / "after.sqlite"
+    make_db(before_db)
+    make_db(after_db)
+
+    calls = []
+    real = render._draw_chart_context
+
+    def spy(ax, bbox, cfg, legend_handles, input_dir=None, source_db=None):
+        calls.append({"input_dir": input_dir, "source_db": source_db})
+        return real(ax, bbox, cfg, legend_handles, input_dir=input_dir, source_db=source_db)
+
+    monkeypatch.setattr(render, "_draw_chart_context", spy)
+
+    out = tmp_path / "diff.png"
+    bbox = (3.9, 51.9, 4.05, 52.05)
+    render.render_diff(bbox, str(out), str(before_db), str(after_db), input_dir="/tmp/nonexistent")
+
+    assert len(calls) == 1
+    assert calls[0]["input_dir"] == "/tmp/nonexistent"
+    assert calls[0]["source_db"] == str(after_db), \
+        "navmesh-region context must come from the surviving (after) graph"
 
 
 def test_render_with_navmesh_region_does_not_crash(tmp_path):
