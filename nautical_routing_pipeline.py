@@ -639,6 +639,13 @@ SKELETON_BOUNDARY_SIMPLIFY_MAX_M = 200.0  # build_skeleton_network: ceiling on
                                            # skeleton_boundary_simplify_m -- measured
                                            # gains plateau well below this (~30m); a much
                                            # larger value risks eroding real channel shape.
+SKELETON_JUNCTION_MERGE_MAX_M = 100.0  # build_skeleton_network: ceiling on
+                                        # skeleton_junction_merge_m -- measured
+                                        # statewide junction-to-junction edge lengths are
+                                        # bimodal (27.8%/51.8% under 30m/50m vs. p75=191m,
+                                        # p90=472m for genuinely-spaced real junctions), so
+                                        # this stays well below the point where real,
+                                        # distinct branches would start merging.
 NARROW_FRAGMENT_RECLASS_CLOSING_M = 50.0  # _reclassify_scattered_narrow_fragments: morphological
                                            # closing radius applied before the fold-back
                                            # eligibility re-test, smoothing away small-scale
@@ -1204,6 +1211,20 @@ class ClassificationConfig:
     # build_skeleton_network's own docstring/comment for the full measurement.
     # Must be finite, >= 0.0, and < SKELETON_BOUNDARY_SIMPLIFY_MAX_M if enabled.
     skeleton_boundary_simplify_m: float = 0.0
+    # docs/SPEC-GRAPH-DENSITY.md §11: skeleton_boundary_simplify_m reduces spurious
+    # medial-axis branches from boundary noise, but does nothing about short edges
+    # BETWEEN two already-real junction nodes -- a wide bay with a detailed coastline
+    # converges many genuine branches into a dense junction tangle (measured: 85% of
+    # coastal_water nodes statewide have degree >= 4, only 14.9% the expected degree-2).
+    # 0.0 (default) disables this entirely -- byte-identical to today's output, same
+    # convention as every other flag in this dataclass. > 0.0: after spur pruning,
+    # cluster raster-skeleton junction pixels connected by an edge shorter than this
+    # many metres and collapse each cluster onto its single highest-distance-transform
+    # member (an already-valid, already-real skeleton pixel -- not a synthetic
+    # centroid, so this carries no land-crossing risk beyond what every edge's
+    # crosses_land classification already checks). Must be finite, >= 0.0, and <
+    # SKELETON_JUNCTION_MERGE_MAX_M if enabled.
+    skeleton_junction_merge_m: float = 0.0
     # docs/SPEC-CHANNEL-AXES.md: merge derive_channel_axes.py's channel_axes_lines.geojson
     # (centerlines of FAIRWY/DRGARE polygons and of lateral buoy/beacon chains) into
     # the inland_waterways layer, so the existing "prefer the authoritative axis"
@@ -1485,6 +1506,7 @@ class NauticalRoutingPipeline:
                  pass0_fanin_cap: int = 0,
                  pass0_cross_type_first: bool = False,
                  skeleton_boundary_simplify_m: float = 0.0,
+                 skeleton_junction_merge_m: float = 0.0,
                  use_channel_axes: bool = False,
                  channel_axes_min_confidence: float = 0.5,
                  channel_axes_navmesh_carve: bool = False):
@@ -1513,6 +1535,7 @@ class NauticalRoutingPipeline:
                                                            pass0_fanin_cap=pass0_fanin_cap,
                                                            pass0_cross_type_first=pass0_cross_type_first,
                                                            skeleton_boundary_simplify_m=skeleton_boundary_simplify_m,
+                                                           skeleton_junction_merge_m=skeleton_junction_merge_m,
                                                            use_channel_axes=use_channel_axes,
                                                            channel_axes_min_confidence=channel_axes_min_confidence,
                                                            channel_axes_navmesh_carve=channel_axes_navmesh_carve)
@@ -1816,6 +1839,25 @@ class NauticalRoutingPipeline:
                 f"{SKELETON_BOUNDARY_SIMPLIFY_MAX_M:.0f}m (got {tol_m!r}).")
 
     @staticmethod
+    def _validate_skeleton_junction_merge_m(tol_m):
+        """`skeleton_junction_merge_m == 0.0` (the default) disables the post-spur-
+        pruning junction-cluster merge entirely -- no validation needed, same
+        convention as `skeleton_boundary_simplify_m`. `> 0.0` must be finite and
+        strictly less than `SKELETON_JUNCTION_MERGE_MAX_M` -- statewide measurement
+        found genuinely-spaced real junction-to-junction edges at p75=191m/p90=472m,
+        so the ceiling stays well below that to avoid merging distinct real branches.
+        `NaN`/negative slip past a bare `<= 0.0` check (`NaN` comparisons are always
+        `False` in Python), so both are checked explicitly rather than relying on
+        that alone.
+        """
+        if tol_m == 0.0:
+            return
+        if not math.isfinite(tol_m) or tol_m < 0.0 or tol_m >= SKELETON_JUNCTION_MERGE_MAX_M:
+            raise ValueError(
+                f"skeleton_junction_merge_m must be finite, >= 0.0, and < "
+                f"{SKELETON_JUNCTION_MERGE_MAX_M:.0f}m (got {tol_m!r}).")
+
+    @staticmethod
     def _validate_channel_axes_min_confidence(min_confidence):
         """`channel_axes_min_confidence` is a threshold on a 0..1 score, so it must be
         finite and within that range; `NaN` slips past bare comparisons (always
@@ -2093,6 +2135,8 @@ class NauticalRoutingPipeline:
             self.classification_config.narrow_fragment_reclass_max_fraction)
         self._validate_skeleton_boundary_simplify_m(
             self.classification_config.skeleton_boundary_simplify_m)
+        self._validate_skeleton_junction_merge_m(
+            self.classification_config.skeleton_junction_merge_m)
         self._validate_channel_axes_min_confidence(
             self.classification_config.channel_axes_min_confidence)
         # Inland waterway centerlines are unchanged (already vector line topology).
@@ -5672,8 +5716,12 @@ class NauticalRoutingPipeline:
                 length_m = sum(step_len(chain[i - 1], chain[i]) for i in range(1, len(chain)))
                 pts = [to_lonlat(p) for p in chain]
                 widths = [round(width_m(p), 1) for p in chain]
-                G.add_node(start, lonlat=to_lonlat(start))
-                G.add_node(end, lonlat=to_lonlat(end))
+                # dist_val: distance-transform value at this junction/endpoint pixel
+                # (distance to nearest non-water pixel, in raster cells) -- carried
+                # so _merge_close_skeleton_junctions can pick the deepest-water member
+                # of a cluster as its representative without re-threading `dist`.
+                G.add_node(start, lonlat=to_lonlat(start), dist_val=float(dist[start[0], start[1]]))
+                G.add_node(end, lonlat=to_lonlat(end), dist_val=float(dist[end[0], end[1]]))
                 if G.has_edge(start, end):
                     # keep the longer of parallel chains between the same node pair
                     if G[start][end]["length_m"] >= length_m:
@@ -5693,6 +5741,66 @@ class NauticalRoutingPipeline:
                         if n in G and G.degree(n) == 0:
                             G.remove_node(n)
                     changed = True
+
+    def _merge_close_skeleton_junctions(self, G: nx.Graph, merge_tol_m: float) -> Dict[tuple, tuple]:
+        """docs/SPEC-GRAPH-DENSITY.md §11: a wide water body with a detailed coastline
+        converges many genuine medial-axis branches into a dense tangle of short
+        junction-to-junction edges -- unlike a spur (one dead end), both ends here are
+        already real degree>=3 junctions, so `_prune_skeleton_spurs` never touches them.
+
+        Clusters junction pixels (`G.degree(p) >= 3`, evaluated post-spur-pruning)
+        connected by an edge shorter than `merge_tol_m`, and returns, for every
+        non-representative pixel in a cluster of size >= 2, the lon/lat of that
+        cluster's representative: the member with the highest `dist_val` (distance-
+        transform value -- i.e. the pixel deepest from any water boundary). Reusing an
+        already-real skeleton pixel as the representative -- never a synthetic
+        centroid -- means the merged position is guaranteed already-valid water, so
+        this carries no land-crossing risk beyond what every edge's `crosses_land`
+        classification already checks at build time.
+
+        Does not modify `G` itself: `G`'s pixel-tuple nodes are only scaffolding for
+        chain-walking in `_skeleton_raster_to_graph`; the real routing-graph nodes are
+        minted downstream, per edge, purely from `pts[0]`/`pts[-1]` coordinates
+        (`_get_or_create_node`'s `_coord_to_id` dedup). The caller substitutes the
+        returned lon/lat into each affected edge's `pts` endpoint instead, so
+        coordinate-based dedup does the actual merging -- see `build_skeleton_network`.
+        """
+        if merge_tol_m <= 0.0:
+            return {}
+        parent: Dict[tuple, tuple] = {}
+
+        def find(p):
+            while parent[p] != p:
+                parent[p] = parent[parent[p]]
+                p = parent[p]
+            return p
+
+        def union(a, b):
+            ra, rb = find(a), find(b)
+            if ra != rb:
+                parent[ra] = rb
+
+        junctions = {p for p in G.nodes if G.degree(p) >= 3}
+        for p in junctions:
+            parent[p] = p
+        for u, v, d in G.edges(data=True):
+            if u in junctions and v in junctions and d["length_m"] < merge_tol_m:
+                union(u, v)
+
+        clusters: Dict[tuple, list] = defaultdict(list)
+        for p in junctions:
+            clusters[find(p)].append(p)
+
+        merge_map: Dict[tuple, tuple] = {}
+        for members in clusters.values():
+            if len(members) < 2:
+                continue
+            representative = max(members, key=lambda p: G.nodes[p]["dist_val"])
+            rep_lonlat = G.nodes[representative]["lonlat"]
+            for p in members:
+                if p != representative:
+                    merge_map[p] = rep_lonlat
+        return merge_map
 
     def _resample_long_skeleton_edges(self, pts, widths, max_segment_m,
                                        max_chord_sagitta_m=0.0,
@@ -5819,6 +5927,35 @@ class NauticalRoutingPipeline:
                 acc = 0.0
             i += 1
 
+    @staticmethod
+    def _splice_junction_merge_into_edge_pts(G: nx.Graph, px_u, px_v, d: dict,
+                                              junction_merge_map: Dict[tuple, tuple]) -> None:
+        """Mutates `d["pts"]` in place: if either raw pixel endpoint of this edge
+        belongs to a merged junction cluster (`junction_merge_map`, from
+        `_merge_close_skeleton_junctions`), splice in that cluster's representative
+        lon/lat at the matching end.
+
+        `nx.Graph.edges()` does NOT guarantee `(px_u, px_v)` comes back in the same
+        order `_skeleton_raster_to_graph`'s own `add_edge(start, end, pts=...)` call
+        used -- confirmed directly on a real piece: ~26% of edges come back reversed
+        relative to `pts[0]`/`pts[-1]`. This matches each pixel to its end via its
+        own known `lonlat` rather than trusting iteration order -- getting this
+        wrong silently corrupts polyline geometry and can fragment the largest
+        component (caught once, real-data only, before this was pulled out into its
+        own directly-testable function -- see
+        tests/test_skeleton_junction_merge.py's coverage for both orderings).
+        """
+        if not junction_merge_map or (px_u not in junction_merge_map and px_v not in junction_merge_map):
+            return
+        if G.nodes[px_u]["lonlat"] == d["pts"][0]:
+            first_px, last_px = px_u, px_v
+        else:
+            first_px, last_px = px_v, px_u
+        if first_px in junction_merge_map:
+            d["pts"][0] = junction_merge_map[first_px]
+        if last_px in junction_merge_map:
+            d["pts"][-1] = junction_merge_map[last_px]
+
     def build_skeleton_network(self, polygon, source_tier=DEFAULT_SOURCE_TIER, source_id=None):
         """Extract medial-axis centerlines for one channel polygon and emit them into the graph."""
         # DIAGNOSTIC (connectivity-regression investigation): see build_navmesh_region's
@@ -5910,6 +6047,7 @@ class NauticalRoutingPipeline:
             return
         G = self._skeleton_raster_to_graph(skel, dist, transform, utm, px)
         self._prune_skeleton_spurs(G, cfg.min_spur_length_m)
+        junction_merge_map = self._merge_close_skeleton_junctions(G, cfg.skeleton_junction_merge_m)
 
         # SPEC-GRAPH-DENSITY.md §6.3.1 Phase B: G's own nodes are raw raster pixel
         # tuples (row, col) -- recover that pixel identity per rounded lon/lat (the
@@ -5925,7 +6063,27 @@ class NauticalRoutingPipeline:
 
         added = 0
         node_occurrences: Dict[int, int] = {}
-        for _, _, d in G.edges(data=True):
+        for px_u, px_v, d in G.edges(data=True):
+            # skeleton_junction_merge_m (docs/SPEC-GRAPH-DENSITY.md §11): if either
+            # raw pixel endpoint belongs to a merged junction cluster, splice in that
+            # cluster's representative lon/lat instead. _get_or_create_node's own
+            # coordinate-based dedup then merges every edge that touched the same
+            # cluster into one real routing-graph node -- no graph contraction on `G`
+            # needed. An edge collapsed entirely inside one cluster now has identical
+            # first/last points, so the existing `if u == v: continue` guard below
+            # drops it, same as any other degenerate chain.
+            #
+            # nx.Graph.edges() does NOT guarantee (px_u, px_v) is returned in the
+            # same order _skeleton_raster_to_graph's own add_edge(start, end, pts=...)
+            # call used -- confirmed directly: ~26% of edges on a real piece come
+            # back reversed relative to pts[0]/pts[-1]. Blindly assuming
+            # px_u~pts[0]/px_v~pts[-1] silently swapped which end got substituted on
+            # those edges, corrupting polyline geometry and fragmenting the largest
+            # component. _splice_junction_merge_into_edge_pts matches explicitly via
+            # each pixel's own known lonlat instead of trusting iteration order --
+            # see tests/test_skeleton_junction_merge.py's dedicated regression
+            # coverage for both orderings.
+            self._splice_junction_merge_into_edge_pts(G, px_u, px_v, d, junction_merge_map)
             # Stitch-density pin (STITCH_PIN_RADIUS_M): investigated, NOT
             # currently enabled -- see that constant's comment for the full
             # measurement history. Unconditional pinning at both ends (dead
@@ -7892,6 +8050,21 @@ if __name__ == "__main__":
                              "35%% at 5m/15m/30m tolerance, plateauing past ~30m. Must be finite, "
                              ">= 0.0, and < "
                              f"{SKELETON_BOUNDARY_SIMPLIFY_MAX_M:.0f}m if enabled (raises otherwise).")
+    parser.add_argument("--skeleton-junction-merge-m", type=float, default=0.0,
+                        help="After spur pruning, cluster raster-skeleton junction pixels "
+                             "connected by an edge shorter than this many metres and collapse each "
+                             "cluster onto its single highest-distance-transform member. "
+                             "--skeleton-boundary-simplify-m only reduces spurious branches from "
+                             "boundary noise; it does nothing about short edges BETWEEN two already-"
+                             "real junction nodes, which is what produces dense mesh-like patches in "
+                             "wide water bodies with a detailed coastline (measured: 85%% of "
+                             "coastal_water nodes statewide have degree >= 4, only 14.9%% the expected "
+                             "degree-2). Safe by construction against land-crossing: the chosen "
+                             "representative is always an already-real, already-valid skeleton pixel, "
+                             "never a synthetic point. Default 0.0 DISABLES this entirely and "
+                             "reproduces today's skeleton raster byte-for-byte. Must be finite, "
+                             ">= 0.0, and < "
+                             f"{SKELETON_JUNCTION_MERGE_MAX_M:.0f}m if enabled (raises otherwise).")
     parser.add_argument("--stitch-registry", nargs="?", const="data/seam_registry.sqlite", default="",
                         help="Enable Round 25 cross-database seam stitching (STITCHING_DESIGN.md "
                              "Section 3) against the shared global-node registry at this SQLite "
@@ -7941,6 +8114,11 @@ if __name__ == "__main__":
             args.skeleton_boundary_simplify_m)
     except ValueError as e:
         raise SystemExit(f"--skeleton-boundary-simplify-m: {e}")
+    try:
+        NauticalRoutingPipeline._validate_skeleton_junction_merge_m(
+            args.skeleton_junction_merge_m)
+    except ValueError as e:
+        raise SystemExit(f"--skeleton-junction-merge-m: {e}")
     try:
         NauticalRoutingPipeline._validate_channel_axes_min_confidence(args.channel_axes_min_confidence)
     except ValueError as e:
@@ -8011,6 +8189,7 @@ if __name__ == "__main__":
                                        pass0_fanin_cap=args.pass0_fanin_cap,
                                        pass0_cross_type_first=args.pass0_cross_type_first,
                                        skeleton_boundary_simplify_m=args.skeleton_boundary_simplify_m,
+                                       skeleton_junction_merge_m=args.skeleton_junction_merge_m,
                                        use_channel_axes=args.channel_axes,
                                        channel_axes_min_confidence=args.channel_axes_min_confidence,
                                        channel_axes_navmesh_carve=args.channel_axes_navmesh_carve)
