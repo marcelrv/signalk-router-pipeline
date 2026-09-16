@@ -507,6 +507,41 @@ the second render is what first made visible that Pass A's node reduction is con
 almost entirely on the `channel_axes`/`inland_waterways` layers, matching §2.2's original
 measurement rather than contradicting it.
 
+### 6.8 `nearest_poi` blind spot — IMPLEMENTED
+
+§6.6/§6.7's blind spot, found twice independently: `_nearest_poi`
+(`graph_cleanup/candidates.py`) only ever searched the `pois` table, so a stub next to a
+named daybeacon or inside a marked creek could report a `nearest_poi_m` of several
+kilometres — the nearest *POI-table* entry happening to be a distant marina or channel —
+even though a human or model looking at the rendered tile could see the real feature
+right next to it.
+
+**Fix**: `trace.load_lateral_marks(input_dir)` reads
+`<input_dir>/lateral_marks_points.geojson` (the already-clipped BOYLAT/BCNLAT layer used
+elsewhere, e.g. `derive_channel_axes.py`) and returns `(lat, lon, name)` tuples for every
+named point, the same shape `trace.load_pois` returns. `candidates.find_all` gained an
+`input_dir` parameter; when given, it concatenates lateral marks onto the `pois` list
+before candidate generation, so `_nearest_poi`'s search is unchanged — it just now sees a
+longer list. `review_region.py` passes its already-required `--input-dir` through.
+Unnamed marks are skipped (an anonymous buoy doesn't give a reviewer anything to read off
+the tile). Regression tests: `tests/test_graph_cleanup_trace.py` (`load_lateral_marks`)
+and `tests/test_graph_cleanup_review.py`
+(`test_find_all_fixes_the_nearest_poi_blind_spot_with_lateral_marks`).
+
+**Re-checked against the real 323-candidate review** (build #40's
+`us_east_md_cleanup_a.sqlite`, the same `--bbox` as §6.7's expanded round): regenerating
+the identical candidate set with and without `input_dir` shows `nearest_poi_m` changes for
+**281 of 323 candidates (87%)**, many dropping from several kilometres to a few hundred
+metres once a nearby named mark is found instead of a distant POI-table entry — confirming
+the blind spot was not a minor edge case but the dominant source of misleading distance
+context in that round. Of the 69 candidates actually dropped, 42 had a changed
+`nearest_poi_m`; none of this is grounds to revisit those verdicts by itself, since the
+real reviewer (§6.6) already judged every one from the rendered tile, not the number — the
+fix corrects the diagnostic a reviewer reads alongside the picture, not the picture itself.
+It does mean any *future* review (and especially the still-untested `ClaudeBackend`/API
+path, §6.5, which has no rendered tile to fall back on for context the way a session
+reading tiles directly does) will see substantially more accurate numbers.
+
 ## 7. Known limits / follow-ups
 
 - The skeleton wobble between junctions (§2.3) is untouched and needs Pass B/C or a
@@ -530,9 +565,8 @@ measurement rather than contradicting it.
   the building session itself acting as the reviewer, not by a scripted API call. The
   Message Batches path (needed for the eventual weeks-long local-model production run) is
   still only import-verified, never executed.
-- The `nearest_poi` blind spot (§6.6: only searches the `pois` table, not lateral marks or
-  named daybeacons) is now confirmed across two review rounds and is the clearest concrete
-  fix available before scaling further — extend it to `lateral_marks_points`.
+- ~~The `nearest_poi` blind spot (§6.6: only searches the `pois` table, not lateral marks
+  or named daybeacons)~~ — **IMPLEMENTED, see §6.8.**
 - The "plain shoreline stub → drop" pattern (§6.6-6.7) now holds across 52 real drops with
   zero counterexceptions and is ready to prototype as a deterministic Pass A rule; it would
   need a held-out sample (tiles not yet hand-reviewed) to validate against, not just the

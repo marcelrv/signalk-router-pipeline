@@ -169,14 +169,24 @@ def find_small_components(g: RoutingGraph, max_component_size: int = 30,
 
 
 def find_all(g: RoutingGraph, db_path: Optional[str] = None,
+             input_dir: Optional[str] = None,
              max_stub_length_m: float = 3000.0,
              max_component_size: int = 30) -> List[Candidate]:
     """Every candidate kind this module knows about, in one list.
 
     Runs `find_small_components` first so its node set can exclude redundant
     stub candidates within those same components (see `find_dead_end_stubs`).
+
+    `input_dir`, when given, adds named lateral marks (buoys/daybeacons) to
+    the nearest-POI search alongside the `pois` table -- fixes the blind spot
+    where a stub next to a named daybeacon or inside a marked creek reports a
+    multi-km `nearest_poi_m` because the `pois` table's nearest entry is a
+    distant channel (`docs/SPEC-GRAPH-CLEANUP.md` §7).
     """
-    pois = trace.load_pois(db_path) if db_path else None
+    pois = trace.load_pois(db_path) if db_path else []
+    if input_dir:
+        pois = pois + trace.load_lateral_marks(input_dir)
+    pois = pois or None
     components = find_small_components(g, max_component_size=max_component_size)
     component_nodes = {n for c in components for n in c.nodes}
     stubs = find_dead_end_stubs(g, max_length_m=max_stub_length_m, pois=pois,
