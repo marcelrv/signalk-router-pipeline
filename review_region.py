@@ -87,7 +87,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     print(f"  {len(g.nodes)} nodes / {len(g.edges)} edges")
 
     print("finding candidates...")
-    cands = candidates_mod.find_all(g, db_path=args.db,
+    cands = candidates_mod.find_all(g, db_path=args.db, input_dir=args.input_dir,
                                     max_stub_length_m=args.max_stub_length_m,
                                     max_component_size=args.max_component_size)
     by_kind: dict = {}

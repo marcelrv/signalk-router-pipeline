@@ -135,6 +135,37 @@ def test_find_all_combines_both_kinds(tmp_path):
     assert kinds == {C.DEAD_END_STUB, C.SMALL_COMPONENT}
 
 
+def test_find_all_fixes_the_nearest_poi_blind_spot_with_lateral_marks(tmp_path):
+    """`nearest_poi_m` measured against the `pois` table alone is blind to
+    named daybeacons/buoys (`docs/SPEC-GRAPH-CLEANUP.md` §7, found twice in
+    real Pass B review): a stub can sit right next to a named lateral mark and
+    still report a multi-km `nearest_poi_m` because the nearest *POI-table*
+    entry is a distant marina. `input_dir` should close that gap."""
+    g = _graph_with_stub_and_component()
+    # No POIs anywhere near the stub (tip is node 11, 52.010, 4.022) -- the
+    # only POI is far away, same shape as the real blind spot.
+    db = _sqlite_for(g, tmp_path, pois=[("Distant Marina", 0.0, 0.0)])
+    (tmp_path / "lateral_marks_points.geojson").write_text(json.dumps({
+        "type": "FeatureCollection",
+        "features": [{
+            "type": "Feature",
+            "properties": {"OBJNAM": "Test Creek Daybeacon 4"},
+            "geometry": {"type": "Point", "coordinates": [4.0221, 52.0101]},
+        }],
+    }))
+
+    without_marks = C.find_all(g, db_path=db, max_component_size=10)
+    stub_before = next(c for c in without_marks if c.kind == C.DEAD_END_STUB)
+    assert stub_before.facts["nearest_poi"] == "Distant Marina"
+    assert stub_before.facts["nearest_poi_m"] > 100_000
+
+    with_marks = C.find_all(g, db_path=db, input_dir=str(tmp_path),
+                            max_component_size=10)
+    stub_after = next(c for c in with_marks if c.kind == C.DEAD_END_STUB)
+    assert stub_after.facts["nearest_poi"] == "Test Creek Daybeacon 4"
+    assert stub_after.facts["nearest_poi_m"] < 100
+
+
 # --------------------------------------------------------------------- tiles
 
 def test_build_tiles_buckets_far_apart_candidates_separately():

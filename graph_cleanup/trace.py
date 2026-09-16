@@ -14,7 +14,9 @@ one vessel's dimensions would delete water that a shallower boat uses.
 """
 import collections
 import heapq
+import json
 import math
+import os
 import sqlite3
 from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
@@ -183,6 +185,41 @@ def load_pois(db_path: str) -> List[Tuple[float, float, str]]:
                 for r in conn.execute("SELECT lat, lon, name FROM pois")]
     finally:
         conn.close()
+
+
+def load_lateral_marks(input_dir: str) -> List[Tuple[float, float, str]]:
+    """`(lat, lon, name)` for every named lateral mark (buoy/daybeacon) in
+    `<input_dir>/lateral_marks_points.geojson`.
+
+    `load_pois`'s `pois` table alone is `_nearest_poi`'s blind spot
+    (`docs/SPEC-GRAPH-CLEANUP.md` §7): it does not include lateral marks, so a
+    stub sitting right next to "Combs Creek Daybeacon 4" or inside a named,
+    marked creek can report a `nearest_poi_m` of several kilometres, because
+    the nearest *POI-table* entry happens to be a distant channel. Meant to be
+    concatenated with `load_pois`'s result before calling `find_dead_end_stubs`
+    -- both return the same `(lat, lon, name)` shape, so the caller doesn't
+    need to know the two came from different sources.
+
+    Missing file (no `--input-dir`, or a clip that dropped this layer) is not
+    an error -- returns `[]`, same as `load_pois` would for an empty table.
+    """
+    path = os.path.join(input_dir, "lateral_marks_points.geojson")
+    if not os.path.exists(path):
+        return []
+    with open(path) as f:
+        data = json.load(f)
+    out: List[Tuple[float, float, str]] = []
+    for feat in data.get("features", ()):
+        props = feat.get("properties") or {}
+        name = props.get("OBJNAM")
+        if not name:
+            continue
+        geom = feat.get("geometry") or {}
+        if geom.get("type") != "Point":
+            continue
+        lon, lat = geom["coordinates"][:2]
+        out.append((lat, lon, name))
+    return out
 
 
 def poi_anchor_nodes(g: RoutingGraph, pois: Sequence[Tuple[float, float, str]],

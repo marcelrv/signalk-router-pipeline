@@ -646,6 +646,12 @@ SKELETON_JUNCTION_MERGE_MAX_M = 100.0  # build_skeleton_network: ceiling on
                                         # p90=472m for genuinely-spaced real junctions), so
                                         # this stays well below the point where real,
                                         # distinct branches would start merging.
+CHANNEL_AXIS_DEADEND_STITCH_MAX_M = 5000.0  # ceiling on channel_axis_deadend_stitch_m --
+                                             # measured statewide gap p90 is 948m with a
+                                             # long tail to 3.4km; well above that risks
+                                             # bridging to an unrelated, merely-nearby
+                                             # water body the straight-line/land-only
+                                             # check can't distinguish from a real one.
 NARROW_FRAGMENT_RECLASS_CLOSING_M = 50.0  # _reclassify_scattered_narrow_fragments: morphological
                                            # closing radius applied before the fold-back
                                            # eligibility re-test, smoothing away small-scale
@@ -1241,6 +1247,45 @@ class ClassificationConfig:
     # (skeleton-side carve always applies: there the generated medial-axis twin is
     # real). Off by default -- see _axis_dedup_suppression_mask's exclude_layer_key.
     channel_axes_navmesh_carve: bool = False
+    # docs/SPEC-CHANNEL-AXES.md follow-up: a channel_axes buoy-chain (tier-3
+    # "mark_chain") axis marks a real charted channel, but derive_channel_axes.py
+    # only knows the buoy line itself -- it has no idea where the nearest medial-axis
+    # skeleton branch ends, so the merged axis can terminate as a true graph dead end
+    # (degree 1) far from the rest of the network (measured on a real MD build: 221
+    # such dead ends, median gap to the nearest non-axis node 211m, p90 948m). A route
+    # that would otherwise follow the marked channel has to abandon it and detour
+    # instead, since a dead end can only be entered and backtracked out of, never used
+    # for through-routing. 0.0 (default) disables this entirely, same convention as
+    # every other flag here. > 0.0: after `_ensure_coastal_connectivity` runs, connect
+    # each such dead end to its nearest ANCHORED graph node (one that itself touches
+    # at least one non-channel_axes edge, i.e. is already part of the real skeleton/
+    # inland network) within this many metres, skipping any candidate whose straight
+    # connector crosses `land` or charted drying/intertidal terrain (`_crosses_land`).
+    # The "anchored" restriction is load-bearing, not a nicety: a first version
+    # connected to the plain nearest OTHER node and, on real geometry, usually landed
+    # on another equally-isolated buoy-chain fragment in the same tangle -- both ends
+    # were already in the same connected component the long way round, so the "fix"
+    # measurably changed nothing (a real route's Dijkstra cost was byte-identical
+    # before and after, caught by a live user report skeptical of the first version).
+    # Deliberately a SEPARATE pass from `_stitch_component_pieces`'s own 500m
+    # `snap_radius_m` rather than just
+    # raising that radius -- that function's own docstring records a past attempt to
+    # widen it (500m -> 700m) making Pass 2's connectivity WORSE from union-find
+    # candidate-pair combinatorics; scoping a wider radius to only the much smaller set
+    # of channel-axis dead ends avoids that regression. Must be finite, >= 0.0, and <
+    # CHANNEL_AXIS_DEADEND_STITCH_MAX_M if enabled.
+    channel_axis_deadend_stitch_m: float = 0.0
+    # A marked channel typically runs down the middle of a body of water, so its
+    # medial-axis skeleton usually exists on BOTH banks, not just whichever one
+    # happens to be nearest. Connecting a dead end to only its single nearest
+    # eligible node risks picking one bank arbitrarily and never offering the
+    # other. `_connect_channel_axis_deadends` instead partitions the search circle
+    # into this many equal angular sectors around the dead end and takes the
+    # nearest eligible candidate FROM EACH sector (not just the next-nearest
+    # overall) -- 3 nearest-by-distance candidates can easily all sit on the same
+    # bank if that bank's skeleton happens to be denser; per-sector search is what
+    # actually guarantees the spread. Must be a positive integer.
+    channel_axis_deadend_max_connections: int = 3
 
     def pixel_size_for(self, min_dimension_m: float) -> float:
         return float(np.clip(min_dimension_m / self.pixel_dim_divisor,
@@ -1509,7 +1554,9 @@ class NauticalRoutingPipeline:
                  skeleton_junction_merge_m: float = 0.0,
                  use_channel_axes: bool = False,
                  channel_axes_min_confidence: float = 0.5,
-                 channel_axes_navmesh_carve: bool = False):
+                 channel_axes_navmesh_carve: bool = False,
+                 channel_axis_deadend_stitch_m: float = 0.0,
+                 channel_axis_deadend_max_connections: int = 3):
         self.data_paths = data_paths
         self.db_path = db_path
         self.country = country
@@ -1538,7 +1585,9 @@ class NauticalRoutingPipeline:
                                                            skeleton_junction_merge_m=skeleton_junction_merge_m,
                                                            use_channel_axes=use_channel_axes,
                                                            channel_axes_min_confidence=channel_axes_min_confidence,
-                                                           channel_axes_navmesh_carve=channel_axes_navmesh_carve)
+                                                           channel_axes_navmesh_carve=channel_axes_navmesh_carve,
+                                                           channel_axis_deadend_stitch_m=channel_axis_deadend_stitch_m,
+                                                           channel_axis_deadend_max_connections=channel_axis_deadend_max_connections)
         self.channel_axes_stats = None
         if max_segment_m is not None:
             self.classification_config.max_segment_m = float(max_segment_m)
@@ -1656,6 +1705,8 @@ class NauticalRoutingPipeline:
         self._mark_edges_inside_locks()
         self._sanity_check_no_land_crossings()
         self._ensure_coastal_connectivity()
+        self._connect_channel_axis_deadends(self.classification_config.channel_axis_deadend_stitch_m,
+                                            self.classification_config.channel_axis_deadend_max_connections)
         self._log_node_origin_diag(label="post_stitch")
         # Adopt pass runs BEFORE calculate_edge_attributes so the new
         # adopted-node connector edges go through normal edge-attribute
@@ -1856,6 +1907,32 @@ class NauticalRoutingPipeline:
             raise ValueError(
                 f"skeleton_junction_merge_m must be finite, >= 0.0, and < "
                 f"{SKELETON_JUNCTION_MERGE_MAX_M:.0f}m (got {tol_m!r}).")
+
+    @staticmethod
+    def _validate_channel_axis_deadend_stitch_m(tol_m):
+        """`channel_axis_deadend_stitch_m == 0.0` (the default) disables the
+        channel-axis dead-end connector pass entirely -- no validation needed, same
+        convention as `skeleton_junction_merge_m`. `> 0.0` must be finite and strictly
+        less than `CHANNEL_AXIS_DEADEND_STITCH_MAX_M`. `NaN`/negative slip past a bare
+        `<= 0.0` check (`NaN` comparisons are always `False` in Python), so both are
+        checked explicitly rather than relying on that alone.
+        """
+        if tol_m == 0.0:
+            return
+        if not math.isfinite(tol_m) or tol_m < 0.0 or tol_m >= CHANNEL_AXIS_DEADEND_STITCH_MAX_M:
+            raise ValueError(
+                f"channel_axis_deadend_stitch_m must be finite, >= 0.0, and < "
+                f"{CHANNEL_AXIS_DEADEND_STITCH_MAX_M:.0f}m (got {tol_m!r}).")
+
+    @staticmethod
+    def _validate_channel_axis_deadend_max_connections(n):
+        """Sector count for `_connect_channel_axis_deadends`'s per-dead-end search --
+        must be a positive integer (at least one sector, i.e. at least one
+        connection attempt per dead end)."""
+        if not isinstance(n, int) or isinstance(n, bool) or n < 1:
+            raise ValueError(
+                f"channel_axis_deadend_max_connections must be a positive integer "
+                f"(got {n!r}).")
 
     @staticmethod
     def _validate_channel_axes_min_confidence(min_confidence):
@@ -2139,6 +2216,10 @@ class NauticalRoutingPipeline:
             self.classification_config.skeleton_junction_merge_m)
         self._validate_channel_axes_min_confidence(
             self.classification_config.channel_axes_min_confidence)
+        self._validate_channel_axis_deadend_stitch_m(
+            self.classification_config.channel_axis_deadend_stitch_m)
+        self._validate_channel_axis_deadend_max_connections(
+            self.classification_config.channel_axis_deadend_max_connections)
         # Inland waterway centerlines are unchanged (already vector line topology).
         if "inland_waterways" in self.gdfs and not self.gdfs["inland_waterways"].empty:
             self._build_inland_network()
@@ -6839,6 +6920,154 @@ class NauticalRoutingPipeline:
             parts = " ".join(f"{k}={v}" for k, v in sorted(d.items()))
             logger.info(f"STITCH_DIAG pass={pass_name} {parts}")
 
+    def _connect_channel_axis_deadends(self, max_radius_m: float, max_connections: int = 3):
+        """`channel_axis_deadend_stitch_m` (see the field's docstring for the full
+        why): reconnect a channel_axes buoy-chain's dangling end to eligible
+        graph nodes on multiple sides of it, so a marked channel that dead-ends
+        far from any medial-axis skeleton branch can still be used for
+        through-routing rather than only entered and backtracked out of.
+
+        A candidate must satisfy BOTH, not either:
+
+        1. Not itself a degree-1 terminus (any source) -- connecting two dead ends
+           together helps neither: each still has exactly one way out, just a
+           longer shared one.
+        2. "Anchored" -- touches at least one non-channel_axes edge, i.e. is
+           already part of the real skeleton/inland network, not just another
+           orphaned buoy-chain fragment. A nearby buoy string that is itself a
+           real, connected THROUGH channel is a perfectly good bridge target
+           (and is `anchored` too, transitively, once ITS own end reaches real
+           water) -- this rule only excludes fragments that are isolated the
+           same way the dead end being fixed is.
+
+        **Real bug caught by a live user report, not a synthetic test, and only
+        half-fixed by rule 1 alone**: the first version of this pass connected to
+        the plain nearest OTHER node with no eligibility check at all. On real
+        geometry this usually meant the nearest node along an adjacent, equally
+        isolated buoy-chain fragment in the same tangle (measured: 137.7m away,
+        chosen over the real skeleton 948m away). That candidate was NOT itself a
+        terminus (degree 2) -- rule 1 alone would still have accepted it. Both
+        ends were already in the same connected component before the "fix" (a
+        long way round, through the tangle's own eventual far-off exit) --
+        confirmed directly: the shortest-path COST between two nearby real-world
+        points was measured byte-identical before and after (11759.4), i.e. the
+        added edge was a no-op for routing, not a shortcut. Rule 2 is what
+        actually gives the dead end a short escape route rather than a longer way
+        to stay lost.
+
+        **Why per-sector, not just the `max_connections` nearest overall**: a
+        marked channel usually runs down the middle of open water, with medial-
+        axis skeleton on both banks -- but the plain N-nearest-by-distance
+        candidates can easily all land on the SAME bank, if that bank's skeleton
+        happens to be denser or closer, leaving the other bank (and the routes
+        that would prefer it) untouched. Partitioning the full circle into
+        `max_connections` equal angular sectors around the dead end and taking
+        the nearest eligible candidate FROM EACH sector is what actually spreads
+        the new connections around the dead end instead of just piling them up
+        in whichever direction happens to be locally densest.
+
+        Deliberately runs AFTER `_ensure_coastal_connectivity`, not as part of it:
+        that pass is scoped per-original-water-body (`_stitch_component_pieces`'
+        own `.within(component polygon)` gate) and its 500m `snap_radius_m` is tuned
+        for a different problem (reconnecting pieces split by width classification).
+        A channel_axes dead end's nearest anchored neighbour may be a different
+        classified piece, or simply further than 500m away -- this pass makes no
+        polygon-component assumption at all, gated only by `_crosses_land` (identical
+        safety bar to every other connectivity pass in this file), which is why it
+        needs its own explicit opt-in radius rather than just widening the general
+        pass.
+        """
+        if max_radius_m <= 0.0:
+            return
+        axis_src_id = self.layer_source_ids.get("channel_axes") if hasattr(self, "layer_source_ids") else None
+        if axis_src_id is None:
+            return
+
+        deadends = []
+        anchored = set()
+        for n in self.graph.nodes:
+            neighbors = list(self.graph.neighbors(n))
+            if len(neighbors) == 1:
+                edata = self.graph.get_edge_data(n, neighbors[0])
+                if edata and edata.get("source_id") == axis_src_id:
+                    deadends.append(n)
+                continue  # a degree-1 node is a terminus -- never an eligible candidate,
+                          # channel_axes-sourced or not (connecting two dead ends together
+                          # is a no-op: neither end gains an escape route, just a longer
+                          # one shared between them).
+            if any(self.graph.get_edge_data(n, nbr, {}).get("source_id") != axis_src_id
+                   for nbr in neighbors):
+                anchored.add(n)
+        if not deadends or not anchored:
+            return
+
+        anchored_ids = list(anchored)
+        lons_all = {i: self.graph.nodes[i]["lon"] for i in self.graph.nodes}
+        lats_all = {i: self.graph.nodes[i]["lat"] for i in self.graph.nodes}
+        lons = np.array([lons_all[i] for i in anchored_ids])
+        lats = np.array([lats_all[i] for i in anchored_ids])
+        pts_wgs84 = gpd.GeoSeries(gpd.points_from_xy(lons, lats), crs=self.CRS_WGS84)
+        utm = pts_wgs84.estimate_utm_crs()
+        pts_m = pts_wgs84.to_crs(utm)
+        xs_m, ys_m = pts_m.x.to_numpy(), pts_m.y.to_numpy()
+
+        import scipy.spatial
+        tree = scipy.spatial.cKDTree(np.column_stack([xs_m, ys_m]))
+
+        # A generous k, not just max_connections * (some factor): the per-sector
+        # search below needs enough raw candidates in hand that even a lopsided
+        # angular distribution (most candidates bunched in one direction) still
+        # leaves each of the other sectors a fair chance at finding one.
+        k = min(max(30, max_connections * 15), len(anchored_ids))
+        sector_width = 2.0 * math.pi / max_connections
+
+        connected, land_rejected, gave_up, deadends_with_any = 0, 0, 0, 0
+        for n in deadends:
+            own_neighbor = next(iter(self.graph.neighbors(n)))
+            n_lon, n_lat = lons_all[n], lats_all[n]
+            n_pt = gpd.GeoSeries([Point(n_lon, n_lat)], crs=self.CRS_WGS84).to_crs(utm).iloc[0]
+            dists, idxs = tree.query([n_pt.x, n_pt.y], k=k)
+
+            # Bucket every in-radius, otherwise-eligible-by-identity candidate by
+            # which angular sector it falls in around the dead end, each bucket
+            # already sorted nearest-first (tree.query returns ascending distance).
+            sectors: Dict[int, List[Tuple[float, int]]] = {}
+            for dist, j in zip(np.atleast_1d(dists), np.atleast_1d(idxs)):
+                if dist > max_radius_m:
+                    break
+                cand = anchored_ids[j]
+                if cand == n or cand == own_neighbor or self.graph.has_edge(n, cand):
+                    continue
+                angle = math.atan2(ys_m[j] - n_pt.y, xs_m[j] - n_pt.x) % (2.0 * math.pi)
+                sector = int(angle // sector_width)
+                sectors.setdefault(sector, []).append((dist, j))
+
+            made_here = 0
+            for sector in range(max_connections):
+                for dist, j in sectors.get(sector, ()):
+                    cand = anchored_ids[j]
+                    line = LineString([(n_lon, n_lat), (lons[int(j)], lats[int(j)])])
+                    if self._crosses_land(line):
+                        land_rejected += 1
+                        continue
+                    attrs = dict(edge_type="inland", edge_kind_id=EDGE_KIND_CENTERLINE,
+                                 source_tier=DEFAULT_SOURCE_TIER, source_id=axis_src_id)
+                    self.graph.add_edge(n, cand, **attrs)
+                    self.graph.add_edge(cand, n, **attrs)
+                    connected += 1
+                    made_here += 1
+                    break
+            if made_here:
+                deadends_with_any += 1
+            else:
+                gave_up += 1
+
+        logger.info(f"Channel-axis dead-end connector pass: {len(deadends)} dead ends found, "
+                    f"{connected} connections made across {deadends_with_any} dead ends "
+                    f"(radius {max_radius_m:g}m, up to {max_connections} per dead end, "
+                    f"one per angular sector), {land_rejected} candidates rejected for "
+                    f"crossing land, {gave_up} gave up (no safe candidate in any sector).")
+
     def _log_node_origin_diag(self, label="post_stitch"):
         """DIAGNOSTIC (coordinator's follow-up on the connectivity-regression
         investigation): distinguish a genuine cross-piece/cross-subsystem
@@ -8072,6 +8301,31 @@ if __name__ == "__main__":
                              "reproduces today's skeleton raster byte-for-byte. Must be finite, "
                              ">= 0.0, and < "
                              f"{SKELETON_JUNCTION_MERGE_MAX_M:.0f}m if enabled (raises otherwise).")
+    parser.add_argument("--channel-axis-deadend-stitch-m", type=float, default=0.0,
+                        help="With --channel-axes: a buoy-chain (tier-3 mark_chain) axis can end as a "
+                             "true graph dead end far from the rest of the network -- "
+                             "derive_channel_axes.py only knows the buoy line itself, not where the "
+                             "nearest medial-axis skeleton branch ends (measured on a real MD build: "
+                             "221 such dead ends, median gap 211m, p90 948m). A route that would "
+                             "otherwise follow the marked channel has to detour instead, since a dead "
+                             "end can only be entered and backtracked out of. After "
+                             "_ensure_coastal_connectivity runs, connect each such dead end to its "
+                             "nearest ANCHORED graph node (one touching at least one non-channel_axes "
+                             "edge, i.e. already part of the real skeleton/inland network -- not just "
+                             "another isolated buoy-chain fragment in the same tangle) within this many "
+                             "metres, skipping any candidate whose straight connector crosses land or "
+                             "charted drying/intertidal terrain. Default 0.0 DISABLES this entirely. "
+                             "Must be finite, >= 0.0, and "
+                             "< " f"{CHANNEL_AXIS_DEADEND_STITCH_MAX_M:.0f}m if enabled (raises otherwise).")
+    parser.add_argument("--channel-axis-deadend-max-connections", type=int, default=3,
+                        help="With --channel-axis-deadend-stitch-m: a marked channel usually runs down "
+                             "the middle of open water with medial-axis skeleton on both banks, but the "
+                             "plain N-nearest-by-distance candidates can all land on the same bank if it "
+                             "happens to be denser. Partitions the search circle into this many equal "
+                             "angular sectors around each dead end and connects to the nearest eligible "
+                             "candidate FROM EACH sector, spreading connections around the dead end "
+                             "instead of piling them up in one direction (default: %(default)s). Must be "
+                             "a positive integer.")
     parser.add_argument("--stitch-registry", nargs="?", const="data/seam_registry.sqlite", default="",
                         help="Enable Round 25 cross-database seam stitching (STITCHING_DESIGN.md "
                              "Section 3) against the shared global-node registry at this SQLite "
@@ -8130,6 +8384,15 @@ if __name__ == "__main__":
         NauticalRoutingPipeline._validate_channel_axes_min_confidence(args.channel_axes_min_confidence)
     except ValueError as e:
         raise SystemExit(f"--channel-axes-min-confidence: {e}")
+    try:
+        NauticalRoutingPipeline._validate_channel_axis_deadend_stitch_m(args.channel_axis_deadend_stitch_m)
+    except ValueError as e:
+        raise SystemExit(f"--channel-axis-deadend-stitch-m: {e}")
+    try:
+        NauticalRoutingPipeline._validate_channel_axis_deadend_max_connections(
+            args.channel_axis_deadend_max_connections)
+    except ValueError as e:
+        raise SystemExit(f"--channel-axis-deadend-max-connections: {e}")
     try:
         NauticalRoutingPipeline._validate_classification_overrides(
             args.axis_dedup_cap, args.axis_dedup_fraction,
@@ -8199,5 +8462,7 @@ if __name__ == "__main__":
                                        skeleton_junction_merge_m=args.skeleton_junction_merge_m,
                                        use_channel_axes=args.channel_axes,
                                        channel_axes_min_confidence=args.channel_axes_min_confidence,
-                                       channel_axes_navmesh_carve=args.channel_axes_navmesh_carve)
+                                       channel_axes_navmesh_carve=args.channel_axes_navmesh_carve,
+                                       channel_axis_deadend_stitch_m=args.channel_axis_deadend_stitch_m,
+                                       channel_axis_deadend_max_connections=args.channel_axis_deadend_max_connections)
     pipeline.run_pipeline()

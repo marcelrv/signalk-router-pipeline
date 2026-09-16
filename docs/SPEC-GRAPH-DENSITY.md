@@ -29,9 +29,12 @@ this mechanism. §11 (implemented, real-build verification COMPLETE — `data/BU
 via `skeleton_junction_merge_m`. Cuckold Creek, MD dropped from 190 to 33 mesh-fill
 nodes at the validated real-build value (35.0m — a piece-level-only test initially
 suggested 20.0m, which turned out to miss a raster quantization artifact entirely; see
-§11.4). One `validate.py` gate (`poi_snap_drift`) has an open, narrow caveat near the
-Chesapeake Bay Bridge — not yet deployed. See `data/BUILD_LOG.md` for every real
-build's measured effect before assuming any of these should ship enabled by default.
+§11.4). One `validate.py` gate (`poi_snap_drift`) flagged an open, narrow caveat near
+the Chesapeake Bay Bridge — accepted as a known, benign tradeoff after visual
+re-confirmation (§11.4), and build #43 is now deployed. Zeeland got the same fix in
+build #44 — same 35.0m value, all six gates pass clean with **zero** `poi_snap_drift`,
+and is also deployed. See `data/BUILD_LOG.md` for every real build's measured effect
+before assuming any of these should ship enabled by default.
 Complements: `SPEC-RECOMMENDED-TRACK.md`, `SPEC-FAIRWAY-HARMONIZATION.md`
 Scope: `nautical_routing_pipeline.py` (`build_skeleton_network`, `_resample_long_skeleton_edges`, `_skeleton_raster_to_graph`, `ClassificationConfig`)
 Measured against: `data/zeeland_full.sqlite` (48,553 nodes / 137,718 directed edges), RWS source GeoJSON
@@ -2198,9 +2201,37 @@ this build replaces any live database.
 
 **Recommended value: 35.0m**, not the 20.0m §11.3's isolated piece-level test
 suggested — logged as `data/BUILD_LOG.md` build #43
-(`data/us_east_md_junction_merge_v3.sqlite`). **Not deployed** — same status as builds
-#41/#42, pending a decision on the `poi_snap_drift` caveat above and a visual
-re-render of Cuckold Creek to confirm the picture itself reads clean now.
+(`data/us_east_md_junction_merge_v3.sqlite`).
+
+**`poi_snap_drift` decision: accept as a known, narrow tradeoff — no code change.**
+`render_diff()` against the real baseline (#39, `us_east_md_channel_axes.sqlite`) vs.
+#43 at two locations confirms both the fix and the caveat read as intended, not as a
+hidden regression:
+
+- **Cuckold Creek** (`bbox=-76.97,38.26,-76.90,38.33`): the dense cross-hatched
+  mesh-fill patch southwest of the creek mouth is gone from the picture entirely —
+  every node in it is drawn red/removed, with no surviving gray skeleton left inside
+  the patch's footprint. This is the first time this fix has been confirmed visually
+  rather than by node/edge counts alone.
+- **The flagged POI's location** (`bbox=-76.37,38.97,-76.32,39.00`, around
+  `38.98458,-76.34537`): the POI is actually at "Bay Bridge Marina" (a marina near
+  Sandy Point/Kent Narrows sharing the bridge's name in the source data), not the
+  bridge span itself. The removed edges there are a modest, open-water mesh-thinning
+  line north of the marina channel — no land crossings, the marina's own channel and
+  navmesh boundary are untouched, and the pattern is visually the same benign
+  mesh-thinning as Cuckold Creek, just smaller. A 76-156m snap increase against a
+  landmark-scale marina in open water is consistent with removing genuine mesh-fill,
+  not a routing defect.
+
+Combined with `poi_pair_reachability` showing zero lost pairs and every other gate
+passing, the caveat is accepted without raising `max_snap_drift_m` — doing so would
+weaken the gate for every future build, not just this one benign case, and the whole
+reason `validate.py` flags this class of thing (builds #11/#12) is to force a look
+before waving it off, not to auto-widen the threshold the first time a drift turns out
+benign.
+
+**Deployed** to `signalk-routeiq/data/us_east_md_channel_axes.sqlite` (replacing build
+#39, backed up first), superseding builds #41/#42 which were review samples only.
 
 **Lesson for the next tolerance-tuning session on this codebase**: a piece-level
 measurement using a hand-clipped standalone polygon is a fast, useful *sanity check*,
