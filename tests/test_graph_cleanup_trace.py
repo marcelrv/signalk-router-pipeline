@@ -18,6 +18,8 @@ own. Covers two real bugs found by code review and fixed:
 
 All fixtures are synthetic geometry -- no real chart data.
 """
+import json
+
 import pytest
 
 from graph_cleanup.graph import EdgeRec, NodeRec, RoutingGraph, edge_key
@@ -118,3 +120,39 @@ def test_nearest_returns_the_only_candidate_in_an_empty_neighbourhood():
     _add_node(g, 1, 0.0, 0.0)
     idx = trace.NodeIndex(g, cell_deg=0.01)
     assert idx.nearest(0.0002, 0.0002) == 1
+
+
+# -------------------------------------------------------------- load_lateral_marks
+
+def _write_lateral_marks_geojson(path, features):
+    """`features` is a list of `(lon, lat, objnam_or_None)`."""
+    doc = {
+        "type": "FeatureCollection",
+        "features": [
+            {"type": "Feature",
+             "properties": {"OBJNAM": name} if name is not None else {"OBJNAM": None},
+             "geometry": {"type": "Point", "coordinates": [lon, lat]}}
+            for lon, lat, name in features
+        ],
+    }
+    path.write_text(json.dumps(doc))
+
+
+def test_load_lateral_marks_reads_named_points(tmp_path):
+    _write_lateral_marks_geojson(
+        tmp_path / "lateral_marks_points.geojson",
+        [(-76.4687142, 37.9690733, "Coan River Daybeacon 20")])
+    marks = trace.load_lateral_marks(str(tmp_path))
+    assert marks == [(37.9690733, -76.4687142, "Coan River Daybeacon 20")]
+
+
+def test_load_lateral_marks_skips_unnamed_points(tmp_path):
+    _write_lateral_marks_geojson(
+        tmp_path / "lateral_marks_points.geojson",
+        [(-76.0, 38.0, None), (-76.1, 38.1, "Named Buoy 4")])
+    marks = trace.load_lateral_marks(str(tmp_path))
+    assert marks == [(38.1, -76.1, "Named Buoy 4")]
+
+
+def test_load_lateral_marks_missing_file_returns_empty(tmp_path):
+    assert trace.load_lateral_marks(str(tmp_path)) == []
