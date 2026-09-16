@@ -61,7 +61,14 @@ Nodes/Edges delta.
 | 40 | 2026-09-12 | `graph-cleanup` branch | n/a — post-processes #39's `.sqlite`, not a rebuild | `apply_cleanup.py` Pass A (`--tolerance-m 20`, smooth + contract + redundant) | First deterministic post-build cleanup: measure how much of the graph comes out with no model at all | 53,930 | 142,196 | 0 | 13 | 0 | no (test build) |
 | 41 | 2026-09-14 | `graph-cleanup` branch | n/a — post-processes #40's `.sqlite` | AI review Pass B, Coltons Point bbox only (16 tiles, 104 candidates), reviewer = this session (Sonnet 5) reading tiles directly, no API | First real Pass B review: 63 keep / 35 drop / 6 unsure -> 40 drop ops applied | 53,890 | 142,116 | 0 | 13 | 0 | no (pilot only) |
 | 42 | 2026-09-14 | `graph-cleanup` branch | n/a — post-processes #40's `.sqlite`, supersedes #41 | AI review Pass B, expanded to ~3x area (-76.95,38.10,-76.63,38.32), 323 candidates/37 tiles, reviewer = this session (Sonnet 5) reading tiles directly, no API | Expanded Pass B review, carrying forward #41's 104 verdicts by candidate_id: 262 keep / 52 drop / 9 unsure -> 69 drop ops applied; render_diff visual comparisons produced | 53,861 | 142,058 | 0 | 13 | 0 | no (review sample only) |
-| 43 | 2026-09-15 | this commit (`skeleton_junction_merge_m` fix, on top of `a859e41`) | `data/geojson/us-east-md-v5_clipped` (same clip as #39) | same as #39 plus `--skeleton-junction-merge-m 35.0` | SPEC-GRAPH-DENSITY.md §11 — fix `coastal_water` mesh-fill (short junction-to-junction edges `_prune_skeleton_spurs` never touches), found reviewing Pass B results visually. Third attempt: 20.0 and 30.0 (both discarded, not logged) barely moved the target location because 502/602 of its junction edges sit at a quantized ~30.4m raster distance; 35.0 clears it | 51,919 | 129,618 | 0 | 15 | 0 | no (see Details — `poi_snap_drift` caveat, not yet decided) |
+| 43 | 2026-09-15 | this commit (`skeleton_junction_merge_m` fix, on top of `a859e41`) | `data/geojson/us-east-md-v5_clipped` (same clip as #39) | same as #39 plus `--skeleton-junction-merge-m 35.0` | SPEC-GRAPH-DENSITY.md §11 — fix `coastal_water` mesh-fill (short junction-to-junction edges `_prune_skeleton_spurs` never touches), found reviewing Pass B results visually. Third attempt: 20.0 and 30.0 (both discarded, not logged) barely moved the target location because 502/602 of its junction edges sit at a quantized ~30.4m raster distance; 35.0 clears it | 51,919 | 129,618 | 0 | 15 | 0 | **YES (replaces #39)** — see Details, `poi_snap_drift` accepted as benign after visual re-render |
+| 44 | 2026-09-15 | `e932b3a` (`main`, PR #25 merged) | `data/geojson/nl-v5-zeeland-build_clipped` (same clip as #38) | same as #38 plus `--skeleton-junction-merge-m 35.0` | First Zeeland build with the `coastal_water` mesh-fill fix (§11), bringing Zeeland's production db in line with MD build #43. Reused #38's clip/derived-axes unchanged — nothing upstream of `nautical_routing_pipeline.py` changed since #38 | 50,964 | 146,377 | 0 | 13 | 0 | **YES (replaces live `zeeland.sqlite`)** — see Details |
+| 45 | 2026-09-15 | this commit (`channel_axis_deadend_stitch_m` fix, on top of `e932b3a`) | `data/geojson/us-east-md-v5_clipped` (same clip as #39/#43) | same as #43 plus `--channel-axis-deadend-stitch-m 1500.0` | SPEC-CHANNEL-AXES.md §10 — fix buoy-chain channel-axis dead ends (found via a live user report of a route abandoning a marked fairway), by connecting each such dead end to its nearest other graph node within 1500m, land-crossing-safe | 51,953 | 130,030 | 0 | 15 | 0 | **SUPERSEDED by #47** — v1 connected dead ends to other isolated fragments, provably a no-op for the reported route; see Details |
+| 46 | 2026-09-15 | this commit (same fix, on top of `e932b3a`) | `data/geojson/nl-v5-zeeland-build_clipped` (same clip as #38/#44) | same as #44 plus `--channel-axis-deadend-stitch-m 1500.0` | Same channel-axis dead-end fix as #45, applied to Zeeland | 50,964 | 146,889 | 0 | 13 | 0 | **SUPERSEDED by #48** — same bug as #45, see Details |
+| 47 | 2026-09-15 | this commit (`_connect_channel_axis_deadends` corrected: anchored + non-terminal candidates only) | `data/geojson/us-east-md-v5_clipped` (same clip as #39/#43/#45) | same as #45 (code fix, same flags) | SPEC-CHANNEL-AXES.md §10.1 — corrects #45: v1 connected dead ends to other isolated fragments (a no-op, caught by a second live user report); v2 requires the candidate be non-terminal AND anchored to a real edge. Verified against the actual reported route: Dijkstra cost 11759.4 -> 3821.8 | 51,953 | 130,006 | 0 | 15 | 0 | **SUPERSEDED by #49** — single-nearest-candidate could miss the far bank; see Details |
+| 48 | 2026-09-15 | this commit (same corrected fix, on top of `e932b3a`) | `data/geojson/nl-v5-zeeland-build_clipped` (same clip as #38/#44/#46) | same as #46 (code fix, same flags) | Same correction as #47, applied to Zeeland | 50,964 | 146,887 | 0 | 13 | 0 | **SUPERSEDED by #50** — same reason as #47, see Details |
+| 49 | 2026-09-16 | this commit (`_connect_channel_axis_deadends`: angular-sector multi-connection, up to 3 per dead end) | `data/geojson/us-east-md-v5_clipped` (same clip as #39/#43/#45/#47) | same as #47 plus `--channel-axis-deadend-max-connections 3` (new default) | User feedback on #47: a fairway runs mid-channel with skeleton on both banks, so connecting to only the single nearest candidate can miss the far bank (or even the near one, if 3-nearest-by-distance all happen to land on the same side). Partitions the search circle into up to 3 angular sectors, one connection per sector. Reported route improved again: 3821.8 -> 1953.5 | 51,953 | 130,474 | 0 | 15 | 0 | **YES (replaces #47)** — see Details |
+| 50 | 2026-09-16 | this commit (same angular-sector fix, on top of `e932b3a`) | `data/geojson/nl-v5-zeeland-build_clipped` (same clip as #38/#44/#46/#48) | same as #48 plus `--channel-axis-deadend-max-connections 3` (new default) | Same angular-sector fix as #49, applied to Zeeland | 50,964 | 147,685 | 0 | 13 | 0 | **YES (replaces #48)** — see Details |
 
 **Row #1 is not a valid comparison baseline** — its input clip/flags are unknown, so
 its counts cannot be attributed to any specific configuration. It's recorded because
@@ -1975,14 +1982,30 @@ Creek — and the fix thinned a locally dense mesh there too (74→47 nodes in a
 around the bridge). POI-pair reachability is unaffected; this reads as a plausible,
 benign consequence of removing genuine mesh-fill near a large linear landmark rather
 than a routing defect, but it is exactly the kind of headline-looks-fine regression
-`validate.py` exists to catch (builds #11/#12), so it is **not waved off** — not yet
-decided whether to accept it, raise `max_snap_drift_m` for open-water contexts, or
-investigate further.
+`validate.py` exists to catch (builds #11/#12), so it is **not waved off** at first —
+see the decision below, made only after a direct visual check.
 
-- **Not deployed** — pending the `poi_snap_drift` decision above and a visual
-  re-render of Cuckold Creek to confirm the picture itself (not just the counts) reads
-  clean, and re-examination of the buoy/fairway-connection appearance from the
-  original visual complaint now that the surrounding clutter is thinned.
+**Decision: accepted as a known, benign tradeoff.** `render_diff()` (baseline #39 vs.
+#43) at both Cuckold Creek and the flagged POI's coordinates confirms this reads as
+intended:
+
+- **Cuckold Creek** (`bbox=-76.97,38.26,-76.90,38.33`): the dense cross-hatched
+  mesh-fill patch is gone entirely — every node in it shows red/removed, no surviving
+  skeleton left inside its footprint. First direct visual confirmation of this fix
+  (previously only measured by node/edge counts).
+- **The flagged POI** (`38.98458,-76.34537`): turns out to be "Bay Bridge Marina" (a
+  marina sharing the bridge's name in the source data, near Sandy Point/Kent Narrows),
+  not the bridge span. The removed edges there are a small, open-water mesh-thinning
+  line north of the marina channel — no land crossings, marina channel/navmesh
+  boundary untouched, same benign pattern as Cuckold Creek at smaller scale.
+
+Not raising `max_snap_drift_m` — that would weaken the gate for every future build to
+paper over one already-confirmed-benign case. `poi_pair_reachability` is zero-loss and
+every other gate passes, so the caveat is accepted as-is.
+
+- **Deployed** to `signalk-routeiq/data/us_east_md_channel_axes.sqlite`, replacing
+  build #39 (backed up as `us_east_md_channel_axes_pre_junction_merge_v3.sqlite.bak`),
+  superseding #41/#42 which were review samples only.
 - **A real bug caught mid-implementation, not by any synthetic test**: an early version
   of the fix assumed `nx.Graph.edges()` returns `(u, v)` in the same order the edge was
   added with; ~26% of edges on the real piece come back reversed, which silently
@@ -2011,3 +2034,425 @@ investigate further.
 - **Tests**: 477 passed (21 new: `tests/test_graph_cleanup_trace.py` is a new file; the
   rest added to existing files, one set per fix above, each confirmed to fail without
   its fix).
+
+### #44 — `zeeland_junction_merge_v1.sqlite` — first Zeeland build with the `coastal_water` mesh-fill fix
+
+Brings Zeeland's production database in line with MD build #43: same
+`skeleton_junction_merge_m` fix (`docs/SPEC-GRAPH-DENSITY.md` §11), same value (35.0m).
+Nothing upstream of `nautical_routing_pipeline.py` changed since #38 (confirmed:
+`git log --since=2026-09-09 -- derive_channel_axes.py nautical_routing_pipeline.py
+enc_preprocessor.py` shows only 0a9b53d, this fix, and 753ad89, which touches only
+`graph_cleanup/` review tooling, not generation code) — so #38's clip and derived
+`channel_axes_lines.geojson` in `data/geojson/nl-v5-zeeland-build_clipped` were reused
+unchanged rather than re-clipping/re-deriving from `data/geojson/nl-v5`.
+
+```bash
+ulimit -Sv $((11*1024*1024))
+.venv/bin/python3 nautical_routing_pipeline.py \
+  --input-dir data/geojson/nl-v5-zeeland-build_clipped \
+  --output data/zeeland_junction_merge_v1.sqlite \
+  --country NL --name "zeeland-junction-merge-v1" \
+  --description "Zeeland province and approaches (Westerschelde, Oosterschelde, Veerse Meer, Grevelingen, Haringvliet, North Sea approach), based on Rijkswaterstaat IENC / ENC data" \
+  --tags '["ienc","rws","coastal","inland"]' \
+  --url "https://github.com/marcelrv/signalk-router-data" \
+  --license "Public Domain (Rijkswaterstaat)" --copyright "Rijkswaterstaat" \
+  --depth-ceiling 6.0 \
+  --sagitta-cap 250.0 --max-segment-m 2000 \
+  --axis-dedup-cap 100.0 --axis-dedup-floor-m 100.0 \
+  --min-navmesh-radius-m 1200.0 \
+  --connector-merge-m 5.0 \
+  --inland-densify-max-segment-m 120.0 \
+  --pass2-max-fanin-per-node 6 \
+  --pass0-target-fanin-cap 4 \
+  --node-merge-m 5.0 \
+  --narrow-fragment-reclass-max-fraction 0.5 \
+  --pass0-fanin-cap 6 \
+  --pass0-cross-type-first \
+  --skeleton-boundary-simplify-m 20.0 \
+  --skeleton-junction-merge-m 35.0 \
+  --channel-axes
+```
+
+Same as #38's command plus `--skeleton-junction-merge-m 35.0` and the renamed
+`--name`/`--output`. Build took ~20 min (no re-clip/re-derive needed).
+
+| | #38 baseline | **#44 (this build)** |
+|---|---|---|
+| nodes / edges | 54,761 / 159,783 | **50,964 / 146,377 (-6.9% / -8.4%)** |
+
+`graph_cleanup/validate.py`'s six gates (no probe pairs supplied, so `route_shape` did
+not run), this build vs. baseline #38 — a scratch script analogous to §11.4's MD one
+(`Baseline.measure` on #38, `validate.check` against the freshly loaded #44 graph):
+
+```
+[PASS] crosses_land: 0 -> 0
+[PASS] largest_component_by_length: 0.9712 -> 0.9709 (+0.04pp, limit 0.5pp)
+[PASS] poi_pair_reachability: 1655345 pairs -> 1655345, 0 lost
+[PASS] poi_snap_drift: 0 POIs snap >50m further than before
+[PASS] counts: nodes 54761 -> 50964 (-6.9%), edges 79703 -> 73000 (-8.4%) [validate.py's own g.edges count, half the raw sqlite row count above]
+[PASS] hubs: 0 nodes with out-degree > 30, max 13
+```
+
+All six pass cleanly — unlike MD build #43, **no `poi_snap_drift` caveat at all** here;
+Zeeland's mesh-fill removal did not thin any POI's neighbourhood enough to trip the
+50m threshold.
+
+**Visual confirmation** (`render_diff()`, same discipline as MD's Cuckold Creek check,
+§11.4): gridded both builds' node counts into 0.02°-cells and rendered the largest drop
+(`bbox=3.29,51.46,3.36,51.51`, cell centred on 3.32,51.48 — 162 nodes before, 6 after).
+The picture shows the same signature as Cuckold Creek: a dense, cross-hatched mesh-fill
+patch collapses into a single clean skeleton edge, with the surrounding real branch
+structure untouched.
+
+- **Installed live**: replaces both `zeeland.sqlite` (the actual production filename;
+  backed up as `zeeland_pre_junction_merge_v1.sqlite.bak`) and retires
+  `zeeland_channel_axes.sqlite` (renamed to
+  `zeeland_channel_axes_superseded_by_jmv1.sqlite.bak`, not deleted) — that file's whole
+  content (channel-axes) is now a strict subset of this build, and leaving both live
+  would have the dynamic-loading plugin load two overlapping regions for the same water.
+  `docker restart signalk-server`, confirmed `Up`; `docker logs` shows "peeked 31
+  database(s)" (down from 32, i.e. exactly one fewer live file) and a clean plugin start,
+  no errors.
+- **Not cleaned up (out of scope for this build)**: `zeeland_skeletonsimplify_v2.sqlite`
+  is a separate, older (2026-09-08) comparison file still live in the same directory,
+  from an earlier boundary-simplify experiment — likely another overlapping-coverage
+  leftover worth retiring the same way, but not touched here since it predates and is
+  unrelated to this specific fix.
+- **Logs**: build/validate scripts were scratch (`/tmp/build_zeeland_jmv1.sh`,
+  `/tmp/validate_zeeland.py`), not preserved in-repo — same convention as #43's.
+
+### #45 — `us_east_md_deadend_stitch_v1.sqlite` — fix buoy-chain channel-axis dead ends
+
+Found via a live user report (screenshots of the deployed routeiq UI, not a
+synthetic test or a Pass B tile): a real route near the Wicomico River, MD
+abandoned a marked fairway partway along it, detouring onto a longer, shallower
+path and triggering a draft-constraint warning. The hovered node in the report
+(`38.2476°N, -76.8246°W`) is a real, degree-1 terminal node at the end of a
+tier-3 `mark_chain` channel axis. Confirmed present already in baseline build #39
+(same node, same 948m gap to the nearest non-axis node) — a longstanding gap in
+how buoy-chain axes get stitched to the rest of the graph, not a regression from
+builds #43/#44. Root cause, fix design, and full real-build numbers:
+`docs/SPEC-CHANNEL-AXES.md` §10.
+
+Statewide measurement on the then-deployed MD build found 221 such dead ends,
+median gap to the nearest non-axis node 211m, p90 948m, max 3.4km — a degree-1
+node can only be entered and backtracked out of, so Dijkstra never routes through
+one, and the marked channel becomes unusable for through-routing past that point.
+
+```bash
+ulimit -Sv $((11*1024*1024))
+.venv/bin/python3 nautical_routing_pipeline.py \
+  --input-dir data/geojson/us-east-md-v5_clipped \
+  --output data/us_east_md_deadend_stitch_v1.sqlite \
+  --country US --name "us-east-md-v5-deadend-stitch-v1" \
+  --description "US coastal waters (us-east-md-v5-deadend-stitch-v1), based on NOAA ENCs" \
+  --tags '["noaa","enc","coastal"]' \
+  --url "https://github.com/marcelrv/signalk-router-data" \
+  --license "Public Domain (NOAA)" --copyright "NOAA Office of Coast Survey" \
+  --depth-ceiling 6.0 \
+  --coverage-bbox="-77.4,37.88,-74.68,39.63" \
+  --sagitta-cap 250.0 --max-segment-m 2000 \
+  --axis-dedup-cap 100.0 --axis-dedup-floor-m 100.0 \
+  --min-navmesh-radius-m 1200.0 \
+  --connector-merge-m 5.0 \
+  --inland-densify-max-segment-m 120.0 \
+  --pass2-max-fanin-per-node 6 \
+  --pass0-target-fanin-cap 4 \
+  --node-merge-m 5.0 \
+  --narrow-fragment-reclass-max-fraction 0.5 \
+  --pass0-fanin-cap 6 \
+  --pass0-cross-type-first \
+  --skeleton-boundary-simplify-m 20.0 \
+  --skeleton-junction-merge-m 35.0 \
+  --channel-axis-deadend-stitch-m 1500.0 \
+  --channel-axes
+```
+
+Same as build #43's command plus one additive flag
+(`--channel-axis-deadend-stitch-m 1500.0` — covers all but 6 of the 221 measured
+dead ends, comfortably under the 5000m validation ceiling).
+
+**Connector pass log**: `Channel-axis dead-end connector pass: 220 dead ends
+found, 176 connected (radius 1500m), 1220 candidates rejected for crossing land,
+44 gave up (no safe candidate within radius).`
+
+The specific reported node went from degree 1 to degree 2 (new neighbour: another
+channel_axes node 137.7m away). Tracing its connected component confirms it was
+already, both before and after this fix, part of the graph's largest component
+(rank #1 by node count, 42,513 nodes) — so the real problem was never a hard
+graph disconnection (`poi_pair_reachability` was always zero-loss) but a spur
+that could never be used for through-routing. `render_diff()` against build #43
+over the Wicomico River/Neale Sound area shows new connector edges landing
+exactly at buoy-marked-channel locations, not scattered arbitrarily.
+
+`graph_cleanup/validate.py`'s six gates (no probe pairs supplied), this build vs.
+baseline #43:
+
+```
+[PASS] crosses_land: 0 -> 0
+[PASS] largest_component_by_length: 0.8620 -> 0.8623 (-0.03pp, limit 0.5pp)
+[PASS] poi_pair_reachability: 48539 pairs -> 48539, 0 lost
+[PASS] poi_snap_drift: 0 POIs snap >50m further than before
+[FAIL] counts: nodes 51919 -> 51953 (+0.1%), edges 64808 -> 65014 (+0.3%)
+[PASS] hubs: 0 nodes with out-degree > 30, max 15
+```
+
+**The `counts` gate "failure" is expected, not a regression** — full reasoning in
+`docs/SPEC-CHANNEL-AXES.md` §10, summary here: that gate assumes a post-hoc
+*cleanup* context where a graph should only ever shrink; it doesn't apply to a
+generation-time fix whose entire point is to add edges. Diffing the two builds'
+node sets directly: 431 nodes present only in the baseline, 465 only in the new
+build, scattered statewide with no relation to any dead-end location — ordinary
+pipeline run-to-run non-determinism (confirmed unrelated to this fix: the new
+pass only adds edges between node IDs already in the graph, never a new node).
+The edge count's real, attributable increase is the 176 connections actually
+made; the rest is that same background noise.
+
+- **Tests**: 494 passed (13 new, `tests/test_channel_axis_deadend_stitch.py`:
+  disabled-by-default no-op, connects within radius, respects the radius cutoff,
+  rejects a land-crossing candidate, ignores non-channel-axes dead ends, and
+  `_validate_channel_axis_deadend_stitch_m` bounds checks).
+- **Deployed** to `signalk-routeiq/data/us_east_md_channel_axes.sqlite`, replacing
+  build #43 (backed up), alongside the matching Zeeland build (#46).
+
+**CORRECTION (found by a second live user report, skeptical of this fix): v1 was
+a no-op for the reported route.** The user pointed out the fairway's end was well
+within 1500m of a real skeleton node yet still not usefully connected. Checking
+directly: the shortest-path Dijkstra COST between the reported start/dest points
+was measured byte-identical (11759.4) on this build and on baseline #43 — the
+176 connections made above did not shorten this route at all. Root cause: v1
+connected each dead end to the plain nearest OTHER node with no eligibility
+check, and on real geometry that usually meant another equally isolated
+channel_axes fragment in the same local tangle (this exact node: 137.7m to
+another channel_axes-sourced node, degree 2 — not itself a terminus, so it
+passed every check v1 had) rather than the real skeleton actually useful for
+routing (948m away, ignored for being farther). Both ends were already in the
+same connected component the long way round, so the new edge changed nothing
+measurable. **Fixed and superseded by build #47** (`_connect_channel_axis_deadends`
+now requires a candidate to be both non-terminal AND "anchored" — touching at
+least one non-channel_axes edge). Full writeup: `docs/SPEC-CHANNEL-AXES.md` §10.
+
+### #46 — `zeeland_deadend_stitch_v1.sqlite` — same channel-axis dead-end fix, Zeeland
+
+Same fix as #45, applied to Zeeland's clip (reusing #44's clip/derived-axes
+unchanged, same as #44 reused #38's). Command identical to build #44's plus
+`--channel-axis-deadend-stitch-m 1500.0`.
+
+**Connector pass log**: `Channel-axis dead-end connector pass: 262 dead ends
+found, 256 connected (radius 1500m), 186 candidates rejected for crossing land,
+6 gave up (no safe candidate within radius).` A much higher hit rate than MD's
+(98% vs. 80%) — Zeeland's marked-channel buoy density is higher (§7.2), so more
+candidates land close enough to a safe connector.
+
+`graph_cleanup/validate.py`'s six gates, this build vs. baseline #44:
+
+```
+[PASS] crosses_land: 0 -> 0
+[PASS] largest_component_by_length: 0.9709 -> 0.9709 (-0.00pp, limit 0.5pp)
+[PASS] poi_pair_reachability: 1655345 pairs -> 1655345, 0 lost
+[PASS] poi_snap_drift: 0 POIs snap >50m further than before
+[FAIL] counts: nodes 50964 -> 50964 (-0.0%), edges 73000 -> 73256 (--0.4%)
+[PASS] hubs: 0 nodes with out-degree > 30, max 13
+```
+
+**Node count is exactly unchanged (50,964 -> 50,964)** — unlike MD, this run hit
+none of the background node-dedup non-determinism #45 measured, so the edge
+delta (+256) matches the connector pass's own count exactly, 1:1, with zero
+noise. Confirms #45's "counts gate failure is background noise, not the fix"
+reasoning directly, on a build where the noise happened not to occur at all.
+
+**Visual confirmation**: `render_diff()` over a busy multi-channel stretch
+(`bbox=4.38,51.85,4.52,51.92`) shows dozens of new connector edges landing along
+buoy-marked fairways throughout the image, not concentrated in one spot or
+scattered onto open water — consistent with Zeeland's much higher marked-channel
+density (§7.2) producing proportionally more dead ends and more fixes.
+
+- **Deployed** to `signalk-routeiq/data/zeeland.sqlite`, replacing build #44
+  (backed up), alongside MD (#45).
+
+**CORRECTION: superseded by build #48 for the same reason as #45/#47** — v1's
+connector had no eligibility check on the candidate node, so on real geometry it
+could (and, per #45's MD case, provably did) connect a dead end to another
+isolated fragment of the same tangle rather than the real network. Zeeland's own
+98% connection rate almost certainly includes some of the same wasted
+connections; not independently re-measured per-route since the bug and its fix
+are general, not MD-specific. See `docs/SPEC-CHANNEL-AXES.md` §10.
+
+### #47 — `us_east_md_deadend_stitch_v2.sqlite` — corrects #45: candidates must be anchored, not just nearest
+
+A second live user report was skeptical of #45's deployed fix: the reported
+fairway's end was clearly within 1500m of a real skeleton node, yet the route
+was still 6.7nmi instead of an expected ~1nmi. Checking directly settled it —
+Dijkstra cost between the reported start/dest points was **byte-identical**
+(11759.4) on build #45 and on baseline #43. The 176 connections #45 made were a
+no-op for this route. Full root-cause writeup: `docs/SPEC-CHANNEL-AXES.md` §10.1.
+
+**Root cause**: `_connect_channel_axis_deadends` (v1) connected each dead end to
+the plain nearest OTHER node with no eligibility check. On real geometry that
+usually meant another equally isolated channel_axes fragment in the same local
+tangle (this exact node: 137.7m to a degree-2, both-edges-channel_axes node —
+not itself a terminus, so a naive "don't chain two dead ends" rule wouldn't have
+caught it either) rather than the real, useful skeleton node 948m away, ignored
+for being farther. Both ends were already in the same connected component the
+long way round (86% of MD's edge length is one component, so "already
+connected, eventually" is a very weak signal here) — the new edge added zero
+routing value.
+
+**Fix**: `_connect_channel_axis_deadends` now requires a candidate to satisfy
+BOTH (1) not itself a degree-1 terminus (any source) and (2) "anchored" —
+touches at least one non-channel_axes edge, i.e. already part of the real
+network rather than another orphaned fragment. Code-only change, same flags as
+#45. Regression tests added: `TestPrefersAnchoredCandidate` (2 new cases,
+reproducing both failure shapes exactly — an unanchored-but-non-terminal
+fragment-mate, and an anchored-but-terminal real stub). 497 tests total.
+
+```bash
+# identical command to build #45's, only the code changed
+```
+
+**Connector pass log**: `220 dead ends found, 164 connected (radius 1500m), 1409
+candidates rejected for crossing land, 56 gave up.` Fewer connections than v1's
+176 (expected — many of v1's were exactly the useless kind this version now
+refuses to make).
+
+**Verified against the actual reported route**: the specific node now connects
+to the real skeleton node 948m away (the same one v1's search saw and discarded
+for being farther than the useless 137.7m alternative) — degree 1 -> 2, same as
+v1, but this time to the right neighbour. Dijkstra cost for the reported
+start/dest points: **11759.4 -> 3821.8** (path length 69 hops -> 5 hops). This is
+the number that actually matters here — the gate table below is necessary but
+was already passing on the broken v1, so it alone would not have caught this bug.
+
+`graph_cleanup/validate.py` gates vs. baseline (build #43):
+
+```
+[PASS] crosses_land: 0 -> 0
+[PASS] largest_component_by_length: 0.8620 -> 0.8627 (-0.07pp, limit 0.5pp)
+[PASS] poi_pair_reachability: 48539 pairs -> 48539, 0 lost
+[PASS] poi_snap_drift: 0 POIs snap >50m further than before
+[FAIL] counts: nodes 51919 -> 51953 (-0.1%), edges 64808 -> 65002 (-0.3%)
+[PASS] hubs: 0 nodes with out-degree > 30, max 15
+```
+
+`counts` fails for the same already-documented reason as #45 (edge-adding fix,
+not a shrink-only cleanup; node delta is background pipeline non-determinism).
+
+**Visual confirmation**: `render_diff()` at the same bbox as #45 now shows one
+long, direct connector line from the buoy cluster straight to the nearby real
+skeleton, replacing the short internal stitches v1 drew inside the tangle.
+
+- **Deployed** to `signalk-routeiq/data/us_east_md_channel_axes.sqlite`,
+  replacing v1 (build #45, kept as `.disabled`), alongside Zeeland (#48).
+
+### #48 — `zeeland_deadend_stitch_v2.sqlite` — same correction as #47, Zeeland
+
+Same code fix as #47, same flags as #46.
+
+**Connector pass log**: `262 dead ends found, 255 connected (radius 1500m), 202
+candidates rejected for crossing land, 7 gave up.` Almost unchanged from v1's
+256 (Zeeland's marked channels are mostly properly integrated end-to-end already,
+so the anchored restriction rarely disqualifies a candidate here — unlike MD's
+Wicomico River tangle, which was specifically a locally dense, poorly-integrated
+buoy cluster).
+
+`graph_cleanup/validate.py` gates vs. baseline (build #44):
+
+```
+[PASS] crosses_land: 0 -> 0
+[PASS] largest_component_by_length: 0.9709 -> 0.9709 (-0.01pp, limit 0.5pp)
+[PASS] poi_pair_reachability: 1655345 pairs -> 1655345, 0 lost
+[PASS] poi_snap_drift: 0 POIs snap >50m further than before
+[FAIL] counts: nodes 50964 -> 50964 (-0.0%), edges 73000 -> 73255 (-0.3%)
+[PASS] hubs: 0 nodes with out-degree > 30, max 13
+```
+
+- **Deployed** to `signalk-routeiq/data/zeeland.sqlite`, replacing v1 (build #46,
+  kept as `.disabled`), alongside MD (#47).
+
+### #49 — `us_east_md_deadend_stitch_v3.sqlite` — angular-sector multi-connection (up to 3 per dead end)
+
+User feedback on #47's deployed fix: a marked channel typically runs down the
+middle of open water, so its medial-axis skeleton usually exists on both banks
+— connecting each dead end to only its single nearest eligible candidate risks
+picking one bank arbitrarily and never offering the other. Follow-up feedback
+sharpened the design further: the several nearest-by-distance candidates should
+NOT just be taken as-is, since they can easily all sit on the same bank/skeleton
+branch if it happens to be locally denser than the other side. Full design:
+`docs/SPEC-CHANNEL-AXES.md` §10.2.
+
+**Design**: `_connect_channel_axis_deadends` now partitions the full circle
+around each dead end into `channel_axis_deadend_max_connections` (new flag,
+default 3) equal angular sectors, and takes the nearest ELIGIBLE (rules 1+2
+from #47 unchanged) candidate FROM EACH sector — not just the 3 nearest
+overall. This directly guarantees spread: two candidates 10° apart can never
+both be chosen just because a "slot" is free, since they fall in the same
+sector and only the nearer one is taken there.
+
+```bash
+# identical to build #47's, plus one additive flag
+--channel-axis-deadend-max-connections 3
+```
+
+**Connector pass log**: `220 dead ends found, 398 connections made across 164
+dead ends (radius 1500m, up to 3 per dead end, one per angular sector), 2293
+candidates rejected for crossing land, 56 gave up.` Same 164/220 dead ends got
+at least one connection as #47 (the anchored+non-terminal eligibility rules are
+unchanged) — the difference is now averaging ~2.4 connections per connected
+dead end instead of exactly 1.
+
+**Verified against the actual reported route, again**: the specific node now
+has degree 4 (up from #47's degree 2) — three new edges at 947.6m, 962.7m, and
+1130.2m, in three visibly different compass directions (confirmed via
+`render_diff()`: three separate red lines fanning out from the buoy cluster,
+not one). Dijkstra cost for the reported start/dest points improved again:
+**3821.8 -> 1953.5** (path length 5 hops -> 3 hops) — close to the user's
+original "~1nmi" expectation.
+
+`graph_cleanup/validate.py` gates vs. baseline (build #43):
+
+```
+[PASS] crosses_land: 0 -> 0
+[PASS] largest_component_by_length: 0.8620 -> 0.8644 (-0.24pp, limit 0.5pp)
+[PASS] poi_pair_reachability: 48539 pairs -> 48539, 0 lost
+[PASS] poi_snap_drift: 0 POIs snap >50m further than before
+[FAIL] counts: nodes 51919 -> 51953 (-0.1%), edges 64808 -> 65236 (-0.7%)
+[PASS] hubs: 0 nodes with out-degree > 30, max 15
+```
+
+`counts` fails for the same already-documented reason (edge-adding fix, not a
+shrink-only cleanup). `largest_component_by_length` moved a bit more than #47's
+(-0.24pp vs -0.07pp, still well inside the 0.5pp limit) — expected: more real,
+useful connections pull more of the graph's edge length into the largest
+component instead of leaving it attributed to the long-way-round path.
+
+**Tests**: 510 passed (13 new: `TestAngularSectorSpread` — connects across
+multiple sectors, only the nearer of two same-sector candidates is used, a
+`max_connections` cap actually caps; `TestValidateMaxConnections` bounds
+checks).
+
+- **Deployed** to `signalk-routeiq/data/us_east_md_channel_axes.sqlite`,
+  replacing v2 (build #47, kept as `.disabled`), alongside Zeeland (#50).
+
+### #50 — `zeeland_deadend_stitch_v3.sqlite` — same angular-sector fix as #49, Zeeland
+
+Same code fix as #49, same flags as #48 plus `--channel-axis-deadend-max-
+connections 3`.
+
+**Connector pass log**: `262 dead ends found, 654 connections made across 255
+dead ends (radius 1500m, up to 3 per dead end, one per angular sector), 981
+candidates rejected for crossing land, 7 gave up.` Same 255/262 dead ends get
+at least one connection as #48, now averaging ~2.6 connections each.
+
+`graph_cleanup/validate.py` gates vs. baseline (build #44):
+
+```
+[PASS] crosses_land: 0 -> 0
+[PASS] largest_component_by_length: 0.9709 -> 0.9712 (-0.03pp, limit 0.5pp)
+[PASS] poi_pair_reachability: 1655345 pairs -> 1655345, 0 lost
+[PASS] poi_snap_drift: 0 POIs snap >50m further than before
+[FAIL] counts: nodes 50964 -> 50964 (-0.0%), edges 73000 -> 73654 (-0.9%)
+[PASS] hubs: 0 nodes with out-degree > 30, max 13
+```
+
+- **Deployed** to `signalk-routeiq/data/zeeland.sqlite`, replacing v2 (build
+  #48, kept as `.disabled`), alongside MD (#49).
