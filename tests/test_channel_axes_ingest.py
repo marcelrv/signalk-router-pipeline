@@ -10,7 +10,7 @@ All fixtures are synthetic geometry near Zeeland -- no real chart data.
 
 import geopandas as gpd
 import pytest
-from shapely.geometry import LineString
+from shapely.geometry import LineString, Polygon
 
 from nautical_routing_pipeline import (
     NauticalRoutingPipeline,
@@ -161,6 +161,42 @@ class TestNavmeshCarveExclusion:
         suppress, _ = p._axis_dedup_suppression_mask(mask, transform, utm, px, polygon,
                                                      exclude_layer_key="channel_axes")
         assert suppress[49, 100]
+
+
+class TestExtractBuoyageDirection:
+    """docs/SPEC-CHANNEL-AXES.md §9: `_extract_buoyage_direction` derives a
+    fairway's lateral-buoyage direction from an overlapping channel_axes line's
+    `direction_deg`, and still returns None (byte-identical to before this seam
+    was lit up) with no channel_axes rows, an empty gdf, or no spatial match."""
+
+    def _fairway_row(self, geom):
+        return gpd.GeoDataFrame({"OBJNAM": ["Test Fairway"]}, geometry=[geom], crs="EPSG:4326").iloc[0]
+
+    def _fairway_poly(self):
+        return Polygon([(3.70, 51.44), (3.71, 51.44), (3.71, 51.45), (3.70, 51.45)])
+
+    def test_none_without_channel_axes_gdf(self):
+        row = self._fairway_row(self._fairway_poly())
+        assert NauticalRoutingPipeline._extract_buoyage_direction(row) is None
+
+    def test_none_with_empty_channel_axes_gdf(self):
+        row = self._fairway_row(self._fairway_poly())
+        empty = gpd.GeoDataFrame(geometry=[], crs="EPSG:4326")
+        assert NauticalRoutingPipeline._extract_buoyage_direction(row, empty) is None
+
+    def test_matching_axis_returns_its_direction(self):
+        row = self._fairway_row(self._fairway_poly())
+        axes = gpd.GeoDataFrame({"direction_deg": [123.4]},
+                                geometry=[LineString([(3.705, 51.445), (3.706, 51.446)])],
+                                crs="EPSG:4326")
+        assert NauticalRoutingPipeline._extract_buoyage_direction(row, axes) == 123
+
+    def test_non_overlapping_axis_returns_none(self):
+        row = self._fairway_row(self._fairway_poly())
+        axes = gpd.GeoDataFrame({"direction_deg": [123.4]},
+                                geometry=[LineString([(4.70, 52.44), (4.71, 52.45)])],
+                                crs="EPSG:4326")
+        assert NauticalRoutingPipeline._extract_buoyage_direction(row, axes) is None
 
 
 class TestNavmeshCarveFastPath:
