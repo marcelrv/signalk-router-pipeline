@@ -23,11 +23,13 @@ from derive_channel_axes import (
     dedupe_marks,
     center_chain,
     default_half_width_m,
+    order_marks_spatial,
     parse_mark_name,
     polygon_skeleton,
     shoal_normal,
     split_anchors,
     subtract_coverage,
+    SPATIAL_KEY,
 )
 
 
@@ -323,6 +325,90 @@ class TestEndToEnd:
         axes = gpd.read_file(d / dca.OUTPUT_AXES)
         assert list(axes["axis_kind"]) == ["polygon_centerline"]
         assert os.path.exists(d / dca.OUTPUT_REJECTED)
+
+
+# ----------------------------------------------------------------------------- spatial fallback
+
+def _mark_chain_dir(tmp_path, subdir, names):
+    """8 alternating-hand mark pairs, 400 m apart, water only (no fairway/depare, so
+    tier 2 yields nothing and the chain-level confidence isolates the tier 3 path)."""
+    utm = "EPSG:32631"
+    x0, y0 = 550000.0, 5700000.0
+    water = box(x0, y0, x0 + 6000, y0 + 3000)
+    marks = []
+    for i in range(8):
+        x = x0 + 2500 + i * 400
+        marks.append((names[2 * i], CATLAM_PORT, Point(x, y0 + 1650)))
+        marks.append((names[2 * i + 1], CATLAM_STARBOARD, Point(x, y0 + 1350)))
+    d = tmp_path / subdir
+    d.mkdir()
+    _to_wgs(gpd.GeoDataFrame({"DRVAL1": [2.0]}, geometry=[water], crs=utm)).to_file(
+        d / "coastal_water_polygons.geojson", driver="GeoJSON")
+    _to_wgs(gpd.GeoDataFrame({"OBJNAM": [m[0] for m in marks], "CATLAM": [m[1] for m in marks],
+                              "src_objl": ["BOYLAT"] * len(marks), "src_cscl": [12000] * len(marks)},
+                             geometry=[m[2] for m in marks], crs=utm)).to_file(
+        d / "lateral_marks_points.geojson", driver="GeoJSON")
+    return d
+
+
+# No trailing digits anywhere -- guaranteed to fail both _US_MARK_RE (needs a keyword
+# + number) and _EU_MARK_RE (needs a mandatory trailing number), unlike "O 12" or "Q1".
+_GARBAGE_NAMES = ["Radar Reflector", "Racon Site", "Historic Wreck", "Sunken Barge",
+                  "Old Piling", "Rock Ledge", "Reef Marker", "Shoal Post",
+                  "Ruin Stake", "Ballast Heap", "Ghost Light", "Broken Spar",
+                  "Mud Bank Post", "Weed Bed Stub", "Timber Snag", "Coral Head"]
+_BARE_NAMES = [str(n) for n in range(1, 17)]  # odd=port, even=starboard, per the loop above
+
+
+class TestSpatialChainingFallback:
+    def test_unparseable_names_are_chained_not_dropped(self, tmp_path):
+        d = _mark_chain_dir(tmp_path, "spatial", _GARBAGE_NAMES)
+        ChannelAxisDeriver(str(d), str(d), Params()).run()
+        axes = gpd.read_file(d / dca.OUTPUT_AXES)
+        assert list(axes["axis_kind"]) == ["mark_chain"]
+        assert axes.iloc[0]["n_marks"] == 16
+        stats = json.load(open(d / dca.OUTPUT_STATS))
+        assert stats["marks"]["unparsed_name"] == 16
+        assert stats["marks"]["spatial_fallback"] == 16
+
+    def test_spatial_chain_gets_a_distinct_channel_key(self, tmp_path):
+        d = _mark_chain_dir(tmp_path, "spatial_key", _GARBAGE_NAMES)
+        ChannelAxisDeriver(str(d), str(d), Params()).run()
+        axes = gpd.read_file(d / dca.OUTPUT_AXES)
+        assert axes.iloc[0]["channel_name"] == SPATIAL_KEY
+        assert SPATIAL_KEY != dca.BARE_NUMBER_KEY
+
+    def test_spatial_chain_confidence_lower_than_bare_number_chain(self, tmp_path):
+        spatial_dir = _mark_chain_dir(tmp_path, "spatial_conf", _GARBAGE_NAMES)
+        bare_dir = _mark_chain_dir(tmp_path, "bare_conf", _BARE_NAMES)
+        ChannelAxisDeriver(str(spatial_dir), str(spatial_dir), Params()).run()
+        ChannelAxisDeriver(str(bare_dir), str(bare_dir), Params()).run()
+        spatial_conf = gpd.read_file(spatial_dir / dca.OUTPUT_AXES).iloc[0]["confidence"]
+        bare_conf = gpd.read_file(bare_dir / dca.OUTPUT_AXES).iloc[0]["confidence"]
+        assert spatial_conf < bare_conf
+
+    def test_order_marks_spatial_walks_nearest_neighbour(self):
+        # SPATIAL_KEY marks have no (number, suffix) to sort by; ordering must come
+        # from geometry alone, via nearest-neighbour chaining from a PCA-picked end.
+        pts = [(0, 0), (1200, 5), (400, -5), (800, 0)]
+        marks = [_mark(x, y, CATLAM_PORT, 0, key=SPATIAL_KEY) for x, y in pts]
+        ordered = order_marks_spatial(marks)
+        xs = [m.pt.x for m in ordered]
+        assert xs == sorted(xs)
+
+    def test_parsed_and_bare_number_paths_unaffected(self, synthetic_dir):
+        # regression: the existing named-channel path in the shared fixture (which
+        # also contains no unparseable names) is untouched by the new SPATIAL_KEY branch
+        out = synthetic_dir / "out_regress"
+        ChannelAxisDeriver(str(synthetic_dir), str(out), Params()).run()
+        axes = gpd.read_file(out / dca.OUTPUT_AXES)
+        chain_axes = axes[axes["axis_kind"] == "mark_chain"]
+        assert len(chain_axes) == 1
+        assert chain_axes.iloc[0]["channel_name"] == "Test Channel"
+        assert chain_axes.iloc[0]["confidence"] >= 0.8
+        stats = json.load(open(out / dca.OUTPUT_STATS))
+        assert stats["marks"]["unparsed_name"] == 0
+        assert stats["marks"]["spatial_fallback"] == 0
 
 
 class TestCli:

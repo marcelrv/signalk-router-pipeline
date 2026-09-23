@@ -98,6 +98,11 @@ _EU_MARK_RE = re.compile(r"^(?P<chan>[A-Za-z][A-Za-z\-\. ]*?)\s*-?\s*(?P<num>\d+
 # channels, at reduced confidence.
 _BARE_MARK_RE = re.compile(r"^(?P<num>\d+)\s?(?P<suf>[A-Za-z]?)$")
 BARE_NUMBER_KEY = "(unnamed channel)"
+# OBJNAM present but matching none of the patterns above (4 % of US marks, 13 % of NL
+# marks): grouped purely by spatial proximity (cluster_marks, same cluster_link_m
+# knob), at a lower confidence than BARE_NUMBER_KEY since there is not even a bare
+# number to order the chain by.
+SPATIAL_KEY = "(unnamed, spatial)"
 # Trailing words that name the same channel as the bare name ("Wicomico River Entrance
 # Light 1W" belongs to the "Wicomico River" chain).
 _STRIP_TRAILING = ("entrance", "approach", "junction")
@@ -446,7 +451,14 @@ def _to_int(v) -> Optional[int]:
 
 
 def load_marks(lateral: gpd.GeoDataFrame, safe: gpd.GeoDataFrame) -> Tuple[List[Mark], int, int]:
-    """Build Mark objects (metric CRS input). Returns (marks, n_unparsed, n_unnamed)."""
+    """Build Mark objects (metric CRS input). Returns (marks, n_unparsed, n_unnamed).
+
+    A mark whose OBJNAM fails every pattern (``n_unparsed``) is not dropped: it is
+    kept under ``SPATIAL_KEY`` so it can still be grouped by spatial proximity in
+    ``derive_mark_axes`` (§9 follow-up, "a spatial-chaining fallback at low
+    confidence"). A mark with no OBJNAM at all (``n_unnamed``) has no charted
+    identity to fall back on and is still dropped.
+    """
     marks: List[Mark] = []
     unparsed = unnamed = 0
     for gdf, default_kind in ((lateral, None), (safe, "safe_water")):
@@ -459,17 +471,18 @@ def load_marks(lateral: gpd.GeoDataFrame, safe: gpd.GeoDataFrame) -> Tuple[List[
             pt = geom if geom.geom_type == "Point" else geom.representative_point()
             name = row.get("OBJNAM")
             parsed = parse_mark_name(name)
-            if parsed is None:
-                if name and isinstance(name, str) and name.strip():
-                    unparsed += 1
-                else:
-                    unnamed += 1
-                continue
-            key, num, suf, display = parsed
             objl = str(row.get("src_objl") or "").upper()
             kind = default_kind or ("beacon" if objl.startswith("BCN") else "buoy")
             catlam = None if kind == "safe_water" else _to_int(row.get("CATLAM"))
             cscl = _to_int(row.get("src_cscl"))
+            if parsed is None:
+                if name and isinstance(name, str) and name.strip():
+                    unparsed += 1
+                    marks.append(Mark(str(name).strip(), SPATIAL_KEY, 0, "", catlam, kind, cscl, pt, SPATIAL_KEY))
+                else:
+                    unnamed += 1
+                continue
+            key, num, suf, display = parsed
             marks.append(Mark(str(name).strip(), key, num, suf, catlam, kind, cscl, pt, display))
     return marks, unparsed, unnamed
 
@@ -520,6 +533,28 @@ def cluster_marks(marks: List[Mark], link_m: float) -> List[List[Mark]]:
 
 def order_marks(marks: List[Mark]) -> List[Mark]:
     return sorted(marks, key=lambda m: (m.num, m.suf))
+
+
+def order_marks_spatial(marks: List[Mark]) -> List[Mark]:
+    """Order a SPATIAL_KEY group that has no number to sort by: project onto the
+    cluster's principal axis to pick a deterministic start, then walk
+    nearest-unvisited-mark (greedy nearest-neighbour chaining) from there."""
+    if len(marks) <= 2:
+        return list(marks)
+    xy = np.array([[m.pt.x, m.pt.y] for m in marks])
+    centered = xy - xy.mean(axis=0)
+    _, _, vt = np.linalg.svd(centered, full_matrices=False)
+    proj = centered @ vt[0]
+    start = int(np.argmin(proj))
+    remaining = set(range(len(marks)))
+    order = [start]
+    remaining.discard(start)
+    while remaining:
+        last = xy[order[-1]]
+        nxt = min(remaining, key=lambda i: math.hypot(*(xy[i] - last)))
+        order.append(nxt)
+        remaining.discard(nxt)
+    return [marks[i] for i in order]
 
 
 def _unit(p: Point, q: Point) -> Tuple[float, float]:
@@ -1077,8 +1112,12 @@ class ChannelAxisDeriver:
             self.stats["tier3"] = {"chains": 0}
             return
         # Region-wide numbering convention (IALA B: odd = port; IALA A: even = port).
-        odd_port = sum(1 for m in marks if m.lateral and (m.num % 2 == 1) == (m.catlam == CATLAM_PORT))
-        lateral_n = sum(1 for m in marks if m.lateral)
+        # SPATIAL_KEY marks carry a placeholder num=0, not a charted number, so they
+        # carry no parity signal and are excluded from both this detection and the
+        # per-chain mismatch check below.
+        odd_port = sum(1 for m in marks if m.lateral and m.key != SPATIAL_KEY
+                       and (m.num % 2 == 1) == (m.catlam == CATLAM_PORT))
+        lateral_n = sum(1 for m in marks if m.lateral and m.key != SPATIAL_KEY)
         convention_odd_port = odd_port >= lateral_n / 2.0 if lateral_n else True
         self.stats["parity_convention"] = "odd=port (IALA B)" if convention_odd_port else "even=port (IALA A)"
         by_key = collections.defaultdict(list)
@@ -1089,7 +1128,7 @@ class ChannelAxisDeriver:
         reasons = collections.Counter()
         for key, group in by_key.items():
             for cluster in cluster_marks(group, p.cluster_link_m):
-                seq = order_marks(cluster)
+                seq = order_marks_spatial(cluster) if key == SPATIAL_KEY else order_marks(cluster)
                 anchors = center_chain(seq, default_half_width_m(seq))
                 for chain in split_anchors(anchors, p.max_mark_gap_m, p.max_turn_deg):
                     n_chains += 1
@@ -1151,7 +1190,7 @@ class ChannelAxisDeriver:
             return None, reason
         n_gates = sum(1 for a in chain if a.is_gate)
         n_pairs = sum(1 for a in chain if len(a.marks) == 2)
-        parity_bad = sum(1 for m in chain_marks if m.lateral and
+        parity_bad = sum(1 for m in chain_marks if m.lateral and m.key != SPATIAL_KEY and
                          ((m.num % 2 == 1) == (m.catlam == CATLAM_PORT)) != convention_odd_port)
         confidence = 0.6
         if n_pairs and n_gates >= 0.5 * n_pairs:
@@ -1160,7 +1199,9 @@ class ChannelAxisDeriver:
             confidence += 0.1
         if parity_bad:
             confidence -= 0.1
-        if chain_marks and all(m.key == BARE_NUMBER_KEY for m in chain_marks):
+        if chain_marks and all(m.key == SPATIAL_KEY for m in chain_marks):
+            confidence -= 0.2   # spatial fallback: no channel name and no bare number to order by
+        elif chain_marks and all(m.key == BARE_NUMBER_KEY for m in chain_marks):
             confidence -= 0.1   # grouped by proximity only, not by a charted channel name
         width = 2.0 * float(np.median([a.half_width for a in chain]))
         res = self._finish_axis(line, tier=3, kind="mark_chain", name=name, confidence=confidence,
@@ -1288,10 +1329,12 @@ class ChannelAxisDeriver:
         self.load()
         raw_marks, unparsed, unnamed = load_marks(self.gdfs["lateral_marks"], self.gdfs["safe_water_marks"])
         self.marks = dedupe_marks(raw_marks)
-        self.stats["marks"] = {"raw": len(raw_marks) + unparsed + unnamed, "parsed": len(raw_marks),
-                               "unparsed_name": unparsed, "unnamed": unnamed, "deduped": len(self.marks)}
-        logger.info("marks: %d parsed (%d unparsed, %d unnamed) -> %d after dedupe",
-                    len(raw_marks), unparsed, unnamed, len(self.marks))
+        n_spatial = sum(1 for m in raw_marks if m.key == SPATIAL_KEY)
+        self.stats["marks"] = {"raw": len(raw_marks) + unnamed, "parsed": len(raw_marks) - n_spatial,
+                               "unparsed_name": unparsed, "spatial_fallback": n_spatial,
+                               "unnamed": unnamed, "deduped": len(self.marks)}
+        logger.info("marks: %d parsed + %d spatial-fallback (%d unnamed dropped) -> %d after dedupe",
+                    len(raw_marks) - n_spatial, n_spatial, unnamed, len(self.marks))
         self._tier2_lines = []
         self._tier2_tree_cache = None
         self.derive_polygon_axes()
