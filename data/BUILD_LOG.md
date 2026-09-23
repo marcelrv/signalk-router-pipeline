@@ -2477,3 +2477,66 @@ at least one connection as #48, now averaging ~2.6 connections each.
 
 - **Deployed** to `signalk-routeiq/data/zeeland.sqlite`, replacing v2 (build
   #48, kept as `.disabled`), alongside MD (#49).
+
+### #51 — `us_east_ny_cattrk_probe.sqlite` — RECTRC/NAVLNE (Option A) measure-then-decide probe, reusing #28's exact NY-harbor recipe
+
+```bash
+./build_region.sh us-east-ny-cattrk-probe --states NY --source-region us-east-coast \
+  --clip-bbox "-74.29,40.39,-73.39,42.71" --overlap-deg 0.01 \
+  --stitch-registry data/seam_registry.sqlite \
+  --extra-pipeline-args "--sagitta-cap 250.0 --max-segment-m 2000 --axis-dedup-cap 100.0 --axis-dedup-floor-m 100.0 --min-navmesh-radius-m 1200.0 --connector-merge-m 5.0 --inland-densify-max-segment-m 120.0 --pass2-max-fanin-per-node 6 --pass0-target-fanin-cap 4 --node-merge-m 5.0"
+```
+
+- **Purpose**: `docs/SPEC-RECOMMENDED-TRACK.md` §4/§5 — decide Option A (minimal, document-only)
+  vs. Option B (promote `CATTRK=1` RECTRC into `fairways_unified`) for NOAA Recommended Track
+  (RECTRC)/Navigation Line (NAVLNE) handling. Byte-for-byte identical command/flags to #28
+  (only the region name changed, to avoid colliding with the existing logged artifact), so
+  results are directly comparable to that baseline. Run on a worktree
+  (`agent-a7767cace0ac0aa8b`) with `data/raw` and `.venv` symlinked (read-only) from the main
+  checkout and `data/seam_registry.sqlite` copied (not symlinked) so the probe's publish pass
+  couldn't mutate the shared live registry.
+- **Result vs. #28 baseline** — exact match, confirming Option A's `enc_preprocessor.py`
+  comment-only change (documenting that `CATTRK`/`TRAFIC`/`ORIENT`/`INFORM` already survive
+  into `inland_waterways_lines.geojson`, see PR item 3) caused zero regression:
+
+  | build | nodes | edges | hubs (od>30) | max out-deg | crosses_land |
+  |---|---|---|---|---|---|
+  | #28 baseline (`us_east_ny_stitched_v2`) | 19,250 | 48,046 | 0 | 26 | 0 |
+  | **#51 (this build, `us_east_ny_cattrk_probe`)** | **19,250** | **48,046** | **0** | **26** | **0** |
+
+- **waterway_crossing_stats** (`_inject_waterway_crossings`, the explicit navmesh-boundary
+  line-crossing injector): 0 successful crossings this build — all 57 attempted candidate
+  connectors were rejected as crossing land (`Waterway crossing: connector to inland row N
+  crosses land; skipping.` x57 in the run log; the summary log line only fires when
+  `regions>0`, so it never printed). This specific mechanism did not fire for RECTRC/NAVLNE in
+  this region.
+- **Pass 0d** (`STITCH_DIAG pass=pass0d`, the 300m local inland↔non-inland connector §2/§4
+  describe as the actual harbour-approach fallback): `success=1923, target_fanin_capped=2635,
+  land_reject=2938, poly_reject=206, radius_reject=51305, already_edge=114, calls=5181` — well
+  over 0, consistent with §5's expectation.
+- **Route probe** (real Dijkstra query against the output SQLite, `sqlite3`/`heapq`, following
+  the pattern used in earlier entries like #47): two `CATTRK=1` RECTRC lines from
+  `US5NYCEG` chain through the East River near Newtown Creek/Long Island City,
+  `(-73.9706927,40.7411454) -> (-73.9676391,40.7345763) -> (-73.9639135,40.7266557)`.
+  - Endpoint-to-endpoint along the RECTRC chain itself: **routable**, Dijkstra cost **1366.4**
+    over a path distance of **1708m** (straight-line distance ≈1710m — the path is
+    essentially direct, no detour), entirely over `inland`-typed edges (both endpoints sit on
+    the RECTRC centerline itself).
+  - Open coastal water (-73.93,40.78, East River/Hell Gate area) to the same RECTRC harbor
+    endpoint: **routable**, Dijkstra cost **5983.364**, crossing from `coastal` to `inland`
+    edge type exactly once — a direct, concrete confirmation of §5's "should already be
+    routable through existing inland↔coastal connector" for the `CATTRK=1` harbour-approach
+    case.
+- **Decision**: **Option A stays.** No disconnection, no regression, no new `crosses_land`
+  violations. Option B (promoting `CATTRK=1` RECTRC into `fairways_unified_polygons`/
+  `_edge_attr_worker` line-cost) was not implemented — the probe found nothing to justify it,
+  matching this spec's own §4/§5 prediction.
+- **Open follow-up (not attempted, out of this item's scope)**: the Lake Ontario/open-water
+  `CATTRK=2` case (`US4NY1JH`, 8 RECTRC lines) could not be probed with a real region rebuild
+  — #28's own `--clip-bbox` deliberately excludes NY's non-Atlantic (Great Lakes/Finger Lakes)
+  cells (documented in #28 itself), and `US4NY1JH` sits well north of that bbox's 42.71°N
+  ceiling. Standing up a new Lake Ontario region/clip is a bigger scope decision than this
+  item's remit; flagged in `docs/SPEC-RECOMMENDED-TRACK.md` and `docs/ROADMAP.md` as open.
+- **Installed live**: not deployed — this is a probe/measurement build only, per the parent
+  item's instructions (no PR, no push).
+- **Logs**: `/tmp/ny_cattrk_probe_build.log` (ephemeral, outside the repo).
