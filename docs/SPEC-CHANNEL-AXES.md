@@ -242,11 +242,17 @@ axes + 64 chain axes (101 km; 28 further chains dropped as duplicates of charted
   direction, `center_chain`/`build_corridor`'s direction-dependent same-hand
   offset and shoal wall are both skipped for `SPATIAL_KEY` chains
   (`reliable_direction=False`) rather than risk guessing the wrong side --
-  `SPATIAL_KEY` chains never place a corridor wall. A chain with no
-  opposite-hand pair at all is rejected (`no_centre_evidence`) rather than
-  emitted as a line along the raw mark positions, which would sit on a
-  channel edge, not its centre, with nothing to distinguish it from a real
-  centreline. Deduplication buckets `SPATIAL_KEY` marks by charted name *and*
+  `SPATIAL_KEY` chains never place a corridor wall. A single opposite-hand
+  pair isn't enough evidence on its own either: a nearest-neighbour walk can
+  cross banks once at one end and otherwise follow a single bank for the
+  rest of the chain, leaving most of the line edge-hugging even though a
+  gate exists somewhere. A `SPATIAL_KEY` chain is rejected (`no_centre_evidence`)
+  unless opposite-hand gates make up at least half of its two-mark anchors --
+  the same majority-gate bar the confidence formula below already uses as its
+  own bonus threshold, applied here as a hard requirement instead. Without it,
+  the line would sit on a channel edge, not its centre, with nothing to
+  distinguish it from a real centreline. Deduplication buckets `SPATIAL_KEY`
+  marks by charted name *and*
   hand instead of the shared placeholder identity, since the generic
   descriptive names this fallback exists for ("Radar Reflector") can recur on
   both banks of the same channel -- only genuine same-name, same-hand

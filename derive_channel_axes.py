@@ -1181,17 +1181,25 @@ class ChannelAxisDeriver:
                                          else chain[0].pt.buffer(1).exterior, 3, name, "too_few_marks",
                                          {"n_marks": len(chain_marks)})
                         continue
-                    if not reliable_direction and not any(a.is_gate for a in chain):
-                        # A spatial-only chain with no opposite-hand pair has no centre
-                        # evidence at all: every anchor sits on the raw mark line itself
-                        # (reliable_direction=False skips the same-hand offset rather
-                        # than guess a side), which is a channel edge, not its centre.
-                        # Emitting that as an axis would be confidently wrong in a
-                        # different way than guessing the wrong side would be.
-                        reasons["no_centre_evidence"] += 1
-                        self._reject(LineString([(a.pt.x, a.pt.y) for a in chain]), 3, name,
-                                     "no_centre_evidence", {"n_marks": len(chain_marks)})
-                        continue
+                    if not reliable_direction:
+                        # A spatial-only chain's same-hand pairs sit on the raw mark
+                        # line itself (reliable_direction=False skips the offset
+                        # rather than guess a side) -- a channel edge, not a centre.
+                        # A single gate anywhere isn't enough evidence: the walk can
+                        # cross banks once at one end and otherwise follow a single
+                        # bank for the rest of the chain, which would still leave
+                        # most of the line edge-hugging. Require the same majority
+                        # -gate-coverage bar the confidence formula below already
+                        # uses as its own bonus threshold, but as a hard requirement
+                        # here instead of a confidence adjustment.
+                        n_gates_pre = sum(1 for a in chain if a.is_gate)
+                        n_pairs_pre = sum(1 for a in chain if len(a.marks) == 2)
+                        if n_pairs_pre == 0 or n_gates_pre < 0.5 * n_pairs_pre:
+                            reasons["no_centre_evidence"] += 1
+                            n_rej += 1
+                            self._reject(LineString([(a.pt.x, a.pt.y) for a in chain]), 3, name,
+                                         "no_centre_evidence", {"n_marks": len(chain_marks)})
+                            continue
                     ok, reason = self._derive_one_chain(chain, chain_marks, name, convention_odd_port,
                                                         reliable_direction=reliable_direction)
                     if ok:
