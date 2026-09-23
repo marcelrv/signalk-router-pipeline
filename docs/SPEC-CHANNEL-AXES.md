@@ -10,8 +10,12 @@ Deployment caveat: `channel_axis_deadend_stitch_m` (`--channel-axis-deadend-stit
 opt-in `--channel-axis-deadend-stitch-m <m>`, which requires `--channel-axes`); the deployed builds
 (MD #49, Zeeland #50) pass `--channel-axis-deadend-stitch-m 1500.0` explicitly on the command
 line (see BUILD_LOG). A build without that flag has no dead-end stitching.
-Still open (not built): `_extract_buoyage_direction` (stub), spatial-chaining fallback for
-unparseable buoy names; see `docs/ROADMAP.md`.
+Still open (not built): spatial-chaining fallback for unparseable buoy names;
+see `docs/ROADMAP.md`. `_extract_buoyage_direction` and the `M_NSYS.ORIENT`
+cross-check (§9) are implemented, but note no code path calls
+`_extract_buoyage_direction` yet -- the "laned" classification it targets is
+currently identical to "skeleton" at the dispatch level, so lighting up the
+function is a no-op in practice until that dispatch is built.
 Supersedes the mechanism sketched in `docs/archive/SPEC-FAIRWAY-DEDUP.md` (moved to docs/archive/ 2026-09-21) (whose measurements
 of fairway/skeleton duplication remain valid and are reused here).
 Complements: `SPEC-GRAPH-DENSITY.md` §4.3/§6.3 (axis-dedup, carve-reconnect),
@@ -231,9 +235,15 @@ axes + 64 chain axes (101 km; 28 further chains dropped as duplicates of charted
 - Unparseable names (4 % US, 13 % NL) are not chained; a spatial-chaining fallback at
   low confidence is a natural extension.
 - A chain whose walls disconnect the corridor is rejected, not repaired.
-- `M_NSYS.ORIENT` is extracted but not yet used to cross-check direction of buoyage.
-- `_extract_buoyage_direction` could read `direction_deg` from an axis to light up the
-  existing `laned` classification.
+- `M_NSYS.ORIENT` **IMPLEMENTED**: cross-checked against a tier-3 axis's own derived
+  `direction_deg`; a mismatch beyond `ORIENT_MISMATCH_TOLERANCE_DEG` (45°) takes the
+  same -0.1 confidence penalty as a parity mismatch (`orient_mismatch` output property).
+- `_extract_buoyage_direction` **IMPLEMENTED**: reads `direction_deg` from an
+  overlapping channel-axes row when `channel_axes_gdf` is supplied. No caller passes
+  it yet, since the `laned` classification it targets is currently dispatched
+  identically to `skeleton` — wiring an actual caller (and deciding what `laned`
+  should do differently, e.g. `calculate_edge_attributes` traffic_mode/cost_factor)
+  is a distinct, unscoped follow-up.
 - USACE National Channel Framework polygons would add a tier-2 source for US federal
   channels without `DRGARE`; USACE IENC (`SPEC-USACE-IENC.md`) adds tier-1 lines.
 

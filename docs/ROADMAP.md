@@ -97,7 +97,7 @@ the exact live commands are in `data/BUILD_LOG.md`.
 
 | Item | Doc / section | Status | Owner | Note |
 |---|---|---|---|---|
-| `_extract_buoyage_direction` (stub, `nautical_routing_pipeline.py:3064`) and `M_NSYS.ORIENT` | `docs/SPEC-CHANNEL-AXES.md` | open | pipeline | |
+| `_extract_buoyage_direction` (`nautical_routing_pipeline.py:3489`) and `M_NSYS.ORIENT` | `docs/SPEC-CHANNEL-AXES.md` §9 | done | pipeline | no live caller wires the return value in yet ("laned" classification is still a behavioral no-op); function + ORIENT cross-check implemented and tested |
 | Spatial-chaining fallback for unparseable buoy names (4% US / 13% NL) | `docs/SPEC-CHANNEL-AXES.md` | open | pipeline | |
 | USACE IENC ingest (phases A/B/C), then National Channel Framework polygons | `docs/SPEC-USACE-IENC.md` | open | pipeline | Draft, not started |
 | Recommended-track probe (Great Lakes/NY) gating Option B, or close as "Option A stays" | `docs/SPEC-RECOMMENDED-TRACK.md` | open | pipeline | Draft |

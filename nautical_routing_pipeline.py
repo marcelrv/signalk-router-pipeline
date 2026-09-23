@@ -3486,21 +3486,45 @@ class NauticalRoutingPipeline:
             return bool(fairway_gdf.intersects(polygon).any())
 
     @staticmethod
-    def _extract_buoyage_direction(fairway_row) -> Optional[int]:
+    def _extract_buoyage_direction(fairway_row, channel_axes_gdf=None) -> Optional[int]:
         """Step D — lateral-buoyage direction for a fairway, if the attributes carry it.
 
         Session 0 recon confirmed the current fairway layer has NO structured
         direction data (TRAFIC/ORIENT null on all features; no IALA CATLAM/COLOUR),
-        so this returns None for real data and lane pairs are never fabricated —
-        'laned' polygons gracefully degrade to a plain skeleton centerline with the
+        so a fairway polygon alone never carries a direction. This was the single
+        seam to light up when a richer fairway source was added -- it now has been:
+        docs/SPEC-CHANNEL-AXES.md's `--channel-axes` derivation
+        (`derive_channel_axes.py`) computes a `direction_deg` per derived tier-3
+        mark-chain axis (direction of buoyage = increasing mark number, SPEC §5
+        step 2). When `channel_axes_gdf` is given (the channel_axes-tagged rows
+        merged into `inland_waterways`, SPEC §6) and one of its axes overlaps
+        `fairway_row`'s geometry, that axis's `direction_deg` is returned, rounded
+        to the nearest degree. Any row with no matching axis -- including every
+        call before `--channel-axes` was wired up here, i.e. `channel_axes_gdf`
+        omitted or empty -- still returns None exactly as before, so 'laned'
+        polygons keep gracefully degrading to a plain skeleton centerline with the
         default two-way traffic_mode (spec-sanctioned, format spec §2.5/§2.8).
-        Kept as the single seam to light up when a richer fairway source is added.
         """
         # S-57 TRAFIC (1=inbound, 2=outbound, 3=one-way, 4=two-way) is the only
-        # direction-ish attribute present, and it is null on every current feature.
-        # Even when populated it is a plain flag — not enough for a geometric lane
-        # pair — so we never derive a lane direction here.
-        return None
+        # fairway-native direction-ish attribute, and it is null on every current
+        # feature. Even when populated it is a plain flag — not enough for a
+        # geometric lane pair — so it is never used to derive a direction here.
+        if channel_axes_gdf is None or channel_axes_gdf.empty:
+            return None
+        geom = getattr(fairway_row, "geometry", None)
+        if geom is None or geom.is_empty:
+            return None
+        try:
+            hits = channel_axes_gdf.sindex.query(geom, predicate="intersects")
+            candidates = channel_axes_gdf.iloc[hits]
+        except Exception:
+            candidates = channel_axes_gdf[channel_axes_gdf.intersects(geom)]
+        if candidates.empty or "direction_deg" not in candidates.columns:
+            return None
+        directions = pd.to_numeric(candidates["direction_deg"], errors="coerce").dropna()
+        if directions.empty:
+            return None
+        return int(round(float(directions.iloc[0]))) % 360
 
     @staticmethod
     def _coord_to_id(lon: float, lat: float, node_type: str = "coastal") -> int:
