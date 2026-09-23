@@ -847,7 +847,11 @@ class NavSystemsIndex:
         if not vals:
             return None
         rad = np.radians(vals)
-        return float(np.degrees(np.arctan2(np.mean(np.sin(rad)), np.mean(np.cos(rad))))) % 360.0
+        mean_sin = float(np.mean(np.sin(rad)))
+        mean_cos = float(np.mean(np.cos(rad)))
+        if np.hypot(mean_sin, mean_cos) < 1e-12:
+            return None
+        return float(np.degrees(np.arctan2(mean_sin, mean_cos))) % 360.0
 
 
 class LayerIndex:
