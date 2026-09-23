@@ -142,6 +142,15 @@ class TestNavSystemsIndex:
         assert idx.orient_near(box(10, 10, 20, 20)) == pytest.approx(90.0)
         assert idx.orient_near(box(5000, 5000, 5010, 5010)) is None
 
+    def test_orient_near_wraps_across_north_instead_of_a_linear_median(self):
+        # a plain median of [350, 10] is 180 -- exactly opposite both inputs.
+        # The circular mean must land near 0/360 instead.
+        gdf = gpd.GeoDataFrame({"ORIENT": [350.0, 10.0]},
+                               geometry=[box(0, 0, 100, 100), box(0, 0, 100, 100)])
+        idx = NavSystemsIndex(gdf)
+        result = idx.orient_near(box(10, 10, 20, 20))
+        assert result == pytest.approx(0.0, abs=1e-6) or result == pytest.approx(360.0, abs=1e-6)
+
 
 class TestMarkHelpers:
     def test_shoal_normal_port_is_left_of_buoyage_direction(self):

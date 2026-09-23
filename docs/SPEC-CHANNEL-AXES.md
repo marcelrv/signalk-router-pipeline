@@ -138,11 +138,13 @@ the graph (`_build_inland_network` joins lines only at identical coordinates).
    confidence), ≥ 3 marks, ≥ 200 m. Failures go to the rejected layer with a reason.
 
 Confidence (tier 3): 0.6 base, +0.1 if ≥ half the consecutive pairs are opposite-hand,
-+0.1 for ≥ 8 marks, −0.1 for parity mismatches, −0.1 if depth could not be checked.
++0.1 for ≥ 8 marks, −0.1 for parity mismatches, −0.1 if depth could not be checked,
+−0.1 if the axis's own direction disagrees with an overlapping `M_NSYS.ORIENT` by
+more than `ORIENT_MISMATCH_TOLERANCE_DEG` (45°, §9).
 
 Output properties: `axis_kind`, `tier`, `channel_name`, `confidence`, `length_m`,
 `direction_deg`, `corridor_width_m`, `depth_median_m`, `depth_checked`,
-`dedup_removed_m`, `n_marks`, `n_gates`, `drval1` (tier 2), `src_objl`, `src_cscl`,
+`orient_mismatch`, `dedup_removed_m`, `n_marks`, `n_gates`, `drval1` (tier 2), `src_objl`, `src_cscl`,
 `parity_mismatch`, `depth_tightened`.
 
 ## 6. Pipeline integration (`--channel-axes`, default off, byte-identical otherwise)
