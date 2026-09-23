@@ -228,21 +228,29 @@ axes + 64 chain axes (101 km; 28 further chains dropped as duplicates of charted
 
 ## 9. Known limits / follow-ups
 
-- Unparseable names (4 % US, 13 % NL) **IMPLEMENTED**: lateral marks (a usable
-  `CATLAM`; safe-water marks are excluded -- no hand/channel evidence) with an
-  unparseable `OBJNAM` are grouped under `SPATIAL_KEY` and clustered by spatial
-  proximity alone (reusing the existing `cluster_link_m` 8 km single-linkage
-  knob; `CATLAM` is used afterward, same as any other chain, for anchor gating
-  and wall placement -- it does not partition the clustering itself), ordered
+- Unparseable names (4 % US, 13 % NL) **IMPLEMENTED**: lateral marks with a
+  usable port/starboard `CATLAM` (safe-water marks, and marks with a missing
+  or junction-only `CATLAM`, are excluded -- no hand/channel evidence) and an
+  unparseable `OBJNAM` are grouped under `SPATIAL_KEY` and clustered by
+  spatial proximity alone (reusing the existing `cluster_link_m` 8 km
+  single-linkage knob; `CATLAM` is used afterward, same as any other chain,
+  for anchor gating -- it does not partition the clustering itself), ordered
   by nearest-neighbour walk from a PCA-picked start (`order_marks_spatial`),
   and given a lower confidence baseline (-0.2) than the existing bare-number
   fallback (-0.1) since it has neither a parsed channel name nor a bare number
   to order by. Because that walk order has no relation to true buoyage
   direction, `center_chain`/`build_corridor`'s direction-dependent same-hand
   offset and shoal wall are both skipped for `SPATIAL_KEY` chains
-  (`reliable_direction=False`) rather than risk guessing the wrong side.
-  Deduplication buckets `SPATIAL_KEY` marks by charted name instead of the
-  shared placeholder identity, so distinct nearby aids aren't merged.
+  (`reliable_direction=False`) rather than risk guessing the wrong side --
+  `SPATIAL_KEY` chains never place a corridor wall. A chain with no
+  opposite-hand pair at all is rejected (`no_centre_evidence`) rather than
+  emitted as a line along the raw mark positions, which would sit on a
+  channel edge, not its centre, with nothing to distinguish it from a real
+  centreline. Deduplication buckets `SPATIAL_KEY` marks by charted name *and*
+  hand instead of the shared placeholder identity, since the generic
+  descriptive names this fallback exists for ("Radar Reflector") can recur on
+  both banks of the same channel -- only genuine same-name, same-hand
+  duplicates merge.
 - A chain whose walls disconnect the corridor is rejected, not repaired.
 - `M_NSYS.ORIENT` is extracted but not yet used to cross-check direction of buoyage.
 - `_extract_buoyage_direction` could read `direction_deg` from an axis to light up the

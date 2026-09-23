@@ -14,6 +14,7 @@ import derive_channel_axes as dca
 from derive_channel_axes import (
     Anchor,
     CATLAM_PORT,
+    CATLAM_PREF_STARBOARD,
     CATLAM_STARBOARD,
     ChannelAxisDeriver,
     Mark,
@@ -413,6 +414,20 @@ class TestSpatialChainingFallback:
         assert [m.name for m in marks] == ["Radar Reflector"]  # only the lateral one is chainable
         assert marks[0].key == SPATIAL_KEY
 
+    def test_marks_without_a_usable_catlam_are_excluded_from_the_spatial_fallback(self):
+        # a lateral-kind mark with a missing or junction-only CATLAM (not plain
+        # port/starboard) carries no hand evidence -- same rationale as excluding
+        # safe-water marks -- and must not be retained under SPATIAL_KEY either.
+        lateral = gpd.GeoDataFrame(
+            {"OBJNAM": ["Radar Reflector", "Racon Site", "Historic Wreck"],
+             "CATLAM": [None, CATLAM_PREF_STARBOARD, CATLAM_PORT],
+             "src_objl": ["BOYLAT"] * 3, "src_cscl": [12000] * 3},
+            geometry=[Point(0, 0), Point(1, 1), Point(2, 2)])
+        safe = gpd.GeoDataFrame(geometry=[])
+        marks, unparsed, unnamed = load_marks(lateral, safe)
+        assert unparsed == 3  # all three names failed parsing and are counted
+        assert [m.name for m in marks] == ["Historic Wreck"]  # only the port/starboard one chains
+
     def test_dedupe_keeps_distinct_named_spatial_marks_close_together(self):
         # all SPATIAL_KEY marks share the placeholder (SPATIAL_KEY, 0, "") identity;
         # dedupe must not collapse two different, unrelated aids just because
@@ -420,6 +435,15 @@ class TestSpatialChainingFallback:
         # a narrow channel) -- only genuine same-name duplicates should merge.
         a = Mark("Rock Ledge", SPATIAL_KEY, 0, "", CATLAM_PORT, "buoy", 12000, Point(0, 0))
         b = Mark("Reef Marker", SPATIAL_KEY, 0, "", CATLAM_STARBOARD, "buoy", 12000, Point(30, 0))
+        out = dedupe_marks([a, b], tol_m=60.0)
+        assert len(out) == 2
+
+    def test_dedupe_keeps_opposite_hand_marks_distinct_even_with_the_same_name(self):
+        # the generic descriptive names this fallback exists for can recur on
+        # both banks of the same channel; a shared name alone must not collapse
+        # two marks of opposite hand into one.
+        a = Mark("Radar Reflector", SPATIAL_KEY, 0, "", CATLAM_PORT, "buoy", 12000, Point(0, 0))
+        b = Mark("Radar Reflector", SPATIAL_KEY, 0, "", CATLAM_STARBOARD, "buoy", 12000, Point(30, 0))
         out = dedupe_marks([a, b], tol_m=60.0)
         assert len(out) == 2
 
@@ -454,6 +478,28 @@ class TestSpatialChainingFallback:
             assert unreliable.area > reliable.area
         line, reason = corridor_centerline(unreliable, anchors, naive, radii, hug=1.0)
         assert reason is None and line is not None
+
+    def test_all_same_hand_spatial_chain_is_rejected_not_emitted_off_centre(self, tmp_path):
+        # no opposite-hand pair anywhere in this cluster -> reliable_direction=False
+        # leaves every anchor on the raw (port-only) mark line itself, which is a
+        # channel edge, not a centre; must be rejected, not emitted as an axis.
+        utm = "EPSG:32631"
+        x0, y0 = 550000.0, 5700000.0
+        water = box(x0, y0, x0 + 6000, y0 + 300)
+        pts = [Point(x0 + 2500 + i * 400, y0 + 150) for i in range(4)]
+        d = tmp_path / "spatial_no_gates"
+        d.mkdir()
+        _to_wgs(gpd.GeoDataFrame({"DRVAL1": [2.0]}, geometry=[water], crs=utm)).to_file(
+            d / "coastal_water_polygons.geojson", driver="GeoJSON")
+        _to_wgs(gpd.GeoDataFrame({"OBJNAM": _GARBAGE_NAMES[:4], "CATLAM": [CATLAM_PORT] * 4,
+                                  "src_objl": ["BOYLAT"] * 4, "src_cscl": [12000] * 4},
+                                 geometry=pts, crs=utm)).to_file(
+            d / "lateral_marks_points.geojson", driver="GeoJSON")
+        ChannelAxisDeriver(str(d), str(d), Params()).run()
+        axes = gpd.read_file(d / dca.OUTPUT_AXES)
+        assert len(axes) == 0
+        stats = json.load(open(d / dca.OUTPUT_STATS))
+        assert stats["tier3"]["reasons"].get("no_centre_evidence") == 1
 
     def test_parsed_and_bare_number_paths_unaffected(self, synthetic_dir):
         # regression: the existing named-channel path in the shared fixture (which

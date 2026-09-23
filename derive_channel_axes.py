@@ -479,8 +479,10 @@ def load_marks(lateral: gpd.GeoDataFrame, safe: gpd.GeoDataFrame) -> Tuple[List[
                 if name and isinstance(name, str) and name.strip():
                     unparsed += 1
                     # Safe-water marks carry no CATLAM/hand and aren't lateral-channel
-                    # evidence -- the spatial fallback is scoped to lateral marks only.
-                    if kind != "safe_water":
+                    # evidence; a missing/unsupported CATLAM (not plain port/starboard)
+                    # carries no hand evidence either -- the spatial fallback requires
+                    # real lateral (port/starboard) evidence to chain a mark at all.
+                    if kind != "safe_water" and catlam in (CATLAM_PORT, CATLAM_STARBOARD):
                         marks.append(Mark(str(name).strip(), SPATIAL_KEY, 0, "", catlam, kind, cscl, pt, SPATIAL_KEY))
                 else:
                     unnamed += 1
@@ -498,14 +500,18 @@ def dedupe_marks(marks: List[Mark], tol_m: float = 60.0) -> List[Mark]:
     SPATIAL_KEY marks all share the placeholder identity ``(SPATIAL_KEY, 0, "")``,
     so bucketing on that alone would collapse distinct, unrelated aids that merely
     happen to sit within ``tol_m`` of each other (e.g. two different-named marks
-    on opposite banks of a narrow channel). Bucket those by their charted name
-    instead -- the same stand-in identity used for the same reason everywhere
-    else in this function -- so only genuine same-name duplicates (the same aid
-    charted twice across overlapping cell coverage) merge.
+    on opposite banks of a narrow channel). Bucket those by their charted name and
+    hand instead -- name is the same stand-in identity used for the same reason
+    everywhere else in this function, and hand is included too because the
+    unparseable names this fallback exists for are often generic, non-unique
+    descriptive text ("Radar Reflector") that two opposite-hand marks guarding
+    the same stretch of channel could equally both carry -- so only genuine
+    same-name, same-hand duplicates (the same aid charted twice across
+    overlapping cell coverage) merge.
     """
     by = collections.defaultdict(list)
     for m in marks:
-        key = (m.key, m.name) if m.key == SPATIAL_KEY else (m.key, m.num, m.suf)
+        key = (m.key, m.name, m.catlam) if m.key == SPATIAL_KEY else (m.key, m.num, m.suf)
         by[key].append(m)
     out: List[Mark] = []
     for group in by.values():
@@ -1174,6 +1180,17 @@ class ChannelAxisDeriver:
                             self._reject(LineString([(a.pt.x, a.pt.y) for a in chain]) if len(chain) > 1
                                          else chain[0].pt.buffer(1).exterior, 3, name, "too_few_marks",
                                          {"n_marks": len(chain_marks)})
+                        continue
+                    if not reliable_direction and not any(a.is_gate for a in chain):
+                        # A spatial-only chain with no opposite-hand pair has no centre
+                        # evidence at all: every anchor sits on the raw mark line itself
+                        # (reliable_direction=False skips the same-hand offset rather
+                        # than guess a side), which is a channel edge, not its centre.
+                        # Emitting that as an axis would be confidently wrong in a
+                        # different way than guessing the wrong side would be.
+                        reasons["no_centre_evidence"] += 1
+                        self._reject(LineString([(a.pt.x, a.pt.y) for a in chain]), 3, name,
+                                     "no_centre_evidence", {"n_marks": len(chain_marks)})
                         continue
                     ok, reason = self._derive_one_chain(chain, chain_marks, name, convention_odd_port,
                                                         reliable_direction=reliable_direction)
