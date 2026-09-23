@@ -719,6 +719,34 @@ NAVMESH_BOUNDARY_SIMPLIFY_M = 5.0   # build_navmesh_region: a separate, coarser 
                                      # moves a retained
                                      # one, so exact-coordinate seam matching in build_navmesh_region
                                      # still works correctly on whatever seam vertices survive.
+                                     # docs/SPEC-GRAPH-DENSITY.md §10.6 item 1: this value is now only
+                                     # the DEFAULT of ClassificationConfig.navmesh_boundary_simplify_m
+                                     # (--navmesh-boundary-simplify-m), not the hardcoded tolerance --
+                                     # a build can raise it to thin the over-dense navmesh boundary
+                                     # rings §10.4 measured. It also stays (a) the threshold above which
+                                     # _simplify_navmesh_boundary switches from this plain
+                                     # Douglas-Peucker to _topology_guarded_simplify -- so a default
+                                     # (or lower) build is byte-identical to the empirically tuned
+                                     # behaviour described above -- and (b) the CAP on how far that
+                                     # guarded pass may push the boundary outward over land at any
+                                     # tolerance, i.e. a raised tolerance leaks no wider than the
+                                     # default already does (measured on real Zeeland coastline: max
+                                     # excursion 7.15m at the 5.0m default vs 4.99m at 15/30/99m; it
+                                     # is a cap on WIDTH, not a guarantee of zero land overlap).
+NAVMESH_BOUNDARY_SIMPLIFY_MAX_M = 100.0  # build_navmesh_region: ceiling on
+                                     # navmesh_boundary_simplify_m. Set an order of magnitude below
+                                     # NAVMESH_TARGET_EDGE_M (650m, the interior triangle edge target)
+                                     # and well below min_navmesh_radius_m (800m, the disk a body must
+                                     # contain to be navmesh-eligible at all), so the boundary can
+                                     # never be simplified at a scale comparable to the region's own
+                                     # navigable width. Deliberately tighter than
+                                     # SKELETON_BOUNDARY_SIMPLIFY_MAX_M (200m): the skeleton path
+                                     # re-intersects against the land mask after simplifying, whereas
+                                     # navmesh-boundary edges are in the LENIENT bucket of
+                                     # _sanity_check_no_land_crossings (never stripped) -- see §10.6's
+                                     # caveat. The measured sweep already plateaued at 15m
+                                     # (median vertices/region 125 -> 80), so this ceiling is far above
+                                     # any tolerance with measured value.
 NAVMESH_TILE_MAX_EXTENT_M = int(os.environ.get(  # Round 25 Chunk 2 PROBE: env-override so the
     "SK_ROUTING_NAVMESH_TILE_MAX_EXTENT_M", 10_000))  # global-tile-grid probe can force a small
                                      # tile size (e.g. 2-3km) without changing the shipped 10km
@@ -1231,6 +1259,24 @@ class ClassificationConfig:
     # crosses_land classification already checks). Must be finite, >= 0.0, and <
     # SKELETON_JUNCTION_MERGE_MAX_M if enabled.
     skeleton_junction_merge_m: float = 0.0
+    # docs/SPEC-GRAPH-DENSITY.md §10.6 item 1: Douglas-Peucker tolerance for the
+    # coarse simplify pass build_navmesh_region applies to a navmesh region's own
+    # boundary ring before triangulating/exporting it (_simplify_navmesh_boundary;
+    # _tile_navmesh_piece uses the same pass for its vertex-count tiling gate, so
+    # the gate keeps measuring the boundary that will actually be built).
+    # UNLIKE every other tolerance in this dataclass, the default is NOT 0.0/"off":
+    # this pass has been unconditionally on since Round 9 and its 5.0m tolerance is
+    # empirically tuned (see NAVMESH_BOUNDARY_SIMPLIFY_M). The default therefore
+    # reproduces today's output byte-for-byte; 0.0 explicitly DISABLES the simplify
+    # (the sweep's "no pass" arm, ~10x the boundary vertices), and a larger value
+    # thins the over-dense boundary rings §10.4 measured (83.5% of navmesh nodes
+    # there sit on no POI-to-POI route). Above the 5.0m default,
+    # _simplify_navmesh_boundary runs _topology_guarded_simplify instead of a plain
+    # simplify(): the chord may cut inward by the full tolerance but may bulge
+    # outward over land by at most NAVMESH_BOUNDARY_SIMPLIFY_M, and may not cross or
+    # engulf another piece of the boundary -- see that method for what that does and
+    # does not guarantee. Must be finite, >= 0.0, and < NAVMESH_BOUNDARY_SIMPLIFY_MAX_M.
+    navmesh_boundary_simplify_m: float = NAVMESH_BOUNDARY_SIMPLIFY_M
     # docs/SPEC-CHANNEL-AXES.md: merge derive_channel_axes.py's channel_axes_lines.geojson
     # (centerlines of FAIRWY/DRGARE polygons and of lateral buoy/beacon chains) into
     # the inland_waterways layer, so the existing "prefer the authoritative axis"
@@ -1552,6 +1598,7 @@ class NauticalRoutingPipeline:
                  pass0_cross_type_first: bool = False,
                  skeleton_boundary_simplify_m: float = 0.0,
                  skeleton_junction_merge_m: float = 0.0,
+                 navmesh_boundary_simplify_m: float = NAVMESH_BOUNDARY_SIMPLIFY_M,
                  use_channel_axes: bool = False,
                  channel_axes_min_confidence: float = 0.5,
                  channel_axes_navmesh_carve: bool = False,
@@ -1583,6 +1630,7 @@ class NauticalRoutingPipeline:
                                                            pass0_cross_type_first=pass0_cross_type_first,
                                                            skeleton_boundary_simplify_m=skeleton_boundary_simplify_m,
                                                            skeleton_junction_merge_m=skeleton_junction_merge_m,
+                                                           navmesh_boundary_simplify_m=navmesh_boundary_simplify_m,
                                                            use_channel_axes=use_channel_axes,
                                                            channel_axes_min_confidence=channel_axes_min_confidence,
                                                            channel_axes_navmesh_carve=channel_axes_navmesh_carve,
@@ -1909,6 +1957,23 @@ class NauticalRoutingPipeline:
                 f"{SKELETON_JUNCTION_MERGE_MAX_M:.0f}m (got {tol_m!r}).")
 
     @staticmethod
+    def _validate_navmesh_boundary_simplify_m(tol_m):
+        """docs/SPEC-GRAPH-DENSITY.md §10.6 item 1. Unlike its siblings there is no
+        `== 0.0` early return: 0.0 is a meaningful, fully-validated value here (it
+        disables the simplify pass, the sweep's "no pass" arm) rather than "flag
+        off", because this pass's default is 5.0, not 0.0. Otherwise the same
+        convention as `skeleton_boundary_simplify_m`: finite, >= 0.0, and strictly
+        less than `NAVMESH_BOUNDARY_SIMPLIFY_MAX_M` (see that constant for why the
+        ceiling is tighter here than the skeleton's). `NaN`/negative slip past a
+        bare `<= 0.0` check (`NaN` comparisons are always `False` in Python), so
+        both are checked explicitly rather than relying on that alone.
+        """
+        if not math.isfinite(tol_m) or tol_m < 0.0 or tol_m >= NAVMESH_BOUNDARY_SIMPLIFY_MAX_M:
+            raise ValueError(
+                f"navmesh_boundary_simplify_m must be finite, >= 0.0, and < "
+                f"{NAVMESH_BOUNDARY_SIMPLIFY_MAX_M:.0f}m (got {tol_m!r}).")
+
+    @staticmethod
     def _validate_channel_axis_deadend_stitch_m(tol_m):
         """`channel_axis_deadend_stitch_m == 0.0` (the default) disables the
         channel-axis dead-end connector pass entirely -- no validation needed, same
@@ -2214,6 +2279,8 @@ class NauticalRoutingPipeline:
             self.classification_config.skeleton_boundary_simplify_m)
         self._validate_skeleton_junction_merge_m(
             self.classification_config.skeleton_junction_merge_m)
+        self._validate_navmesh_boundary_simplify_m(
+            self.classification_config.navmesh_boundary_simplify_m)
         self._validate_channel_axes_min_confidence(
             self.classification_config.channel_axes_min_confidence)
         self._validate_channel_axis_deadend_stitch_m(
@@ -2884,6 +2951,364 @@ class NauticalRoutingPipeline:
                 depth_seam = Polygon()
         return deep, shallow, depth_seam
 
+    def _simplify_navmesh_boundary(self, poly_m, protected_coords=None):
+        """The coarse navmesh-boundary simplify pass, at
+        `classification_config.navmesh_boundary_simplify_m`
+        (`--navmesh-boundary-simplify-m`, default `NAVMESH_BOUNDARY_SIMPLIFY_M` =
+        5.0). Single choke point for both users of the pass: `build_navmesh_region`,
+        which actually builds on the result, and `_tile_navmesh_piece`, whose
+        `NAVMESH_TILE_MAX_VERTICES` gate must count the boundary that will actually
+        be built.
+
+        WHY A PLAIN `simplify()` IS NOT ENOUGH ABOVE THE DEFAULT (§10.6 item 1 /
+        §10.7's stated open risk). Douglas-Peucker never moves a retained vertex,
+        but the ring BETWEEN two retained vertices moves: where the water polygon
+        is concave (a land spit or pier poking into the water, a narrow creek
+        mouth, an island that is a small interior ring), the simplified chord
+        bulges OUTWARD, so the polygon gains area over real land -- up to the
+        tolerance in width. Nothing downstream catches that: the navmesh path never
+        re-intersects against the `land` layer the way `_rasterize_water_polygon`
+        does for the skeleton, and `EDGE_KIND_NAVMESH_BOUNDARY` edges sit in the
+        lenient bucket of `_sanity_check_no_land_crossings`, so they are never
+        stripped. Measured on the real Zeeland `coastal_water` body (124.2 km^2,
+        39,618 boundary vertices): a plain `simplify()` puts 60,000 m^2 of navmesh
+        over land at 15m and 194,600 m^2 at 99m, against the 24,300 m^2 the
+        empirically tuned 5.0m default already (knowingly) leaks.
+
+        WHY THE PREVIOUS RE-INTERSECT GUARD WAS WORSE. Clipping the simplified
+        polygon back against the original water (`simplified.intersection(base)`)
+        is land-safe but self-defeating: the clip RE-INSERTS every original vertex
+        wherever a chord bulged outward, so the boundary gets DENSER, not sparser
+        (same polygon: 5,861 vertices at the 5.0m default -> 27,586 at 15m), it
+        shatters the region into slivers (1 part -> 37 at 15m, 55 at 99m -- and
+        `build_navmesh_region` keeps only the largest, silently dropping real
+        water), and it emits sub-millimetre ring segments (6e-5 m) that are a
+        `triangle -pq28` blow-up risk. End to end on an 18.9 km^2 Zeeland
+        sub-polygon it made things 4x worse: 298 navmesh nodes at 5m -> 1,158 at
+        15m.
+
+        WHAT THIS DOES INSTEAD (`_topology_guarded_simplify`): a Douglas-Peucker
+        pass whose accept test is constrained rather than repaired afterwards.
+        A chord may cut INWARD (into the water, removing water) by up to the full
+        tolerance, but may bulge OUTWARD (over land) by at most `outward_m` =
+        min(tol, `NAVMESH_BOUNDARY_SIMPLIFY_M`) -- i.e. never further over land
+        than the shipped 5.0m default already goes -- and it is rejected outright
+        if it would cross, or engulf, any other part of the original boundary.
+        The result is therefore built from a SUBSET of the original vertices
+        (seam-coordinate matching in `build_navmesh_region` still works, and any
+        coordinate the caller passes as `protected_coords` is an anchor this pass
+        may never delete), is a single valid polygon with all 385 of its island
+        rings intact, and is genuinely sparser: on that same Zeeland body, 3,886
+        vertices / 19,164 m^2 over land at 15m and 2,609 / 13,677 m^2 at 99m --
+        fewer vertices AND less navmesh-over-land than the 5,861 / 24,299 m^2
+        default. End to end on an 18.888 km^2 crop of it (centre 3.89E 51.63N,
+        +/-2,500m), `build_navmesh_region` registers 298 nodes at the default, 242
+        at 15m and 199 at 99m -- the clip gave 1,158 at 15m. Node counts are
+        crop-dependent (an independent 18.78 km^2 crop of the same body measured
+        270 -> 183 -> 151 at 5/15/60m), so quote the crop with the number.
+
+        What it costs is water: the inward half of the tolerance removes a gross
+        0.50 km^2 of the 124.2 km^2 body at 15m (2.39 km^2 at 99m). And note what
+        this is NOT: the outward cap bounds the WIDTH of a land excursion, not its
+        existence -- 19,164 m^2 of the result still sits over the real `land` layer
+        at 15m (the default leaks 24,299 m^2; max excursion 4.92m vs the default's
+        7.04m). Reproduce with scripts/measure_navmesh_boundary_simplify.py.
+
+        At `tol <= NAVMESH_BOUNDARY_SIMPLIFY_M` the guarded pass is SKIPPED, not
+        merely expected to be a no-op: it is a different algorithm and would
+        perturb coordinates/ordering, which would break both byte-identical default
+        output and the exact-coordinate `seam_coord_set` matching
+        `build_navmesh_region` performs. A default build is therefore bit-identical
+        to the pre-flag code.
+
+        `tol == 0.0` disables the simplify entirely (the Round 9 sweep's "no pass"
+        arm). The `buffer(0)` validity repair is kept in that case -- it is not part
+        of the simplification, and `_polygon_to_pslg` needs a clean polygon.
+
+        FAIL CLOSED: if the guarded pass cannot produce a valid, same-part-count
+        polygon (degenerate input, or a ring that collapses below 3 vertices), this
+        returns the PRE-SIMPLIFY polygon rather than a differently-shaped geometry.
+        An unsimplified boundary is merely dense -- `build_navmesh_region`'s own
+        `NAVMESH_PSLG_BUDGET` retry already handles that -- whereas a silently
+        substituted one is a correctness problem.
+
+        STILL NOT COVERED (see §10.7): the inward half of the tolerance genuinely
+        removes water, up to `tol` in width, so a channel narrower than ~2*tol can
+        still be narrowed (the guards stop it being severed or fragmented, not
+        narrowed). That is the reason for `NAVMESH_BOUNDARY_SIMPLIFY_MAX_M`'s
+        conservative ceiling and for §10.6's caveat that a raised tolerance still
+        needs validating against a real regional build.
+        """
+        base = poly_m.buffer(0)
+        tol_m = self.classification_config.navmesh_boundary_simplify_m
+        if tol_m <= 0.0:
+            return self._clean_polygonal(base)
+        if tol_m <= NAVMESH_BOUNDARY_SIMPLIFY_M:
+            return self._clean_polygonal(base.simplify(tol_m))
+        cleaned = self._clean_polygonal(base)
+        if cleaned.is_empty:
+            return cleaned
+        guarded = self._topology_guarded_simplify(
+            cleaned, tol_m, min(tol_m, NAVMESH_BOUNDARY_SIMPLIFY_M), protected_coords)
+        if guarded is None:
+            logger.warning(f"  Navmesh boundary simplify at {tol_m:.1f}m could not keep the "
+                           f"polygon's topology; keeping the unsimplified boundary.")
+            return cleaned
+        return guarded
+
+    def _topology_guarded_simplify(self, poly_m, tol_m: float, outward_m: float,
+                                   protected_coords=None):
+        """Douglas-Peucker over every ring of `poly_m`, keeping a chord only when it
+
+        1. deviates from the vertices it replaces by at most `tol_m` on the WATER
+           side of the chord and at most `outward_m` on the LAND side (asymmetric
+           tolerance -- see `_simplify_navmesh_boundary` for why the two sides are
+           not the same risk), and
+        2. neither crosses nor engulfs any other piece of the ORIGINAL boundary
+           (any other ring, or a non-adjacent stretch of its own ring).
+
+        Rings are oriented so the water is always on the LEFT of the ring
+        direction (exterior counter-clockwise, interiors clockwise), which makes
+        "which side of the chord is land" a single sign test: a replaced vertex
+        lying to the LEFT of the chord means the chord runs outside the water there.
+
+        Guard 2 is what keeps the result a single valid polygon. A chord that
+        crosses another ring would pinch a channel shut or sever an island's
+        coastline; a chord that engulfs one (no crossing, ring wholly inside the
+        cut-off loop) would leave a hole outside its shell or swallow a
+        neighbouring part. Because a non-crossing ring is wholly inside or wholly
+        outside the loop, ONE representative vertex per ring decides that test.
+        Honest note (§10.6 item 1): on both regions measured, the CROSSING half
+        carries the guard on its own -- disabling the engulf half changes nothing on
+        Zeeland. It is kept because it is cheap and a constructible case needs it
+        (tests: a bump of water with an island in it that no chord crosses).
+
+        `protected_coords`: coordinates -- rounded to 3 decimals, the same rounding
+        `build_navmesh_region` matches `seam_coord_set` with -- that must survive as
+        ring vertices. They become extra DP anchors, so a raised tolerance cannot
+        delete a cross-piece stitching point.
+
+        Returns the simplified polygon, or None if it could not be built (see
+        `_simplify_navmesh_boundary`'s fail-closed contract). Only ever removes
+        vertices -- never moves or invents one.
+        """
+        parts = self._explode_polygonal(poly_m)
+        if not parts:
+            return None
+
+        def _oriented(ring, want_ccw: bool):
+            pts = np.asarray(ring.coords, dtype=float)
+            if len(pts) > 1 and pts[0][0] == pts[-1][0] and pts[0][1] == pts[-1][1]:
+                pts = pts[:-1]
+            if len(pts) < 3:
+                return pts
+            x, y = pts[:, 0], pts[:, 1]
+            twice_area = float(np.dot(x, np.roll(y, -1)) - np.dot(y, np.roll(x, -1)))
+            if (twice_area > 0.0) != want_ccw:
+                pts = pts[::-1].copy()
+            return pts
+
+        rings: List[Any] = []          # one open (unclosed) vertex array per ring
+        ring_of_part: List[List[int]] = []  # part index -> [exterior ring, *hole rings]
+        for part in parts:
+            ring_of_part.append([len(rings)])
+            rings.append(_oriented(part.exterior, True))
+            for hole in part.interiors:
+                ring_of_part[-1].append(len(rings))
+                rings.append(_oriented(hole, False))
+
+        # Every original boundary segment, as one vectorized shapely call (a Python
+        # loop over ~40k LineString constructions is the whole runtime otherwise).
+        if not any(len(pts) >= 3 for pts in rings):
+            return None
+        pairs = np.concatenate([np.stack([pts, np.roll(pts, -1, axis=0)], axis=1)
+                                for pts in rings if len(pts) >= 2])
+        segments = shapely.linestrings(
+            pairs.reshape(-1, 2), indices=np.repeat(np.arange(len(pairs)), 2))
+        seg_ring = np.concatenate([np.full(len(pts), ri)
+                                   for ri, pts in enumerate(rings) if len(pts) >= 2])
+        seg_pos = np.concatenate([np.arange(len(pts)) for pts in rings if len(pts) >= 2])
+        seg_tree = shapely.STRtree(segments)
+        reps = [Point(pts[0]) for pts in rings]
+        rep_tree = shapely.STRtree(reps)
+
+        def _blocked(ri, chain, i, j, start_index):
+            """Guard 2 for the chord replacing `chain[i:j+1]` of ring `ri`.
+            `start_index` is the ring index of `chain[0]`, so the stretch the chord
+            replaces is ring positions start_index+i .. start_index+j (modulo n)."""
+            a, b = chain[i], chain[j]
+            chord = LineString((a, b))
+            pa, pb = Point(a), Point(b)
+            n = len(rings[ri])
+            lo, span = (start_index + i) % n, j - i
+            for idx in seg_tree.query(chord):
+                if seg_ring[idx] == ri and (seg_pos[idx] - lo) % n < span:
+                    continue  # a segment of the stretch being replaced
+                hit = chord.intersection(segments[idx])
+                if hit.is_empty:
+                    continue
+                if hit.geom_type != "Point" or not (hit.equals(pa) or hit.equals(pb)):
+                    return True
+            if j - i >= 2:
+                try:
+                    loop = Polygon(np.vstack([chain[i:j + 1], chain[i:i + 1]]))
+                except Exception:
+                    return True
+                if not loop.is_empty and loop.area > 0.0:
+                    for idx in rep_tree.query(loop):
+                        if idx != ri and loop.contains(reps[idx]):
+                            return True
+            return False
+
+        def _worst(chain, i, j):
+            """(index in `chain` of the vertex the chord i->j violates most,
+            amount by which it violates its side's cap)."""
+            sub = chain[i + 1:j]
+            if len(sub) == 0:
+                return None, 0.0, None
+            a, b = chain[i], chain[j]
+            seg = b - a
+            length_sq = float(seg @ seg)
+            rel = sub - a
+            if length_sq == 0.0:
+                dist = np.hypot(rel[:, 0], rel[:, 1])
+                side = np.zeros(len(sub))
+            else:
+                t = np.clip((rel @ seg) / length_sq, 0.0, 1.0)
+                proj = a + t[:, None] * seg
+                dist = np.hypot(sub[:, 0] - proj[:, 0], sub[:, 1] - proj[:, 1])
+                side = seg[0] * rel[:, 1] - seg[1] * rel[:, 0]
+            # water is on the LEFT of the ring, so a replaced vertex on the left of
+            # the chord means the chord itself lies outside the water there.
+            over = dist - np.where(side > 0.0, outward_m, tol_m)
+            k = int(np.argmax(over))
+            return i + 1 + k, float(over[k]), int(np.argmax(dist)) + i + 1
+
+        def _dp(ri, chain, start_index, keep):
+            """Iterative Douglas-Peucker over one open chain; marks kept indices
+            (chain-relative) in `keep`."""
+            stack = [(0, len(chain) - 1)]
+            while stack:
+                i, j = stack.pop()
+                if j - i < 2:
+                    continue
+                k, over, farthest = _worst(chain, i, j)
+                if k is None:
+                    continue
+                if over <= 0.0:
+                    if not _blocked(ri, chain, i, j, start_index):
+                        continue
+                    # The chord is within tolerance but would change the boundary's
+                    # topology: split at the farthest vertex and try the halves.
+                    k = farthest
+                keep[k] = True
+                stack.append((i, k))
+                stack.append((k, j))
+
+        def _anchors(pts):
+            """THREE ring vertices to hang the DP off: a closed ring has no natural
+            endpoints, and two anchors alone would let a ring smaller than the
+            tolerance collapse onto a degenerate two-point "ring". Three keep every
+            ring -- a few-metre island's interior ring included -- a real triangle,
+            which is the same order of detail the 5.0m default leaves on one, and
+            they are original vertices, so the ring still only ever loses vertices.
+
+            All three are chosen GEOMETRICALLY, never "index 0": the first is the
+            lexicographically smallest vertex. A ring's start index is an artifact of
+            whatever GEOS operation produced it, so anchoring on index 0 made the
+            output depend on it -- the same ring rotated by 500 vertices simplified to
+            a different (169 vs 175) vertex count, meaning an unrelated upstream
+            change that rotated a ring would silently change the navmesh. This makes
+            the pass rotation-invariant (exact ties in the argmax aside)."""
+            n = len(pts)
+            first = int(np.lexsort((pts[:, 1], pts[:, 0]))[0])
+            second = int(np.argmax(np.hypot(pts[:, 0] - pts[first, 0], pts[:, 1] - pts[first, 1])))
+            if second == first:
+                second = (first + n // 2) % n
+            a, b = pts[first], pts[second]
+            seg = b - a
+            length_sq = float(seg @ seg)
+            rel = pts - a
+            if length_sq == 0.0:
+                dist = np.hypot(rel[:, 0], rel[:, 1])
+            else:
+                t = np.clip((rel @ seg) / length_sq, 0.0, 1.0)
+                proj = a + t[:, None] * seg
+                dist = np.hypot(pts[:, 0] - proj[:, 0], pts[:, 1] - proj[:, 1])
+            third = int(np.argmax(dist))
+            picked = sorted({first, second, third})
+            if len(picked) < 3:  # degenerate (all vertices collinear): space them out
+                picked = sorted({first, (first + n // 3) % n, (first + (2 * n) // 3) % n})
+            return picked if len(picked) == 3 else None
+
+        def _protected(pts):
+            """Indices of ring vertices that are seam coordinates, at the same
+            3-decimal rounding `build_navmesh_region` matches seams with. They become
+            extra DP anchors, so the pass can never delete a cross-piece attachment
+            point: measured before this, a Zeeland sub-polygon with 22 seam
+            coordinates kept 11 `boundary_node_ids` at 5m/15m but only 9 at 30m/60m,
+            i.e. a raised tolerance silently de-stitched the region."""
+            if not protected_coords:
+                return []
+            return [i for i, (x, y) in enumerate(pts)
+                    if (round(float(x), 3), round(float(y), 3)) in protected_coords]
+
+        kept_rings = []
+        for ri, pts in enumerate(rings):
+            n = len(pts)
+            picked = _anchors(pts) if n >= 4 else None
+            if picked is None:
+                kept_rings.append(pts)
+                continue
+            picked = sorted(set(picked) | set(_protected(pts)))
+            keep = np.zeros(n, dtype=bool)
+            for idx in picked:
+                keep[idx] = True
+            for start, end in zip(picked, picked[1:] + [picked[0] + n]):
+                chain = (pts[start:end + 1] if end < n
+                         else np.vstack([pts[start:], pts[:end - n + 1]]))
+                chain_keep = np.zeros(len(chain), dtype=bool)
+                _dp(ri, chain, start, chain_keep)
+                for off in np.nonzero(chain_keep)[0]:
+                    keep[(start + int(off)) % n] = True
+            kept = pts[keep]
+            if len(kept) < 3:
+                return None  # unreachable with three anchors; never emit a
+                             # degenerate ring, fail closed instead
+            kept_rings.append(kept)
+
+        result = self._assemble_simplified_rings(ring_of_part, kept_rings)
+        if result is None:
+            return None
+        # Fail closed on anything the guards were supposed to have prevented, so a
+        # caller never silently builds a navmesh on a broken or fragmented boundary.
+        # "Supposed to" is not a check: §10.6 item 1 lists one residual path no
+        # guard covers (two chords on opposite banks of a neck narrower than 2*tol
+        # crossing each other -- never reproduced on real data, but not excluded).
+        if result.is_empty or not result.is_valid:
+            return None
+        if len(self._explode_polygonal(result)) != len(parts):
+            return None
+        return result
+
+    @staticmethod
+    def _assemble_simplified_rings(ring_of_part, kept_rings):
+        """Rebuild a (Multi)Polygon from per-ring surviving-vertex arrays, or None
+        if shapely refuses one of the rings. Split out of
+        `_topology_guarded_simplify` so its fail-closed re-validation can be tested
+        against a deliberately broken assembly."""
+        out = []
+        for part_rings in ring_of_part:
+            shell = kept_rings[part_rings[0]]
+            holes = [kept_rings[hi] for hi in part_rings[1:]]
+            try:
+                out.append(Polygon(shell, holes))
+            except Exception:
+                return None
+        if not out:
+            return None
+        return out[0] if len(out) == 1 else MultiPolygon(out)
+
     def _tile_navmesh_piece(self, poly_m, max_extent_m: float, min_navmesh_radius_m: float):
         """Round 23a: cap a navmesh-eligible piece's extent by splitting it into a
         regular grid of tiles no larger than `max_extent_m` per side, when the piece
@@ -2931,7 +3356,7 @@ class NauticalRoutingPipeline:
         minx, miny, maxx, maxy = poly_m.bounds
         width, height = maxx - minx, maxy - miny
 
-        simplified = self._clean_polygonal(poly_m.buffer(0).simplify(NAVMESH_BOUNDARY_SIMPLIFY_M))
+        simplified = self._simplify_navmesh_boundary(poly_m)
         nverts = sum(len(p.exterior.coords) - 1 + sum(len(ring.coords) - 1 for ring in p.interiors)
                      for p in self._explode_polygonal(simplified))
         needs_tiling = (width > max_extent_m or height > max_extent_m
@@ -3826,13 +4251,21 @@ class NauticalRoutingPipeline:
         # apart from this region's own perimeter nodes.
         self._piece_counter += 1
         piece_ctx = f"navmesh:{self._piece_counter}"
-        # Coarse boundary-output simplify pass (§5.2.3 item 1, NAVMESH_BOUNDARY_SIMPLIFY_M's
-        # docstring above has the full rationale) -- applied here, after the caller already
-        # computed seam_coord_set from the un-simplified wide/narrow and deep/shallow
-        # boundaries, because simplify() only ever removes vertices, never moves a
-        # retained one, so exact-coordinate seam matching below still works on whatever
-        # seam vertices survive this pass.
-        simplified_poly_m = self._clean_polygonal(poly_m.buffer(0).simplify(NAVMESH_BOUNDARY_SIMPLIFY_M))
+        # Coarse boundary-output simplify pass, at navmesh_boundary_simplify_m
+        # (--navmesh-boundary-simplify-m, default NAVMESH_BOUNDARY_SIMPLIFY_M; that
+        # constant's comment has the full tuning rationale, _simplify_navmesh_boundary
+        # what a raised tolerance does and does not guarantee) -- applied here, after
+        # the caller already computed seam_coord_set from the un-simplified wide/narrow
+        # and deep/shallow boundaries, because BOTH the default simplify() and the
+        # guarded pass only ever remove vertices, never move a retained one, so
+        # exact-coordinate seam matching below still works on whatever seam vertices
+        # survive this pass. Above the default that "whatever survives" would be a
+        # real cost -- measured before seam protection existed, a Zeeland sub-polygon
+        # with 22 seam coordinates kept 11 boundary_node_ids at 5m/15m but only 9 at
+        # 30m/60m -- so seam_coord_set is passed in as PROTECTED anchors the pass may
+        # never delete (§10.6 item 1). _tile_navmesh_piece's vertex-count gate passes
+        # none, so its count is a slight under-estimate of the real boundary.
+        simplified_poly_m = self._simplify_navmesh_boundary(poly_m, seam_coord_set)
         simplified_pieces = self._explode_polygonal(simplified_poly_m)
         if not simplified_pieces:
             logger.warning("  Navmesh region boundary simplify collapsed the polygon; skipping region.")
@@ -8301,6 +8734,38 @@ if __name__ == "__main__":
                              "reproduces today's skeleton raster byte-for-byte. Must be finite, "
                              ">= 0.0, and < "
                              f"{SKELETON_JUNCTION_MERGE_MAX_M:.0f}m if enabled (raises otherwise).")
+    parser.add_argument("--navmesh-boundary-simplify-m", type=float,
+                        default=NAVMESH_BOUNDARY_SIMPLIFY_M,
+                        help="Douglas-Peucker tolerance for the coarse simplify pass applied to a "
+                             "navmesh region's own boundary ring before it is triangulated and "
+                             "exported (docs/SPEC-GRAPH-DENSITY.md §10.6 item 1 -- the navmesh "
+                             "analogue of --skeleton-boundary-simplify-m, and the ONLY place the "
+                             "navmesh's over-dense boundary rings can be thinned, since a navmesh "
+                             "node cannot be removed post-build without re-triangulating the region, "
+                             "see docs/SPEC-GRAPH-CLEANUP.md §4.4). Unlike the other tolerance flags "
+                             "this pass is ON by default: "
+                             f"the default {NAVMESH_BOUNDARY_SIMPLIFY_M:.1f} is the empirically tuned "
+                             "value this pass has used unconditionally since Round 9, so omitting the "
+                             "flag reproduces today's output byte-for-byte. 0.0 disables the pass "
+                             "entirely (the sweep's 'no pass' arm, ~10x the boundary vertices). Above "
+                             f"{NAVMESH_BOUNDARY_SIMPLIFY_M:.1f} a guarded simplify is used instead of "
+                             "plain Douglas-Peucker: a chord may cut INWARD (removing water) by the "
+                             "full tolerance, but may bulge OUTWARD over land by at most "
+                             f"{NAVMESH_BOUNDARY_SIMPLIFY_M:.1f}m, and is rejected if it would cross or "
+                             "engulf another part of the boundary (so islands, parts and narrow "
+                             "passages survive). That caps the WIDTH of any navmesh-over-land "
+                             "excursion at what the default already produces -- it does NOT make the "
+                             "overlap zero (measured on the real Zeeland coastal_water body: 19,164 "
+                             "m2 over the land layer at 15m vs 24,299 m2 at the default; widest "
+                             "excursion 4.92m vs the default's 7.04m) -- and navmesh boundary edges "
+                             "have no land-crossing strip-on-failure safety net of their own. Raising "
+                             "the tolerance also shaves real water inward (gross 0.50 km2 of that "
+                             "124 km2 body at 15m, 2.39 km2 at 99m), narrowing channels below ~2x the "
+                             "tolerance. Seam coordinates are protected, so stitching points survive. "
+                             "15 is the recommended first value and NO raised tolerance has been "
+                             "validated by a real regional build yet (§10.6/§10.7; reproduce the "
+                             "bench numbers with scripts/measure_navmesh_boundary_simplify.py). Must "
+                             f"be finite, >= 0.0, and < {NAVMESH_BOUNDARY_SIMPLIFY_MAX_M:.0f}m.")
     parser.add_argument("--channel-axis-deadend-stitch-m", type=float, default=0.0,
                         help="With --channel-axes: a buoy-chain (tier-3 mark_chain) axis can end as a "
                              "true graph dead end far from the rest of the network -- "
@@ -8381,6 +8846,11 @@ if __name__ == "__main__":
     except ValueError as e:
         raise SystemExit(f"--skeleton-junction-merge-m: {e}")
     try:
+        NauticalRoutingPipeline._validate_navmesh_boundary_simplify_m(
+            args.navmesh_boundary_simplify_m)
+    except ValueError as e:
+        raise SystemExit(f"--navmesh-boundary-simplify-m: {e}")
+    try:
         NauticalRoutingPipeline._validate_channel_axes_min_confidence(args.channel_axes_min_confidence)
     except ValueError as e:
         raise SystemExit(f"--channel-axes-min-confidence: {e}")
@@ -8460,6 +8930,7 @@ if __name__ == "__main__":
                                        pass0_cross_type_first=args.pass0_cross_type_first,
                                        skeleton_boundary_simplify_m=args.skeleton_boundary_simplify_m,
                                        skeleton_junction_merge_m=args.skeleton_junction_merge_m,
+                                       navmesh_boundary_simplify_m=args.navmesh_boundary_simplify_m,
                                        use_channel_axes=args.channel_axes,
                                        channel_axes_min_confidence=args.channel_axes_min_confidence,
                                        channel_axes_navmesh_carve=args.channel_axes_navmesh_carve,

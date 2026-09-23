@@ -94,7 +94,9 @@ configured "universally safe" ceiling everywhere in the polygon?), and
 it?). This is a single, named, documented decision point — not a threshold
 buried inside a sampling function.
 
-### Long-distance routing → supernodes and macro-edges
+### Long-distance routing → supernodes and macro-edges (PLANNED, not implemented)
+
+> **Status: PLANNED.** Not implemented; this is phase 3f (see `PHASE_3_DESIGN.md`, `docs/ROADMAP.md`). Nothing below exists in the pipeline today.
 
 Supernodes sit at navmesh-region boundaries, skeleton junctions, and every
 lock/bridge/POI. Between adjacent supernodes, the pipeline precomputes not
@@ -116,17 +118,19 @@ router are aware of it:
 |---|---|---|
 | 1 | Official hydrographic authority ENC/IENC | Ground truth |
 | 2 | Other official waterway-authority data outside strict ENC | Authoritative, less standardized |
-| 3 | OpenStreetMap / OpenSeaMap community tags | Good for topology, provisional for exact numbers |
-| 4 | Bathymetric raster fill (GEBCO / EMODnet Bathymetry) | Statistically reasonable, not survey-grade — extra margin applied, never a sole safety authority |
+| 3 | OpenStreetMap / OpenSeaMap community tags (**PLANNED, not implemented**, phase 3a) | Good for topology, provisional for exact numbers |
+| 4 | Bathymetric raster fill (GEBCO / EMODnet Bathymetry) (**PLANNED, not implemented**, phase 3b) | Statistically reasonable, not survey-grade — extra margin applied, never a sole safety authority |
 | 5 | Human/AI-curated override, after human sign-off | Tier-1-equivalent for that specific location |
 | 6 | AIS/vessel-density–derived candidate track | Soft preference / anomaly signal only, never a hard safety constraint on its own |
 
-A region ships as soon as tiers 1–4 connect it, with lower-tier stretches
+**Future policy target** (tiers 3–4 are not implemented yet, see table above): a region ships as soon as tiers 1–4 connect it, with lower-tier stretches
 clearly marked so a consumer can render or weight them differently — a
 graph that's honest about its gaps and improves over time, rather than one
 that looks equally confident everywhere and occasionally isn't.
 
-## Community override workflow
+## Community override workflow (PLANNED, not implemented)
+
+> **Status: PLANNED.** There is no anomaly detector (`find_anomalies.py`) or override applier (`apply_overrides.py`) in the repo yet; a spec is on branch `override-zones-spec` (phase 3c). See `docs/ROADMAP.md`.
 
 Some things aren't obvious from any chart — an unusual lock approach, a
 bridge with an asymmetric fairway, a local shortcut everyone uses. The
@@ -151,7 +155,9 @@ one-off fix:
    every future rebuild of that region — a regeneration of the base graph
    never silently discards it.
 
-## Real vessel-traffic signal
+## Real vessel-traffic signal (PLANNED, not implemented)
+
+> **Status: PLANNED.** No AIS/vessel-density ingestion or validation exists yet (phase 3d). See `docs/ROADMAP.md`.
 
 Two free, aggregated vessel-traffic datasets exist for the target
 continents — EMODnet Human Activities' vessel-density grids (Europe,
@@ -204,17 +210,15 @@ not a requirement.
 ## Status & roadmap
 
 This repository is a from-scratch rebuild of the graph-generation pipeline
-around the architecture above. Rollout is phased by region, starting with
-a pilot area with good existing test coverage, then scaling out to full
-national/regional coverage before adding the hierarchical long-distance
-layer. Phase 0-2 (navmesh/skeleton generation, funnel-algorithm routing)
-are implemented; see `PHASE_3_DESIGN.md` for the detailed design of what
-comes next (community data fusion, override workflow, vessel-traffic
-validation, scale-out, hierarchical routing), `PHASE_4_DESIGN.md` for three
-further sub-phases (dynamic, position-aware database loading; AI-vision-
-assisted resolution of ambiguous path choices; bridge/lock wait-time and
-schedule data), and `NEXT_PHASES.md` for
-the tactical, in-progress bug-tracking log.
+around the architecture above. Phase 0-2 (navmesh/skeleton generation,
+funnel-algorithm routing) are implemented, as is the US East Coast
+scale-out.
+
+The single source of truth for what is done, open, superseded or deferred is
+[`docs/ROADMAP.md`](docs/ROADMAP.md). Forward designs: `PHASE_3_DESIGN.md`
+and `PHASE_4_DESIGN.md`. `NEXT_PHASES.md` lists only what is still open; the
+finished chronological hardening log is archived at
+[`docs/archive/NEXT_PHASES_LOG.md`](docs/archive/NEXT_PHASES_LOG.md).
 
 ## Contributing
 

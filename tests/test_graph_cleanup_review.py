@@ -412,3 +412,367 @@ def test_answers_to_ops_applies_cleanly_to_the_graph(tmp_path):
     res = ops_mod.apply(g, result_ops)
     assert res.applied == 3
     assert {20, 21, 22}.isdisjoint(g.nodes)
+
+
+# ------------------------------------------- stale / degraded / circuit breaker
+
+from graph_cleanup.backends.base import BackendError  # noqa: E402
+
+
+def _hand_tile(tmp_path, name="h1", nodes=(10, 11, 12)):
+    """A minimal tile dir (no images) with one dead_end_stub candidate."""
+    d = tmp_path / name
+    d.mkdir()
+    (d / "context.json").write_text(json.dumps({
+        "tile_id": name, "candidates": [
+            {"n": 1, "kind": "dead_end_stub", "candidate_id": "stub:10"}]}))
+    (d / "manifest.json").write_text(json.dumps({
+        "1": {"candidate_id": "stub:10", "kind": "dead_end_stub", "nodes": list(nodes)}}))
+    return str(d)
+
+
+class _Scripted:
+    """answer_tile plays back `script`: a raw string, an Exception, or a
+    callable(tile_dir). The last item repeats. Optionally degraded-aware."""
+
+    def __init__(self, *script, degraded=False):
+        self.script, self.calls, self._degraded = list(script), 0, degraded
+
+    def answer_tile(self, tile_dir):
+        self.calls += 1
+        item = self.script.pop(0) if len(self.script) > 1 else self.script[0]
+        if isinstance(item, Exception):
+            raise item
+        return item
+
+    def consume_degraded(self, tile_dir):
+        return self._degraded
+
+
+DROP = json.dumps({"1": {"verdict": "drop", "why": "rubbish"}})
+KEEP = json.dumps({"1": {"verdict": "keep", "why": "real"}})
+UNSURE = json.dumps({"1": {"verdict": "unsure", "why": "local: unusable reply"}})
+
+
+def test_no_resume_failing_backend_leaves_no_stale_answer_or_ops(tmp_path):
+    tile = _hand_tile(tmp_path)
+    runner.run_all(_Scripted(DROP), [tile])
+    assert len(runner.answers_to_ops([tile], "t")) == 2   # round 1 dropped 10, 11
+
+    stats = runner.run_all(_Scripted(BackendError("server down")), [tile],
+                           resume=False, max_consecutive_backend_errors=0)
+    assert stats.unanswered == 1
+    for name in ("answer.json", "answer.meta.json"):
+        assert not os.path.exists(os.path.join(tile, name))
+    assert os.path.exists(os.path.join(tile, "error.txt"))
+    assert runner.answers_to_ops([tile], "t") == []
+
+
+def test_rerun_removes_a_stale_error_txt_on_success(tmp_path):
+    tile = _hand_tile(tmp_path)
+    runner.run_all(_Scripted(BackendError("boom")), [tile], max_consecutive_backend_errors=0)
+    assert os.path.exists(os.path.join(tile, "error.txt"))
+    runner.run_all(_Scripted(KEEP), [tile])
+    assert not os.path.exists(os.path.join(tile, "error.txt"))
+    assert runner.answer_status(tile) == "valid"
+
+
+def test_run_tile_clears_an_old_error_txt(tmp_path):
+    tile = _hand_tile(tmp_path)
+    (tmp_path / "h1" / "error.txt").write_text("old")
+    assert runner.run_tile(_Scripted(KEEP), tile) is not None
+    assert not os.path.exists(os.path.join(tile, "error.txt"))
+
+
+def test_answer_for_a_different_manifest_is_refused(tmp_path):
+    tile = _hand_tile(tmp_path)
+    runner.run_all(_Scripted(DROP), [tile])
+    # same tile id, but another graph build: the manifest now names other nodes
+    (tmp_path / "h1" / "manifest.json").write_text(json.dumps({
+        "1": {"candidate_id": "stub:77", "kind": "dead_end_stub", "nodes": [77, 78, 79]}}))
+    assert runner.answer_status(tile) == "stale"
+    with pytest.raises(runner.StaleAnswerError, match="different manifest"):
+        runner.answers_to_ops([tile], "t")
+    # --resume does not trust it either: the tile is re-answered
+    b = _Scripted(KEEP)
+    stats = runner.run_all(b, [tile])
+    assert b.calls == 1 and stats.skipped_existing == 0
+    assert runner.answers_to_ops([tile], "t") == []
+
+
+def test_legacy_answer_without_meta_still_works_but_must_match_the_manifest(tmp_path):
+    tile = _hand_tile(tmp_path)
+    (tmp_path / "h1" / "answer.json").write_text(DROP)     # no answer.meta.json
+    assert runner.answer_status(tile) == "valid"
+    assert [o.node for o in runner.answers_to_ops([tile], "t")] == [10, 11]
+    (tmp_path / "h1" / "answer.json").write_text(json.dumps(
+        {"1": {"verdict": "drop"}, "2": {"verdict": "drop"}}))
+    with pytest.raises(runner.StaleAnswerError, match="not the same tile"):
+        runner.answers_to_ops([tile], "t")
+
+
+def test_reprepare_with_other_candidates_discards_the_old_answer(tmp_path):
+    g = _graph_with_stub_and_component()
+    stubs = C.find_dead_end_stubs(g)
+    comps = C.find_small_components(g, max_component_size=10)
+    geo = _fake_geojson_dir(tmp_path)
+
+    def prep(cands):
+        prepare.write_tile(T.Tile(id="t1", bbox=(3.9, 51.9, 4.2, 53.3), candidates=cands),
+                           g, tile_dir, input_dir=geo)
+
+    tile_dir = str(tmp_path / "t1")
+    prep(stubs)
+    runner.run_all(MockBackend(stub_keep_max_m=0.0), [tile_dir])
+    (open(os.path.join(tile_dir, "error.txt"), "w")).write("old")
+    assert runner.answer_status(tile_dir) == "valid"
+
+    # identical re-prepare keeps the answer (that is what --resume relies on)
+    prep(stubs)
+    assert runner.answer_status(tile_dir) == "valid"
+
+    # same tile id, different candidates: answer, meta and error are gone
+    prep(comps + stubs)
+    assert runner.answer_status(tile_dir) == "missing"
+    assert not os.path.exists(os.path.join(tile_dir, "answer.meta.json"))
+    assert not os.path.exists(os.path.join(tile_dir, "error.txt"))
+    assert runner.answers_to_ops([tile_dir], "t") == []
+
+
+def test_degraded_answer_is_marked_never_dropped_and_retried_on_resume(tmp_path):
+    tile = _hand_tile(tmp_path)
+    fallback = _Scripted(UNSURE, degraded=True)
+    stats = runner.run_all(fallback, [tile])
+    assert stats.answered == 1 and stats.degraded == 1
+    assert json.load(open(os.path.join(tile, "answer.meta.json")))["degraded"] is True
+    assert json.load(open(os.path.join(tile, "answer.json")))["1"]["verdict"] == "unsure"
+    assert runner.answer_status(tile) == "degraded"
+    assert runner.answers_to_ops([tile], "t") == []
+
+    good = _Scripted(DROP)                       # a later --resume retries it
+    stats2 = runner.run_all(good, [tile])
+    assert good.calls == 1 and stats2.skipped_existing == 0 and stats2.degraded == 0
+    assert runner.answer_status(tile) == "valid"
+    stats3 = runner.run_all(_Scripted(KEEP), [tile])   # now really done
+    assert stats3.skipped_existing == 1
+
+
+def test_degraded_answer_is_never_turned_into_ops_even_if_it_holds_a_drop(tmp_path):
+    tile = _hand_tile(tmp_path)
+    runner.run_all(_Scripted(DROP, degraded=True), [tile])
+    assert runner.answers_to_ops([tile], "t") == []
+
+
+def _many_tiles(tmp_path, n):
+    return [_hand_tile(tmp_path, f"m{i}") for i in range(n)]
+
+
+def test_circuit_breaker_aborts_after_n_consecutive_backend_errors(tmp_path):
+    tiles = _many_tiles(tmp_path, 6)
+    b = _Scripted(BackendError("connection refused"))
+    with pytest.raises(runner.BackendCircuitOpen, match="3 consecutive") as ei:
+        runner.run_all(b, tiles, max_consecutive_backend_errors=3)
+    assert b.calls == 3 * 2                      # 3 tiles x (1 + runner retry)
+    assert ei.value.stats.unanswered == 3
+    assert not os.path.exists(os.path.join(tiles[3], "error.txt"))  # never reached
+
+
+def test_circuit_breaker_disabled_with_zero(tmp_path):
+    tiles = _many_tiles(tmp_path, 6)
+    stats = runner.run_all(_Scripted(BackendError("x")), tiles,
+                           max_consecutive_backend_errors=0)
+    assert stats.unanswered == 6
+
+
+def test_circuit_breaker_resets_on_success_and_ignores_bad_json(tmp_path):
+    tiles = _many_tiles(tmp_path, 7)
+    err = BackendError("x")
+    # per tile the runner makes two calls: fail,fail | fail,fail | ok | fail,fail | garbage,garbage | fail,fail | fail,fail
+    script = [err, err, err, err, KEEP, err, err, "not json", "not json", err, err, err, err]
+    stats = runner.run_all(_Scripted(*script), tiles, max_consecutive_backend_errors=3)
+    assert stats.answered == 1 and stats.unanswered == 6
+
+
+def test_circuit_breaker_default_and_skipped_tiles_do_not_count(tmp_path):
+    assert runner.DEFAULT_MAX_CONSECUTIVE_BACKEND_ERRORS == 5
+    tiles = _many_tiles(tmp_path, 8)
+    runner.run_all(_Scripted(KEEP), tiles[:2])
+    with pytest.raises(runner.BackendCircuitOpen):
+        runner.run_all(_Scripted(BackendError("x")), tiles)   # default threshold
+
+
+# ------------------------------------------- history, atomic writes, identity
+
+def _history(tile):
+    h = os.path.join(tile, "history")
+    return sorted(os.listdir(h)) if os.path.isdir(h) else []
+
+
+def test_no_resume_outage_archives_the_old_answer_and_yields_no_ops(tmp_path):
+    tile = _hand_tile(tmp_path)
+    runner.run_all(_Scripted(DROP), [tile])
+    old = open(os.path.join(tile, "answer.json")).read()
+
+    runner.run_all(_Scripted(BackendError("outage")), [tile], resume=False,
+                   max_consecutive_backend_errors=0)
+    assert _history(tile) == ["0001"]
+    h = os.path.join(tile, "history", "0001")
+    assert open(os.path.join(h, "answer.json")).read() == old       # paid-for work kept
+    assert json.load(open(os.path.join(h, "answer.meta.json")))["degraded"] is False
+    assert os.path.exists(os.path.join(h, "manifest.json"))
+    assert not os.path.exists(os.path.join(tile, "answer.json"))
+    assert runner.answer_status(tile) == "missing"                  # never falls back
+    assert runner.answers_to_ops([tile], "t") == []
+
+
+def test_history_rounds_increment_and_are_never_read_back(tmp_path):
+    tile = _hand_tile(tmp_path)
+    runner.run_all(_Scripted(DROP), [tile])
+    runner.run_all(_Scripted(KEEP), [tile], resume=False)
+    runner.run_all(_Scripted(UNSURE, degraded=True), [tile], resume=False)
+    assert _history(tile) == ["0001", "0002"]
+    assert json.load(open(os.path.join(tile, "history", "0001", "answer.json")))[
+        "1"]["verdict"] == "drop"
+    # current answer is the degraded one; the archived drop must not resurface
+    assert runner.answer_status(tile) == "degraded"
+    assert runner.answers_to_ops([tile], "t") == []
+    # a failed re-run of a stale answer leaves nothing to fall back on either
+    (tmp_path / "h1" / "manifest.json").write_text(json.dumps({
+        "1": {"candidate_id": "stub:9", "kind": "dead_end_stub", "nodes": [9, 8, 7]}}))
+    runner.run_all(_Scripted(BackendError("x")), [tile], max_consecutive_backend_errors=0)
+    assert runner.answers_to_ops([tile], "t") == []
+    assert len(_history(tile)) == 3
+
+
+def test_a_lone_error_txt_is_deleted_not_archived(tmp_path):
+    tile = _hand_tile(tmp_path)
+    runner.run_all(_Scripted(BackendError("x")), [tile], max_consecutive_backend_errors=0)
+    runner.run_all(_Scripted(KEEP), [tile])
+    assert _history(tile) == []
+
+
+def test_reprepare_with_new_candidates_archives_the_old_answer(tmp_path):
+    g = _graph_with_stub_and_component()
+    stubs = C.find_dead_end_stubs(g)
+    comps = C.find_small_components(g, max_component_size=10)
+    geo = _fake_geojson_dir(tmp_path)
+    tile_dir = str(tmp_path / "t1")
+
+    def prep(cands):
+        prepare.write_tile(T.Tile(id="t1", bbox=(3.9, 51.9, 4.2, 53.3), candidates=cands),
+                           g, tile_dir, input_dir=geo)
+    prep(stubs)
+    runner.run_all(MockBackend(stub_keep_max_m=0.0), [tile_dir])
+    prep(comps + stubs)
+    assert runner.answer_status(tile_dir) == "missing"
+    assert _history(tile_dir) == ["0001"]
+    assert os.path.exists(os.path.join(tile_dir, "history", "0001", "manifest.json"))
+    assert runner.answers_to_ops([tile_dir], "t") == []
+
+
+def test_answer_is_discarded_if_the_tile_is_reprepared_during_the_call(tmp_path):
+    tile = _hand_tile(tmp_path)
+
+    class Reprepares(_Scripted):
+        def answer_tile(self, tile_dir):
+            out = super().answer_tile(tile_dir)
+            (tmp_path / "h1" / "manifest.json").write_text(json.dumps({
+                "1": {"candidate_id": "stub:55", "kind": "dead_end_stub",
+                      "nodes": [55, 56, 57]}}))
+            return out
+
+    stats = runner.run_all(Reprepares(DROP), [tile], max_consecutive_backend_errors=0)
+    assert stats.answered == 0 and stats.unanswered == 1
+    assert not os.path.exists(os.path.join(tile, "answer.json"))
+    assert not os.path.exists(os.path.join(tile, "answer.meta.json"))
+    assert "re-prepared" in open(os.path.join(tile, "error.txt")).read()
+    assert runner.answers_to_ops([tile], "t") == []
+
+
+def test_answer_is_stamped_with_the_manifest_it_was_made_for(tmp_path):
+    tile = _hand_tile(tmp_path)
+    runner.run_all(_Scripted(KEEP), [tile])
+    assert json.load(open(os.path.join(tile, "answer.meta.json")))[
+        "manifest_sha256"] == runner.manifest_digest(tile)
+
+
+def test_atomic_write_leaves_old_file_and_no_temp_on_crash(tmp_path, monkeypatch):
+    path = str(tmp_path / "answer.json")
+    runner.atomic_write_text(path, "OLD")
+
+    def crash(fd):
+        raise OSError("power cut")
+    monkeypatch.setattr(os, "fsync", crash)
+    with pytest.raises(OSError):
+        runner.atomic_write_text(path, "NEW-but-half-written")
+    assert open(path).read() == "OLD"
+    assert os.listdir(tmp_path) == ["answer.json"]
+
+
+def test_crash_while_writing_answer_leaves_no_valid_looking_answer(tmp_path, monkeypatch):
+    tile = _hand_tile(tmp_path)
+    real_replace = os.replace
+
+    def crash_on_answer(src, dst):
+        if os.path.basename(dst) == "answer.json":
+            raise OSError("killed")
+        return real_replace(src, dst)
+    monkeypatch.setattr(os, "replace", crash_on_answer)
+    with pytest.raises(OSError):
+        runner.run_all(_Scripted(DROP), [tile])
+    assert not os.path.exists(os.path.join(tile, "answer.json"))
+    assert runner.answer_status(tile) == "missing"        # meta alone is not an answer
+    assert runner.answers_to_ops([tile], "t") == []
+    assert [f for f in os.listdir(tile) if f.endswith(".tmp")] == []
+
+
+def test_legacy_answer_without_meta_warns_on_stderr(tmp_path, capsys):
+    tile = _hand_tile(tmp_path)
+    (tmp_path / "h1" / "answer.json").write_text(DROP)
+    assert len(runner.answers_to_ops([tile], "t")) == 2
+    err = capsys.readouterr().err
+    assert "answer.meta.json" in err and "h1" in err and "cannot be tied" in err
+    runner.run_all(_Scripted(DROP), [tile], resume=False)
+    runner.answers_to_ops([tile], "t")
+    assert capsys.readouterr().err == ""                  # meta present: no warning
+
+
+@pytest.mark.parametrize("entry", ["drop", None, ["drop"], 7])
+def test_answers_to_ops_skips_non_dict_entries(tmp_path, entry):
+    tile = _hand_tile(tmp_path)
+    (tmp_path / "h1" / "answer.json").write_text(json.dumps({"1": entry}))
+    assert runner.answers_to_ops([tile], "t") == []
+
+
+def test_skipped_tiles_do_not_count_toward_the_circuit_breaker(tmp_path):
+    tiles = _many_tiles(tmp_path, 6)
+    runner.run_all(_Scripted(KEEP), tiles[:4])
+    # 4 skipped + 2 failing with threshold 3: never trips
+    stats = runner.run_all(_Scripted(BackendError("x")), tiles, max_consecutive_backend_errors=3)
+    assert stats.skipped_existing == 4 and stats.unanswered == 2
+
+
+def test_skipped_tile_between_failures_does_not_reset_the_streak(tmp_path):
+    tiles = _many_tiles(tmp_path, 3)
+    runner.run_all(_Scripted(KEEP), [tiles[1]])
+    with pytest.raises(runner.BackendCircuitOpen):
+        runner.run_all(_Scripted(BackendError("x")), tiles, max_consecutive_backend_errors=2)
+
+
+def test_consecutive_degraded_tiles_trip_the_breaker(tmp_path):
+    tiles = _many_tiles(tmp_path, 8)
+    with pytest.raises(runner.BackendCircuitOpen, match="3 consecutive tiles came back"):
+        runner.run_all(_Scripted(UNSURE, degraded=True), tiles, max_consecutive_degraded=3)
+    assert sum(os.path.exists(os.path.join(t, "answer.json")) for t in tiles) == 3
+    # 0 disables; a good tile in between resets the streak
+    stats = runner.run_all(_Scripted(UNSURE, degraded=True), tiles, resume=False,
+                           max_consecutive_degraded=0)
+    assert stats.degraded == 8
+    class Alternating(_Scripted):
+        n = 0
+        def consume_degraded(self, tile_dir):
+            self.n += 1
+            return self.n % 3 != 0
+    stats = runner.run_all(Alternating(UNSURE), tiles, resume=False, max_consecutive_degraded=3)
+    assert stats.answered == 8
+    assert runner.DEFAULT_MAX_CONSECUTIVE_DEGRADED == 10

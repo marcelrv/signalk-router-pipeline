@@ -35,6 +35,27 @@ re-confirmation (§11.4), and build #43 is now deployed. Zeeland got the same fi
 build #44 — same 35.0m value, all six gates pass clean with **zero** `poi_snap_drift`,
 and is also deployed. See `data/BUILD_LOG.md` for every real build's measured effect
 before assuming any of these should ship enabled by default.
+
+**Status update (2026-09-21), added without rewriting the history above.** The header list
+above omits three sections: **§6.8** (`_get_or_create_node` ~1.1 m rounding grain, fixed by
+`--node-merge-m`, verified live in BUILD_LOG #9), **§6.9** (`axis_dedup_cap_m` clarification;
+its follow-up, a flat `--axis-dedup-floor-m 100` for narrow channels, is commit `c2259f2`,
+BUILD_LOG #10, the config that was live for Zeeland at the time) and **§10** (the post-§9
+"bowtie" investigation, with recommendations that are still mostly unbuilt: see §10.6).
+Follow-ups not mentioned elsewhere: `--inland-resample-max-segment-m` (BUILD_LOG #11 at 250 m
+and #12 at 100 m) **regressed connectivity** (21 and 9 named POIs lost from the main component)
+and was **not deployed**. The §6.6/§6.7 "real-build verification pending" notes are resolved:
+BUILD_LOG #6 (hubs unchanged at 56, so Pass 2 was not the cause) and #7 (hubs 56 to 0 with
+`--pass0-target-fanin-cap 4`). §9.4's five-gate discipline was only partly run for builds #34/#35
+(no byte-identical-at-default rebuild, no edge-length connectivity or POI-pair reachability
+gates). **§10.6 item 1 (`--navmesh-boundary-simplify-m`) is BUILT in code as of
+2026-09-22** — `NAVMESH_BOUNDARY_SIMPLIFY_M = 5.0` is now only the flag's default, and
+above it `_topology_guarded_simplify` replaces the plain Douglas-Peucker — but **no
+regional build has been run with a raised tolerance** (ROADMAP item 9), so nothing
+about the depth-margin cost, per-edge land crossings or the rendered image is settled.
+See §10.6 item 1 for the measured bench numbers on Zeeland and MD. Consolidated
+status: `docs/ROADMAP.md`.
+
 Complements: `SPEC-RECOMMENDED-TRACK.md`, `SPEC-FAIRWAY-HARMONIZATION.md`
 Scope: `nautical_routing_pipeline.py` (`build_skeleton_network`, `_resample_long_skeleton_edges`, `_skeleton_raster_to_graph`, `ClassificationConfig`)
 Measured against: `data/zeeland_full.sqlite` (48,553 nodes / 137,718 directed edges), RWS source GeoJSON
@@ -259,7 +280,7 @@ chain *before* `_resample_long_skeleton_edges` sees it. Targets the 25.1% of edg
 10–25 m band, which are raster discretisation, not channel shape. Cheap and independent
 of 4.1, though 4.1 subsumes part of it.
 
-### 4.3 Prefer the authoritative axis over a generated twin — SCOPED, ready to implement
+### 4.3 Prefer the authoritative axis over a generated twin — IMPLEMENTED (shipped in PR #14, see §6.3; heading was "SCOPED, ready to implement")
 
 Where a medial-axis centerline runs within a small tolerance of an imported
 `inland_waterways_lines` axis (`wtwaxs`/`RECTRC`/`NAVLNE`), keep the axis and drop the
@@ -1087,8 +1108,9 @@ as the only mechanism under test. Confirms: cap=0 lets the hub accumulate a conn
 to every spoke (documented pre-existing behaviour); cap=N bounds the hub's
 Pass-2-added out-degree at N while every spoke still ends up in the same connected
 component (via a different, uncapped node) rather than being stranded; a larger cap
-allows proportionally more fan-in. Full real-build verification (five-gate
-discipline, against `data/BUILD_LOG.md`'s baseline) pending.
+allows proportionally more fan-in. Real-build verification: DONE, see the header and
+`data/BUILD_LOG.md` #6 (hubs unchanged at 56 -- Pass 2 was not the cause; this was the
+finding that led to §6.7).
 
 ### 6.7 Pass 0c/0d's fan-in cap only covers one direction — IMPLEMENTED
 
@@ -1133,7 +1155,8 @@ treating it as "already connected"). Confirms: cap=0 lets the target accumulate 
 ring member's connector; cap=N bounds Pass 0c's own contribution at N
 (`_stitch_diag["pass0c"]["success"] <= N`, `target_fanin_capped` firing) while the
 graph stays fully connected regardless. Real-build five-gate verification (does hub
-count actually drop against `data/BUILD_LOG.md`'s baseline) pending.
+count actually drop against `data/BUILD_LOG.md`'s baseline): DONE, `data/BUILD_LOG.md`
+#7 (hubs 56 to 0, out-degree max 12, `crosses_land` 0) -- confirmed as the actual dominant cause.
 
 ### 6.8 `_get_or_create_node`'s ~1.1m rounding grain leaves near-duplicate nodes at multi-subsystem junctions
 
@@ -1240,6 +1263,12 @@ genuine short skeleton segments, not rounding-grain duplicates). Hub count (0) a
 new connectivity problems. Not installed live pending explicit deploy confirmation.
 
 ### 6.9 Clarification: `axis_dedup_cap_m` is a ceiling on a width-scaled tolerance, and lock polygons are exempted entirely — not a bug
+
+> **Follow-up (2026-09-21 note):** the "no follow-up is proposed" conclusion at the end of this
+> section was later superseded for narrow channels: a flat `--axis-dedup-floor-m 100` (commit
+> `c2259f2`, `data/BUILD_LOG.md` #10) fixed a real crisscross at the Vossemeersebrug/Tholen
+> narrows. The `--inland-resample-max-segment-m` attempts (BUILD_LOG #11/#12) regressed
+> connectivity and were not deployed.
 
 Investigating the same Krammersluis screenshot also raised a real but different
 question: with `--axis-dedup-cap 50.0` in effect, why do so many nodes still sit
@@ -1430,6 +1459,8 @@ disables it). Scoped to a subshell so only step 3/3 is bounded, not the whole sc
 
 ### 8.5 Verification plan (pending — not yet run against a real build)
 
+> Status 2026-09-21: real-build verification was executed, see §8.6 (it found §8.2/§8.3 do not fix the motivating case). The byte-identical-at-default check named here has still not been run.
+
 Everything in §8.2/§8.3 is implemented and covered by synthetic unit tests (29 new
 tests total, full suite 289/289 green with all new flags at their defaults), but —
 per this spec's own repeatedly-learned lesson (§6.1, §6.5) — **synthetic fixtures are
@@ -1574,6 +1605,8 @@ tolerance in this fixture; `0.0` reproduces today's skeleton output byte-for-byt
 validation rejects out-of-range/NaN/infinite values. Full suite: 300/300 passing.
 
 ### 9.4 Verification plan — PARTIALLY EXECUTED (real builds done; full five-gate discipline not)
+
+> Still true on 2026-09-21: the gates marked "Not done" below were only partly run for #34/#35 and have not been run since. Tracked in `docs/ROADMAP.md`.
 
 Same discipline as §8.5. Status per item, updated against `data/BUILD_LOG.md` #33-35:
 
@@ -1934,23 +1967,161 @@ magnitude sense of scale only.
 
 In priority order, by measured impact:
 
-1. **Primary fix — navmesh boundary ring simplification, mirroring §9's proven
-   pattern.** `NAVMESH_BOUNDARY_SIMPLIFY_M` (currently a fixed constant, 5.0m, not
-   a CLI flag) is the direct analogue of `skeleton_boundary_simplify_m`. Either (a)
-   raise the constant, or (b) parameterize it as a new CLI flag
-   (`--navmesh-boundary-simplify-m`), defaulting to today's 5.0m for byte-identical
-   output, tunable upward for real builds. **Caveat, flagged explicitly**: unlike
-   skeleton edges, navmesh-boundary (`EDGE_KIND_NAVMESH_BOUNDARY`) edges are in the
-   *lenient* bucket of `_sanity_check_no_land_crossings` (confirmed directly,
-   ~line 6322: "Navmesh fallback edges... don't set `is_placeholder`, so they fall
-   into the lenient 'skeleton' bucket... never stripped") — there is **no
-   automatic strip-on-land-crossing safety net** for these edges, unlike skeleton
-   edges' rasterize+land-mask re-intersection. Any tolerance increase needs its own
-   land-crossing validation on real extracted geometry before shipping (same
-   discipline as §9.2, not synthetic fixtures alone). The original 5.0m tuning note
-   (line 696-703) already found navmesh-boundary edges under 3.0m rose from 0.9%
-   (no-pass) to 3.9% (5.0m) to 6.0% (15.0m) — a real, quantified, non-zero
-   depth-safety-margin cost that needs re-measuring at whatever tolerance is tried.
+1. **[BUILT 2026-09-21 (option b), land-safety design REPLACED 2026-09-22:
+   `--navmesh-boundary-simplify-m` / `ClassificationConfig.navmesh_boundary_simplify_m`,
+   default `NAVMESH_BOUNDARY_SIMPLIFY_M` = 5.0, ceiling
+   `NAVMESH_BOUNDARY_SIMPLIFY_MAX_M` = 100.0, `0.0` disables the pass entirely. The
+   tolerance is read in one place, `_simplify_navmesh_boundary`, used by both
+   `build_navmesh_region` and `_tile_navmesh_piece`'s vertex-count tiling gate. A
+   default build is byte-identical: unit-tested against the literal pre-flag
+   expression on convex and concave geometry, and verified against
+   `git show HEAD:nautical_routing_pipeline.py` on the real Zeeland `coastal_water`
+   body (`equals_exact` at the default and at 2.0/0.0, plus an identical
+   `build_navmesh_region` node/edge/seam set and `navmesh_region_rows` hash on a real
+   18.9 km² sub-polygon). **No regional build has been run at a raised tolerance**
+   (ROADMAP item 9).
+
+   **Why the first land-safety guard was thrown away.** It re-intersected the
+   simplified polygon with the original water. That is land-safe but self-defeating,
+   measured on the real Zeeland `coastal_water` body (124.2 km², 39,618 boundary
+   vertices, 385 island rings): the clip *re-inserts* every original vertex wherever
+   a chord bulged outward, so the boundary got DENSER (5,861 vertices at the 5.0m
+   default → 27,586 at 15m), shattered into slivers (1 part → 37 at 15m, 55 at 99m,
+   and `build_navmesh_region` keeps only the largest — up to 0.51 km² of real water
+   silently dropped), emitted sub-millimetre ring segments (6e-5 m, a `triangle
+   -pq28` blow-up risk), and cost 4× MORE graph nodes than the default (298 → 1,158
+   at 15m).
+
+   **What ships instead: `_topology_guarded_simplify`.** An asymmetric-tolerance
+   Douglas-Peucker in the same single choke point. A chord may cut INWARD (into the
+   water, removing water) by the full tolerance, but may bulge OUTWARD over land by
+   at most `NAVMESH_BOUNDARY_SIMPLIFY_M` — never *wider* over land than the shipped
+   default already goes — and is rejected outright if it would cross or engulf any
+   other piece of the original boundary. Rings hang off three geometrically chosen
+   anchors (so no ring, not even a 6m island's, can collapse below a triangle, and
+   the result does not depend on where a ring happens to start), and any coordinate
+   in the caller's `seam_coord_set` is a protected anchor the pass may never delete.
+   It only ever REMOVES vertices, so `build_navmesh_region`'s exact-coordinate seam
+   match still works, and it runs in ~0.8s on the 39,618-vertex polygon.
+
+   **This is a width cap, not a zero-overlap guarantee.** The mesh still sits over
+   some land — less than the default does, but not none. Reproduce any of this with
+   `scripts/measure_navmesh_boundary_simplify.py` (it prints exactly these columns).
+
+   Zeeland, largest connected `coastal_water` body in bbox `3.83 51.58 3.98 51.70`
+   of `data/zeeland_clip` (124.2 km², 39,618 vertices, 385 islands; land overlap
+   against that clip's own `land_polygons.geojson`; "cut"/"added" are GROSS areas,
+   net = cut − added; "max out" is the widest excursion outside the original water):
+
+   | tol | plain `simplify()` verts / land m² | clip verts / parts | **guarded** verts | parts | islands | land m² | cut km² | added km² | net km² | max out m | min seg m |
+   |---|---|---|---|---|---|---|---|---|---|---|---|
+   | 5.0 (default) | 5,861 / 24,299 | *(skipped)* | *(default path)* | 1 | 385 | 24,299 | 0.129 | 0.157 | −0.028 | 7.04 | 0.370 |
+   | 15 | 2,629 / 59,996 | 27,586 / 37 | 3,886 | 1 | 385 | 19,164 | 0.498 | 0.101 | 0.397 | 4.92 | 0.111 |
+   | 20 | — | — | 3,541 | 1 | 385 | 19,006 | 0.657 | 0.093 | 0.564 | 4.94 | 0.111 |
+   | 30 | 1,922 / 96,957 | 26,921 / 44 | 3,212 | 1 | 385 | 18,051 | 0.962 | 0.083 | 0.878 | 4.94 | 0.111 |
+   | 60 | 1,576 / 138,318 | 27,423 / 51 | 2,801 | 1 | 385 | 16,505 | 1.654 | 0.073 | 1.581 | 4.94 | 0.111 |
+   | 99 | 1,452 / 194,569 | 27,613 / 55 | 2,609 | 1 | 385 | 13,677 | 2.391 | 0.067 | 2.324 | 4.94 | 0.111 |
+
+   MD, largest connected body in bbox `-76.6 38.7 -76.2 39.1` of
+   `data/geojson/md_reclip` — a second region, different survey vintage and
+   coastline character:
+
+   | tol | **guarded** verts | parts | islands | land m² | cut km² | added km² | net km² | max out m |
+   |---|---|---|---|---|---|---|---|---|
+   | 5.0 (default) | 65,539 | 1 | 233 | 43,982,270 | 1.915 | 1.910 | 0.005 | 6.70 |
+   | 15 | 49,225 | 1 | 233 | 40,720,605 | 10.018 | 1.503 | 8.515 | 5.00 |
+   | 20 | 45,023 | 1 | 233 | 39,131,403 | 14.731 | 1.382 | 13.349 | 5.00 |
+   | 30 | 39,766 | 1 | 233 | 36,344,276 | 23.839 | 1.217 | 22.621 | 5.00 |
+   | 60 | 31,902 | 1 | 233 | 30,038,898 | 51.193 | 0.949 | 50.244 | 5.00 |
+   | 99 | 26,915 | 1 | 233 | 25,003,864 | 83.386 | 0.796 | 82.590 | 5.00 |
+
+   That body is the whole Chesapeake reach in the bbox: 4,576.7 km², 150,672
+   boundary vertices, 233 islands, and 1.6-5.3s per pass. −25% vertices at 15m,
+   −59% at 99m, one part and all 233 islands at every tolerance, and less mesh over
+   land than the default throughout. The absolute land overlap is large on MD
+   (44.0 km² at the default, i.e. ~1% of the body) because MD's `coastal_water` and
+   `land` layers genuinely overlap — that is pre-existing, and the guarded pass
+   reduces it (40.7 km² at 15m). End to end on a 19.719 km² MD crop (centre
+   76.45W 38.95N, ±2,500 m, 1,537 vertices, no islands, 6 cut-line seam
+   coordinates): 242 nodes at the default → 167 at 15m → 138 at 30m → 95 at 99m,
+   all 6 seam nodes kept throughout.
+
+   An independent reviewer measured a smaller 423.7 km² MD crop and reported the
+   same shape of result (−29% vertices at 15m, one part, 24 islands kept, less land
+   overlap than the default).
+
+   End to end, `build_navmesh_region` on a metric crop of the Zeeland body (centre
+   3.89E 51.63N, ±2,500 m, largest resulting piece: 18.888 km², 1,367 vertices, 45
+   islands; the 9 crop-boundary coordinates lying on the crop's own cut lines are
+   passed as `seam_coord_set`, which is what a real cross-piece seam is):
+
+   | tol | nodes | edges | seam nodes | regions |
+   |---|---|---|---|---|
+   | 5.0 (default) | 298 | 596 | 8 | 1 |
+   | 15 | 242 | 484 | 9 | 1 |
+   | 20 | 234 | 468 | 9 | 1 |
+   | 30 | 221 | 442 | 9 | 1 |
+   | 60 | 203 | 406 | 9 | 1 |
+   | 99 | 199 | 398 | 9 | 1 |
+
+   (The default drops one of the 9 seam coordinates; the guarded pass keeps all 9,
+   because they are protected anchors.) **Node counts are crop-dependent — quote the
+   crop with the number.** An independent re-measurement on a different 18.78 km²
+   crop of the same body (box ±2,750×2,250 m at 558728/5718147, EPSG:32631) got
+   270 → 183 → 169 → 151 nodes at 5/15/30/60m; an earlier crop of this doc's own
+   (before seam protection and geometric anchors existed) got 298 → 241 → 197. All
+   three agree on the shape of the result — roughly −20% to −35% nodes — and
+   disagree on the exact figures because the geometry differs.
+
+   Also checked on the real Zeeland `bridges`/`locks` layers: all 4 passages in the
+   bbox stay open at every tolerance.
+
+   **Two risks an independent review found, now fixed in the algorithm:**
+   - *Rotation dependence.* The DP used to anchor on ring index 0, which is an
+     artifact of whatever GEOS operation produced the ring: the same Zeeland ring
+     rotated by 500 vertices simplified to 169 vs 175 vertices, so an unrelated
+     upstream change that rotated a ring would have silently changed the navmesh.
+     All three anchors are now chosen geometrically (lexicographically smallest
+     vertex, then farthest from it, then farthest from that chord), which makes the
+     pass rotation-invariant up to exact argmax ties. Tested.
+   - *Lost seam attachment points.* Before protection, a Zeeland sub-polygon with 22
+     seam coordinates kept 11 `boundary_node_ids` at 5m and 15m but only 9 at 30m
+     and 60m — a raised tolerance was quietly de-stitching regions.
+     `build_navmesh_region` now passes `seam_coord_set` in as protected anchors. On
+     the crop above (9 real cut-line seam coordinates) the plain 5.0m default drops
+     one of the 9; the guarded pass keeps all 9 at every tolerance. The cost is a
+     floor on how sparse the boundary can get: with a pathologically dense seam set
+     (194 of 1,367 boundary coordinates) the protected vertices dominate and the
+     node count rises above the default's instead of falling. Real seams are a small
+     subset of the boundary, but a caller that hands in a dense one gets no thinning.
+     `_tile_navmesh_piece`'s vertex-count gate passes no protected coordinates, so
+     its estimate is slightly below the boundary that will actually be built.
+
+   **Limits and residual risks, explicitly:**
+   - The inward half of the tolerance genuinely removes water (gross 0.50 km² of
+     124.2 at 15m, 2.39 km² at 99m), so a channel narrower than ~2×tol is narrowed.
+     The guards stop it being severed or fragmented, not narrowed.
+   - An island still loses its corners up to the 5.0m cap — a 15m-radius island
+     loses exactly the same 255.7 m² at 40m as it already does at the 5.0m default
+     (a plain 40m pass loses 481 m²).
+   - The engulf half of the cross/engulf guard was NOT load-bearing on either region
+     tested: with it disabled the Zeeland output is still valid and unchanged.
+     (Earlier wording here claimed it produced a "hole lies outside shell"
+     invalidity — that was the effect of disabling the WHOLE guard, and even then
+     the result is not shipped: the fail-closed path returns the unsimplified
+     polygon.) It is kept because it is cheap and a synthetic case does need it
+     (`test_a_chord_may_not_engulf_an_island_it_never_crosses`: a 40m-deep bump of
+     water with a 12m island in it, where only the engulf check stops the bump being
+     swallowed).
+   - Two chords on OPPOSITE banks of a neck narrower than 2×tol could in principle
+     cross each other; no guard covers that, only the final validity re-check. No
+     real or synthetic instance has been constructed.
+   - Fail-closed is all-or-nothing: one un-simplifiable ring discards the whole
+     region's simplification (never observed on real data).
+   - The depth-margin cost the original 5.0m tuning note quantified
+     (navmesh-boundary edges <3.0m: 0.9% no-pass → 3.9% at 5.0m → 6.0% at 15.0m)
+     has NOT been re-measured for this algorithm; that needs a real regional build
+     (§10.7, ROADMAP item 9). **Recommended first arm: 15m.** Still open: items 2–3.]
 2. **Alternative/complementary — direct chain-contraction post-process**, exactly
    as simulated in §10.4.4: after `build_navmesh_region` registers ring
    nodes/edges (and after `_stitch_component_pieces` adds any cross-type
@@ -1986,7 +2157,12 @@ independently reconfirmed by this investigation's own fan-in/fan-out measurement
   investigation (needs `_crosses_land`/`_drying_gdf`, which need the loaded
   GeoDataFrames from a real pipeline run, not just the exported sqlite). The single
   most important gate before shipping either §10.6 item 1 or 2 — mirrors §9.2's own
-  discipline.
+  discipline. **Partly closed for item 1 (2026-09-22):** the boundary polygon
+  itself was measured against the real Zeeland `land` layer at 5/15/20/30/60/99m
+  (table in §10.6 item 1) and the guarded pass puts *less* mesh over land than the
+  shipped default at every tolerance. Still NOT closed: the per-EDGE
+  `crosses_land`/drying check and the depth-margin re-measurement (edges <3.0m)
+  both need a real regional build — ROADMAP item 9.
 - **The 70-node open-chain component in §10.4.3** — not confirmed whether this is
   a genuine broken ring in the live database or a bounding-box-clip artifact. Not
   load-bearing for any finding above, but worth a quick re-check with a wider box.

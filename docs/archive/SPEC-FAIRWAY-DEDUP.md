@@ -1,6 +1,10 @@
 # Spec: Fairway/Dredged-Area Boundary Preference — Reducing Medial-Axis Density Near a Marked Channel
 
-Status: SUPERSEDED by `SPEC-CHANNEL-AXES.md` (2026-09-09). The measurements below
+> **SUPERSEDED. Moved to `docs/archive/` on 2026-09-21; superseded by `docs/SPEC-CHANNEL-AXES.md`. Kept for the §2 measurements and history only.**
+> Sibling specs named below live in `docs/` (one level up); root docs at the repo root.
+> Note: the `DRGARE` OBJL 53 vs 46 discrepancy raised in §2.1 and §10 item 6 is fixed in `docs/SPEC-FAIRWAY-HARMONIZATION.md` (real code is 46).
+
+Status: SUPERSEDED by `docs/SPEC-CHANNEL-AXES.md` (2026-09-09). The measurements below
 (§2) stand; the mechanism (§5–§7) was not built. Probing the raw cells showed the
 motivating Potomac channel has no FAIRWY/DRGARE polygon at all — only lateral buoys —
 so a polygon-boundary mechanism could never reach it; `derive_channel_axes.py` derives
@@ -80,7 +84,7 @@ from the S-57 catalogue alone):
 | `inland_waterways` | `data/geojson/md_reclip/inland_waterways_lines.geojson` | `LineString` | 85 (`NAVLNE`) |
 
 Note: `SPEC-FAIRWAY-HARMONIZATION.md` §2 states `DRGARE` as "OBJL 53" — the real data here
-carries `OBJL=46` on every `dredged_areas` feature sampled. 53 is `DRYDOC` in the S-57
+carries `OBJL=46` on every `dredged_areas` feature sampled. 53 is `FERYRT`, DRYDOC is 47 in the S-57
 object catalogue, not `DRGARE`. Worth reconciling in that doc; not fixed here (out of this
 spec's scope), flagged as a minor correction for whoever next touches that file.
 
@@ -642,7 +646,7 @@ document only.
    "fairway polygons are reliably coarser than natural coastline" claim beyond this single
    dataset.
 6. **Minor, low-priority**: reconcile `SPEC-FAIRWAY-HARMONIZATION.md` §2's stated `DRGARE`
-   `OBJL=53` against this document's directly-observed `OBJL=46` (§2.1) — 53 is `DRYDOC`
+   `OBJL=53` against this document's directly-observed `OBJL=46` (§2.1) — 53 is `FERYRT`, DRYDOC is 47
    in the S-57 catalogue, not `DRGARE`. Does not affect any code (`enc_preprocessor.py`
    maps by the `DRGARE` string key, not by numeric `OBJL`), so this is a documentation-only
    correction.
