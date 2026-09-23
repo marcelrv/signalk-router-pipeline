@@ -500,6 +500,34 @@ class TestSpatialChainingFallback:
         assert len(axes) == 0
         stats = json.load(open(d / dca.OUTPUT_STATS))
         assert stats["tier3"]["reasons"].get("no_centre_evidence") == 1
+        assert stats["tier3"]["rejected"] == 1  # n_rej must count this rejection too
+
+    def test_single_gate_at_one_end_is_not_enough_centre_evidence(self, tmp_path):
+        # a walk that follows one bank for most of its length and only crosses to
+        # the other bank once, at the far end, has exactly one gate -- not zero --
+        # but the rest of the chain would still be edge-hugging same-hand anchors.
+        # A single gate must not be enough; gates need to be the majority.
+        utm = "EPSG:32631"
+        x0, y0 = 550000.0, 5700000.0
+        water = box(x0, y0, x0 + 6000, y0 + 300)
+        # 6 port marks along one bank, then 1 starboard mark at the far end: the
+        # nearest-neighbour walk follows the port bank in order and only gates once,
+        # at the final port->starboard step.
+        pts = [(Point(x0 + 2500 + i * 400, y0 + 150), CATLAM_PORT) for i in range(6)]
+        pts.append((Point(x0 + 2500 + 6 * 400, y0 + 200), CATLAM_STARBOARD))
+        d = tmp_path / "spatial_one_gate"
+        d.mkdir()
+        _to_wgs(gpd.GeoDataFrame({"DRVAL1": [2.0]}, geometry=[water], crs=utm)).to_file(
+            d / "coastal_water_polygons.geojson", driver="GeoJSON")
+        _to_wgs(gpd.GeoDataFrame({"OBJNAM": _GARBAGE_NAMES[:7], "CATLAM": [c for _, c in pts],
+                                  "src_objl": ["BOYLAT"] * 7, "src_cscl": [12000] * 7},
+                                 geometry=[p for p, _ in pts], crs=utm)).to_file(
+            d / "lateral_marks_points.geojson", driver="GeoJSON")
+        ChannelAxisDeriver(str(d), str(d), Params()).run()
+        axes = gpd.read_file(d / dca.OUTPUT_AXES)
+        assert len(axes) == 0
+        stats = json.load(open(d / dca.OUTPUT_STATS))
+        assert stats["tier3"]["reasons"].get("no_centre_evidence") == 1
 
     def test_parsed_and_bare_number_paths_unaffected(self, synthetic_dir):
         # regression: the existing named-channel path in the shared fixture (which
