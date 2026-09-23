@@ -14,6 +14,7 @@
 #   ./build_region.sh <name> --states ME,NH,MA,RI,CT [--source-region us-east-coast]
 #                      [--clip-bbox "min_lon,min_lat,max_lon,max_lat"] [--overlap-deg 0.02]
 #                      [--channel-axes] [--channel-axes-args "--min-confidence 0.6"]
+#                      [--channel-axis-deadend-stitch-m 1500.0]
 #                      [--stitch-registry data/seam_registry.sqlite]
 #                      [--extra-pipeline-args "--sagitta-cap 250.0 --node-merge-m 5.0"]
 #                      [--build-mem-limit-gb 11]
@@ -31,6 +32,14 @@
 # script's own flags -- e.g. the density-tuning flags
 # (--sagitta-cap/--axis-dedup-cap/--node-merge-m/etc., see SPEC-GRAPH-DENSITY.md)
 # without hand-editing this script per run.
+#
+# --channel-axis-deadend-stitch-m <metres> (opt-in, requires --channel-axes): forwards
+# --channel-axis-deadend-stitch-m to the pipeline, connecting each buoy-chain
+# channel-axis dead end to the anchored graph within that radius
+# (docs/SPEC-CHANNEL-AXES.md section 10). The pipeline default is 0.0 (disabled) and
+# this script keeps it that way unless the option is given. 1500.0 is the value used
+# by the live MD/Zeeland builds (#49/#50, data/BUILD_LOG.md); the per-dead-end
+# connection count is the pipeline default of 3.
 #
 # Step 3/3 (the routing-graph build) runs under a default `ulimit -v` memory
 # ceiling (data/BUILD_LOG.md build #32: _split_wide_narrow's erosion step can
@@ -78,6 +87,8 @@ STITCH_RADIUS_M=""
 EXTRA_PIPELINE_ARGS=""
 CHANNEL_AXES=""            # --channel-axes: derive marked-channel axes and feed them to the pipeline
 CHANNEL_AXES_ARGS=""       # --channel-axes-args "...": extra derive_channel_axes.py options
+DEADEND_STITCH_M=""        # --channel-axis-deadend-stitch-m <m>: opt-in dead-end stitch radius (needs --channel-axes)
+DEADEND_STITCH_SEEN=""     # set when the flag was given at all, so an explicitly empty value is rejected too
 BUILD_MEM_LIMIT_GB="${SK_ROUTING_BUILD_MEM_LIMIT_GB-11}"  # unset (no colon) -- an
                                                            # explicitly empty env var
                                                            # override means "disabled",
@@ -100,6 +111,13 @@ while [ $# -gt 0 ]; do
         --extra-pipeline-args) EXTRA_PIPELINE_ARGS="$2"; shift 2 ;;
         --channel-axes) CHANNEL_AXES="1"; shift ;;
         --channel-axes-args) CHANNEL_AXES_ARGS="$2"; shift 2 ;;
+        --channel-axis-deadend-stitch-m)
+            if [ "$#" -lt 2 ]; then
+                echo "Error: --channel-axis-deadend-stitch-m requires a value." >&2
+                exit 1
+            fi
+            DEADEND_STITCH_SEEN="1"
+            DEADEND_STITCH_M="$2"; shift 2 ;;
         --build-mem-limit-gb)
             if [ "$#" -lt 2 ]; then
                 echo "Error: --build-mem-limit-gb requires a value." >&2
@@ -109,6 +127,28 @@ while [ $# -gt 0 ]; do
         *) echo "Unknown option: $1" >&2; exit 1 ;;
     esac
 done
+
+# Validate --channel-axis-deadend-stitch-m up front, before any download/extract/clip
+# step, so a bad invocation fails immediately instead of after a long run.
+if [ -n "$DEADEND_STITCH_SEEN" ]; then
+    if [ -z "$CHANNEL_AXES" ]; then
+        echo "Error: --channel-axis-deadend-stitch-m only applies with --channel-axes." >&2
+        exit 1
+    fi
+    # Plain non-negative decimal only; the range mirrors the pipeline's own check
+    # (CHANNEL_AXIS_DEADEND_STITCH_MAX_M in nautical_routing_pipeline.py: 0 disables,
+    # otherwise must be < 5000m).
+    case "$DEADEND_STITCH_M" in
+        ''|*[!0-9.]*|*.*.*|.)
+            echo "Error: --channel-axis-deadend-stitch-m must be a non-negative number of metres (got: '$DEADEND_STITCH_M')." >&2
+            exit 1
+            ;;
+    esac
+    if ! awk -v v="$DEADEND_STITCH_M" 'BEGIN { exit !(v + 0 < 5000) }'; then
+        echo "Error: --channel-axis-deadend-stitch-m must be < 5000 metres (got: '$DEADEND_STITCH_M'; 0 disables)." >&2
+        exit 1
+    fi
+fi
 
 # Human-readable name/description per known region key (override with --name).
 case "$REGION" in
@@ -188,6 +228,10 @@ if [ -n "$CHANNEL_AXES" ]; then
     time "$PYTHON" derive_channel_axes.py --input-dir "$GEOJSON_DIR" $CHANNEL_AXES_ARGS \
         2>&1 | tee "${LOG_PREFIX}_channel_axes.log"
     EXTRA_PIPELINE_ARGS="$EXTRA_PIPELINE_ARGS --channel-axes"
+fi
+
+if [ -n "$DEADEND_STITCH_SEEN" ]; then
+    EXTRA_PIPELINE_ARGS="$EXTRA_PIPELINE_ARGS --channel-axis-deadend-stitch-m $DEADEND_STITCH_M"
 fi
 
 STITCH_ARGS=()

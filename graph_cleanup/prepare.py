@@ -21,6 +21,7 @@ from typing import List, Optional
 from .candidates import Candidate
 from .graph import RoutingGraph
 from .render import RenderConfig, render_tile
+from .runner import archive_results, atomic_write_text
 from .tiles import Tile
 
 PRUNE_PROMPT_PATH = os.path.join(os.path.dirname(__file__), "prompts", "prune.md")
@@ -69,8 +70,7 @@ def write_tile(tile: Tile, g: RoutingGraph, out_dir: str,
             for n, c in numbered.items()
         ],
     }
-    with open(os.path.join(out_dir, "context.json"), "w", encoding="utf-8") as fh:
-        json.dump(context, fh, indent=2)
+    atomic_write_text(os.path.join(out_dir, "context.json"), json.dumps(context, indent=2))
 
     # manifest.json is NOT sent to the reviewer (a 30-node component's raw id
     # list is noise to a model and tells it nothing) -- it exists purely so
@@ -78,8 +78,18 @@ def write_tile(tile: Tile, g: RoutingGraph, out_dir: str,
     # was about, without re-deriving candidates from the graph after the fact.
     manifest = {str(n): {"candidate_id": c.id, "kind": c.kind, "nodes": c.nodes}
                for n, c in numbered.items()}
-    with open(os.path.join(out_dir, "manifest.json"), "w", encoding="utf-8") as fh:
-        json.dump(manifest, fh)
+    manifest_path = os.path.join(out_dir, "manifest.json")
+    new_manifest = json.dumps(manifest)
+    # Same tile id, different candidates (another graph build, other
+    # thresholds): the old answer's numbers would map to the wrong nodes, so
+    # it must not survive. An identical manifest keeps its answer (--resume).
+    old_manifest = None
+    if os.path.exists(manifest_path):
+        with open(manifest_path, encoding="utf-8") as fh:
+            old_manifest = fh.read()
+    if old_manifest != new_manifest:
+        archive_results(out_dir)  # to history/, together with the old manifest
+    atomic_write_text(manifest_path, new_manifest)
 
     with open(prompt_path, encoding="utf-8") as fh:
         prompt_text = fh.read()

@@ -1,12 +1,27 @@
 # Phase 3+ Design — Data Fusion, Community Overrides, Vessel-Traffic Validation, Scale-Out, Hierarchical Routing
 
+## Status (2026-09-21)
+
+Consolidated status for the whole project lives in `docs/ROADMAP.md`. Per sub-phase:
+
+| Sub-phase | Status | Note |
+|---|---|---|
+| 3a OSM/OpenSeaMap tier-3 fusion | open (not started) | also the assigned fix for the ~55 inland land-crossings and Issue J |
+| 3b Bathymetry gap-fill (tier 4) | open (not started) | |
+| 3c Community override workflow | open | spec exists on branch `override-zones-spec` (not merged; `docs/SPEC-OVERRIDE-ZONES.md` there); no `apply_overrides.py` or `find_anomalies.py` in the repo |
+| 3d AIS / vessel-density validation | open (not started) | |
+| 3e Scale-out | done for the US East Coast (19 regions, BUILD_LOG #13-#32); NL beyond Zeeland not done | |
+| 3f Supernode / macro-edge hierarchy | open (not started) | |
+
+The status column above is authoritative; the sections below are the original design text.
+
 ## Scope and how this document relates to the others
 
 This is the **forward design** document for everything after Phase 2
 (navmesh/funnel-algorithm routing). It assumes Phase 0-2 and Phase 2
 Hardening are working — **do not re-verify them here**; that history and
-any still-open hardening work lives in `NEXT_PHASES.md`, which stays the
-tactical bug-tracking log. `README.md` stays the short, stable
+the finished hardening log is archived in `docs/archive/NEXT_PHASES_LOG.md` (moved there 2026-09-21);
+`NEXT_PHASES.md` now only lists what is still open and `docs/ROADMAP.md` is the status table. `README.md` stays the short, stable
 architecture overview for a new reader. This document is where "Status &
 roadmap" and "Phase 3 and beyond (pointer only)" in those two files
 should point for actual design detail — update both pointers to reference
@@ -50,7 +65,7 @@ layer-per-concern convention):
   special-purpose) → a **new** `seamarks_points` layer, not previously
   ingested at all. This is the concrete implementation of the buoy-based
   node placement idea from the Phase 2 Hardening Round 5 investigation
-  (see `NEXT_PHASES.md` §5.5) — see below.
+  (see `NEXT_PHASES.md` §5.5 -- moved to `docs/archive/NEXT_PHASES_LOG.md`) — see below.
 
 **Inherited Phase 2 leftover, assigned here by explicit decision
 (2026-07-20)**: the Round 9 finding that ~4.6% of long (>150m)
@@ -230,7 +245,7 @@ reason: >
   Movable Zeelandbrug span miscategorized by the mariculture obstacle
   bug; the fix already landed in the pipeline, this override is an
   example only.
-evidence: "Round 3 investigation, see NEXT_PHASES.md"
+evidence: "Round 3 investigation, see NEXT_PHASES.md (moved to docs/archive/NEXT_PHASES_LOG.md)"
 contributor: "agent:claude"    # or a human GitHub username
 reviewer: ""                   # filled in by the human who approves the PR
 date: ""                       # filled in at merge time
@@ -371,7 +386,7 @@ data specifically and may need US-ENC-specific aliases added.
 
 **Concrete tasks**:
 1. Full-NL regeneration run; capture timing/memory numbords analogous
-   to `NEXT_PHASES.md`'s existing Round 4 tables, as a baseline.
+   to the existing Round 4 tables in `NEXT_PHASES.md` (moved to `docs/archive/NEXT_PHASES_LOG.md`), as a baseline.
 2. Pick and download a first US NOAA ENC region; verify `_s57_col`
    candidate lists against its actual attribute encoding before assuming
    parity.

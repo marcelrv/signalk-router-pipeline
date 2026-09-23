@@ -1,6 +1,11 @@
 # Spec: Fairway Harmonization — FAIRWY + DRGARE as Unified Main-Waterway Signal
 
-Status: Draft — analysis only, no code changes
+Status: **Implemented** (status refreshed 2026-09-21; the original text below is the pre-implementation
+analysis and is kept as written). Where it lives: `enc_preprocessor.py` maps `DRGARE` to
+`dredged_areas_polygons.geojson`; `_build_fairways_unified` in `nautical_routing_pipeline.py` merges
+FAIRWY + DRGARE into one fairway signal; `_edge_attr_worker` applies the DRGARE depth override;
+`tests/test_fairway_match_buffer.py` covers `FAIRWAY_MATCH_BUFFER_M`.
+Note: the S-57 object class code for `DRGARE` is **46** (53 is `FERYRT`, DRYDOC is 47); see the correction at §2.
 Authors: pipeline analysis session 2026-08-27
 Scope: `enc_preprocessor.py`, `nautical_routing_pipeline.py`, `add_pois_to_db.py`, DB format / data_sources
 
@@ -25,7 +30,7 @@ Evidence:
 ## 2. S-57 Semantics
 
 - **FAIRWY (Fairway, OBJL 51, polygon):** Designated fairway area, often an inbound/outbound traffic lane or recommended fairway. In US, used for regulated traffic fairways (e.g. East River Channel, Hudson River Channel — `OBJNAM` values in `US5NYCEG`); not the generic maintained channel footprint.
-- **DRGARE (Dredged Area, OBJL 53, polygon):** Area dredged to a **controlled/maintained depth**. Attributes include `DRVAL1` (least depth, maintained), `QUASOU`, `SOUACC`, `TECSOU`. Observed in NOAA: `US5NYCUG` DRGARE `DRVAL1` 9.9–12.1 m (mean ~10.7 m), `US5NYCEG` 1.5–5.9 m; `US4NY1BW` 1.8–2.4 m with `QUASOU=[11]`. This is the primary US charting of “the channel” — the analogue of NL `FAIRWY`.
+- **DRGARE (Dredged Area, OBJL 46, polygon; corrected 2026-09-21 from an original typo "53", which is the code for `FERYRT` -- real cells carry `OBJL=46`, see `docs/archive/SPEC-FAIRWAY-DEDUP.md` §2.1):** Area dredged to a **controlled/maintained depth**. Attributes include `DRVAL1` (least depth, maintained), `QUASOU`, `SOUACC`, `TECSOU`. Observed in NOAA: `US5NYCUG` DRGARE `DRVAL1` 9.9–12.1 m (mean ~10.7 m), `US5NYCEG` 1.5–5.9 m; `US4NY1BW` 1.8–2.4 m with `QUASOU=[11]`. This is the primary US charting of “the channel” — the analogue of NL `FAIRWY`.
 - **DEPARE (Depth Area, polygon):** Natural/charted depth band (`DRVAL1/DRVAL2`). Coastal water navmesh is derived from `DEPARE`+`LOKBSN`. `DRGARE` sits *inside* `DEPARE` but carries the authoritative maintained depth for that footprint.
 - No overlap assumption: a centroid test on `US5NYCEG` shows most `DRGARE` centroids fall outside any single containing `DEPARE` polygon at the query point (digitization differences), but the logical containment is channel-inside-water.
 

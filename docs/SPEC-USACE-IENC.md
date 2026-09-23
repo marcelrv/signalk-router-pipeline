@@ -6,7 +6,7 @@ Scope: data acquisition, `enc_preprocessor.py`, `nautical_routing_pipeline.py`, 
 
 ## 1. Deficiency
 
-The pipeline advertises “US inland rivers → Inland ENC, USACE (`ienccloud.us`)” (`README:160`) but **no US inland build uses it**.
+The pipeline advertises “US inland rivers → Inland ENC, USACE (`ienccloud.us`)” (`README.md` "Free data sources" table, ~L183 as of 2026-09-21) but **no US inland build uses it**.
 
 Current `build_region.sh` + `scripts/download_noaa.py` only fetches **NOAA Office of Coast Survey coastal ENC** (S-57 `.000` per-state ZIPs at `charts.noaa.gov/ENCs/{STATE}_ENCs.zip`, bands 3–6 after overview skip). USACE Inland ENC is a **separate distribution** at `https://ienccloud.us` (IENC, Inland ECDIS standard, harmonized with European IENC at `eurisportal.eu`). It carries the inland-specific object catalogue that makes European inland routing work:
 

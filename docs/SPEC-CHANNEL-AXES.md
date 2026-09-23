@@ -1,9 +1,18 @@
 # Spec: Channel Axes — "Prefer the marked channel" from polygons *and* buoys
 
-Status: Implemented on branch `channel-axes` (2026-09-09): `derive_channel_axes.py`,
-new `enc_preprocessor.py` layers, `--channel-axes` in `nautical_routing_pipeline.py`
-and `build_region.sh`. Verification builds: see §8 and `data/BUILD_LOG.md`.
-Supersedes the mechanism sketched in `SPEC-FAIRWAY-DEDUP.md` (whose measurements
+Status: **Implemented and merged** (status refreshed 2026-09-21). Core feature merged as PR #24
+(implemented 2026-09-09 on branch `channel-axes`): `derive_channel_axes.py`, new
+`enc_preprocessor.py` layers, `--channel-axes` in `nautical_routing_pipeline.py` and
+`build_region.sh`. The buoy-chain dead-end stitch (§10, v1 to v3) was merged in PR #26.
+Verification builds: see §8 and `data/BUILD_LOG.md`.
+Deployment caveat: `channel_axis_deadend_stitch_m` (`--channel-axis-deadend-stitch-m`)
+**defaults to `0.0` (disabled)** and `build_region.sh` does not set it by default (it now has an
+opt-in `--channel-axis-deadend-stitch-m <m>`, which requires `--channel-axes`); the deployed builds
+(MD #49, Zeeland #50) pass `--channel-axis-deadend-stitch-m 1500.0` explicitly on the command
+line (see BUILD_LOG). A build without that flag has no dead-end stitching.
+Still open (not built): `_extract_buoyage_direction` (stub), spatial-chaining fallback for
+unparseable buoy names; see `docs/ROADMAP.md`.
+Supersedes the mechanism sketched in `docs/archive/SPEC-FAIRWAY-DEDUP.md` (moved to docs/archive/ 2026-09-21) (whose measurements
 of fairway/skeleton duplication remain valid and are reused here).
 Complements: `SPEC-GRAPH-DENSITY.md` §4.3/§6.3 (axis-dedup, carve-reconnect),
 `SPEC-FAIRWAY-HARMONIZATION.md` (FAIRWY + DRGARE), `SPEC-RECOMMENDED-TRACK.md`.
@@ -12,7 +21,7 @@ Complements: `SPEC-GRAPH-DENSITY.md` §4.3/§6.3 (axis-dedup, carve-reconnect),
 
 Where an authoritative marked channel exists, routes should follow it, preferring it
 over the pipeline's own independently generated medial-axis skeleton — for the US
-as well as for other countries (`SPEC-FAIRWAY-DEDUP.md` §1, Coltons Point / Potomac
+as well as for other countries (`docs/archive/SPEC-FAIRWAY-DEDUP.md` §1, Coltons Point / Potomac
 screenshot: "Potomac River Channel Buoy 13/14/14A/15").
 
 ## 2. What the charts actually contain (measured)
@@ -65,7 +74,7 @@ inspectable per channel in QGIS (`channel_axes_rejected.geojson` carries a `reas
 per dropped candidate), and source-agnostic — NOAA, RWS, USACE IENC, later OSM
 seamarks or the USACE National Channel Framework all reduce to "line", "polygon" or
 "ordered marks". The main pipeline only sees a line layer, the primitive its whole
-"prefer the authoritative axis" machinery is built for (`SPEC-FAIRWAY-DEDUP.md` §4.2's
+"prefer the authoritative axis" machinery is built for (`docs/archive/SPEC-FAIRWAY-DEDUP.md` §4.2's
 objection — carving water near a polygon with nothing replacing it — disappears
 because the axis *is* ingested as topology).
 

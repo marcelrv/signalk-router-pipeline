@@ -121,6 +121,12 @@ S's side (harmless — it connects on the author's side; overlap sizing in
 §3.5 is what keeps this from happening at a real seam).
 
 ### 3.4 Registry is the authority; every build adopts-then-publishes
+> **Status (2026-09-21):** the freeze / `source_region`-replacement / retirement lifecycle described
+> below was **not built**. `seam_registry.py` (docstring and `upsert_nodes`) implements a plain
+> upsert: a rebuild re-adopts whatever is in the registry and re-publishes its own current boundary
+> nodes over it; `source_region` is a provenance column only; there is no freeze, retire or GC step.
+> The paragraph below is kept as the original design intent.
+
 Once a seam node is registered it is **frozen** — later adjacent builds adopt
 it rather than generating their own. This is what makes it robust to
 **rebuilds**: rebuilding R re-adopts R's own frozen boundary nodes (stable
@@ -227,6 +233,9 @@ pairing pass is cheap and incremental.
 ---
 
 ## 4. Already in place (no further work)
+> **Status (2026-09-21):** the `dynamicLoading` "uncommitted working tree" remark below is stale
+> (reported committed; routeiq is a separate repo and was not re-checked in this pass).
+
 - **`--overlap-deg`** (pipeline, committed `ac91c8a`) — feeds §3.1.
 - **Dynamic loading** (routeiq, committed `94a0a27`) — peek, per-file
   load/evict, node-ID merge, on-demand load, `/databases/*` endpoints.
@@ -235,6 +244,14 @@ pairing pass is cheap and incremental.
 ---
 
 ## 5. Open questions for review (registry design)
+
+> **Status (2026-09-21): these questions are settled by the code (see `seam_registry.py`
+> docstring: "open question Section 5, resolved by the user"). Q1: seam nodes+edges are baked into each
+> `.sqlite` at build time (option (a)); the registry is pipeline-side only, never shipped
+> (`data/seam_registry.sqlite`, Q2). Q3/Q5: no freeze and no retirement path; plain upsert.
+> Q4: `build_region.sh` exposes `--stitch-band-m` and `--stitch-radius-m` alongside
+> `--overlap-deg` and `--stitch-registry`. Q6: not verified here (no evidence either way in code
+> for a dropped Chunk 2 branch).** The list below is kept as the historical record.
 
 1. **Design fork §3.8:** bake seam nodes+edges into each `.sqlite` at build
    time (recommended) vs. ship the registry as a runtime overlay like
@@ -495,8 +512,13 @@ CT↔NY crosses on a **single** shared node, the §9.1 phenomenon again.
 
 The remaining gaps are the known missing regions: MA (between NH and RI) and
 VA/NC (between MD and SC+GA) still OOM and need the sub-splits noted in
-`NEXT_PHASES.md`. So coverage is three connected clusters — ME–NH,
+`NEXT_PHASES.md` (moved to `docs/archive/NEXT_PHASES_LOG.md`). So coverage is three connected clusters — ME–NH,
 RI–CT–NY–NJ–DE–MD, and SC+GA — not one chain.
+
+> **Status (2026-09-21): stale.** "MA and VA/NC still OOM" no longer holds: `data/BUILD_LOG.md`
+> builds #22 (MA) and #31 (VA) succeeded, and all 19 US East Coast regions were rebuilt
+> (builds #13-#32, including the `fl_atl_n1a` OOM fix in PR #22). The 2026-07-30 measurement above is a
+> point-in-time record.
 
 ### 10.2 Real cross-state routes
 
