@@ -1,6 +1,28 @@
 # Spec Supplement: Recommended Track (RECTRC / NAVLNE) — Coastal vs Inland
 
-Status: Draft — analysis only, no code changes
+Status: **Resolved 2026-09-23 — Option A shipped, Option B not needed.** `enc_preprocessor.py`
+now documents (comment only, no behaviour change) that `CATTRK`/`TRAFIC`/`ORIENT`/`INFORM`
+already survive into `inland_waterways_lines.geojson` properties for RECTRC/NAVLNE, locked in
+by a regression test (`tests/test_enc_preprocessor.py::TestRectrcAttributePassthrough`). The
+two-cell check (`US4NY1JH` + `US5NYCEG`) reproduced the predicted 8+2=10 RECTRC / 2 NAVLNE
+exactly, with `fairways_unified` byte-identical before/after (no fairway-side change, as
+Option A requires). The NY-harbor rebuild probe (`data/BUILD_LOG.md` #51, reusing #28's exact
+clip/flags) reproduced #28's baseline byte-for-byte (19,250 nodes / 48,046 edges / 0 hubs /
+0 `crosses_land`) and a direct route probe through the `CATTRK=1` East River/Newtown Creek
+RECTRC chain confirmed it is routable (Dijkstra cost 1366.4 over ~1708m, essentially the
+straight-line distance — no detour, no disconnection), including a second probe from open
+coastal water into the RECTRC chain that crosses the coastal↔inland boundary exactly once via
+the existing Pass 0d connector (cost 5983.364). **Decision: Option A stays** — no
+disconnection or regression observed, matching this spec's own §5 prediction. Option B was
+not implemented.
+One caveat remains open: the Lake Ontario/open-water `CATTRK=2` case (`US4NY1JH`) could not be
+probed with a real region rebuild — the #28 NY-harbor clip (`--clip-bbox
+"-74.29,40.39,-73.39,42.71"`) deliberately excludes NY's non-Atlantic (Great Lakes/Finger
+Lakes) cells, and standing up a new Lake Ontario region/clip is a bigger scope decision left
+for a future session if an actual Great Lakes build is ever undertaken. The two-cell
+preprocessor check above did confirm `US4NY1JH`'s 8 RECTRC lines carry `CATTRK=2` and survive
+with full attributes, so the *data* is available; only the *routed-graph* behaviour for that
+specific open-water case is unverified.
 Complements: `SPEC-FAIRWAY-HARMONIZATION.md`, `SPEC-USACE-IENC.md`
 Scope: `enc_preprocessor.py`, `nautical_routing_pipeline.py`
 

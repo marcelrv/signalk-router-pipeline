@@ -100,7 +100,7 @@ the exact live commands are in `data/BUILD_LOG.md`.
 | `_extract_buoyage_direction` (stub, `nautical_routing_pipeline.py:3064`) and `M_NSYS.ORIENT` | `docs/SPEC-CHANNEL-AXES.md` | open | pipeline | |
 | Spatial-chaining fallback for unparseable buoy names (4% US / 13% NL) | `docs/SPEC-CHANNEL-AXES.md` | open | pipeline | |
 | USACE IENC ingest (phases A/B/C), then National Channel Framework polygons | `docs/SPEC-USACE-IENC.md` | open | pipeline | Draft, not started |
-| Recommended-track probe (Great Lakes/NY) gating Option B, or close as "Option A stays" | `docs/SPEC-RECOMMENDED-TRACK.md` | open | pipeline | Draft |
+| Recommended-track probe (Great Lakes/NY) gating Option B, or close as "Option A stays" | `docs/SPEC-RECOMMENDED-TRACK.md` | **done — closed as "Option A stays"** | pipeline | NY-harbor probe (`data/BUILD_LOG.md` #51) matched #28 baseline exactly, harbour-approach `CATTRK=1` route confirmed routable via existing inland↔coastal connector; Lake Ontario `CATTRK=2` open-water rebuild still open (needs a new region/clip, not attempted) |
 
 ### Step 4: new-capability roadmap (decide priority after Steps 0-3)
 

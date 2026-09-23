@@ -54,7 +54,25 @@ class ENCToGeoJSONPreprocessor:
             'DRGARE': 'dredged_areas_polygons.geojson',
             'HRBFAC': 'pois_points.geojson',
             # We will merge RECTRC, NAVLNE and WTWAXS (IENC Waterway Axis) together
-            # for inland waterways centerlines
+            # for inland waterways centerlines.
+            #
+            # RECTRC (Recommended Track) / NAVLNE (Navigation Line) are NOAA's
+            # coastal analogues, not the same thing as WTWAXS -- see
+            # docs/SPEC-RECOMMENDED-TRACK.md. Option A there (adopted) keeps
+            # this single merge as-is but relies on CATTRK/TRAFIC/ORIENT/INFORM
+            # surviving into the piped GeoJSON properties, since a future
+            # Great Lakes/estuary probe (or Option B: promoting CATTRK=1
+            # harbour-approach tracks into fairways_unified) needs to
+            # distinguish CATTRK=1 (fixed-mark harbour approach) from CATTRK=2
+            # (open-water passage track) downstream. No explicit column
+            # selection happens here -- gpd.read_file() (via GDAL's S-57
+            # driver) already returns the full S-57 attribute set per feature,
+            # and GeoDataFrame.to_file() writes every non-geometry column as a
+            # GeoJSON property, so CATTRK/TRAFIC/ORIENT/INFORM already pass
+            # through unmodified. This comment (and the regression test in
+            # tests/test_enc_preprocessor.py) documents and locks in that
+            # passthrough so a future refactor that narrows the column set
+            # doesn't silently drop it.
             'RECTRC': 'inland_waterways_lines.geojson',
             'NAVLNE': 'inland_waterways_lines.geojson',
             'WTWAXS': 'inland_waterways_lines.geojson',
