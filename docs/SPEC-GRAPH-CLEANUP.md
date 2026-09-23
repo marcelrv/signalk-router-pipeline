@@ -1,6 +1,11 @@
 # Spec: Graph cleanup — removing the graph no boat will ever use
 
-Status: Pass A, the renderer, and Pass B (prune) implemented on branch `graph-cleanup`
+Status (refreshed 2026-09-21): **merged** as PR #25 (Pass A, renderer, Pass B, `render_diff`) and
+PR #26 (the `nearest_poi_m` blind-spot fix, §6.8). **Pass C is not built**: only the prompt
+`graph_cleanup/prompts/trace.md` exists; there is no junction-numbering candidate generator
+and no runner wiring. Pass B has only been run through the mock backend and by Claude Code acting
+as the reviewer (§6.6-6.7); no local-model/Message-Batches run has been executed.
+Original status line: Pass A, the renderer, and Pass B (prune) implemented on branch `graph-cleanup`
 (2026-09-12/14): `graph_cleanup/`, `apply_cleanup.py`, `review_region.py`,
 `tests/test_graph_cleanup*.py`, `tests/test_review_region_cli.py`. Verification builds:
 `data/BUILD_LOG.md` #40 (Pass A), #41 (Pass B pilot), #42 (Pass B expanded, 3x area,
@@ -186,7 +191,7 @@ reason in §2.3.
 | `largest_component_by_length` | loses ≤0.5pp. **By edge length, never node count** — removing nodes is the point here, so a node-count ratio moves on every successful run (§6.1: the node-count form "sent two investigations chasing a 2.61pp 'regression' that does not exist") |
 | `poi_pair_reachability` | zero pairs lost, re-snapping each POI to the cleaned graph. The gate that would have caught builds #11/#12, where 21 named POIs fell into an isolated 8-node island |
 | `poi_snap_drift` | no POI snaps >50 m further than before (§4.2) |
-| `counts` | nodes and edges only go down |
+| `counts` | nodes and edges only go down. Opt-in for edge-adding changes: `validate.check(..., max_edge_growth=N)` tolerates up to N extra edges over the baseline (default 0 = strictly shrink-only, unchanged). The parameter lives in `validate.check` for baseline-vs-candidate comparisons of separate builds: the edge-adding cases (#45-#50) were cross-build comparisons made by an ad-hoc script calling `validate.check` against a different baseline DB, not by `apply_cleanup.py`. The `apply_cleanup.py --max-edge-growth N` flag is only forwarded to the same check; that CLI loads one DB and applies `drop_node`/`splice_node`/`drop_edge`/`move_node` (`graph_cleanup/ops.py`), none of which can add an edge, so today the flag cannot change its result and exists for future edge-adding ops (a negative N is rejected at argument parsing). The node-count check stays strict: node growth is never tolerated, so a cross-build comparison whose node set drifts between runs (e.g. #45, +34 nodes) still fails the counts gate on nodes; the bound only helps a same-node-set comparison, e.g. #50 (`max_edge_growth=654`, its 654 dead-end connections) |
 | `hubs` | no node above out-degree 30 (splicing joins neighbours, so it can raise a degree) |
 | `route_shape` | no probe route's cost changes by more than 5%. A cleanup that *shortens* a route has usually deleted a constraint; one that lengthens it has deleted something real |
 
@@ -338,7 +343,8 @@ know which one it's driving:
 in that tile, every verdict must be `keep`/`drop`/`unsure`), retrying once before giving up;
 a tile that never validates is marked `unanswered` and contributes no ops — never a silent
 drop. `run_all` writes `<tile>/answer.json` as soon as each tile is answered, so a killed
-run resumes by skipping tiles that already have one. `answers_to_ops` turns every `drop`
+run resumes by skipping tiles that already have a valid one (details, incl. stale/degraded
+answers and the circuit breaker, in §6.9). `answers_to_ops` turns every `drop`
 into `Op` records: a `small_component` drop removes every node in it; a `dead_end_stub`
 drop removes the stub's own chain (`nodes[:-1]`, excluding the junction) — confidence is a
 flat 0.7 (there is nothing in a `keep`/`drop`/`why` answer to read a real number from),
@@ -406,7 +412,7 @@ daybeacons** — so a stub sitting right next to "Combs Creek Daybeacon 4" or in
 of a named, marked, real tidal creek can still show a `nearest_poi_m` of several kilometres,
 because the nearest *POI-table* entry happens to be a distant channel. Real review caught
 this every time by looking at the rendered chart context, not the number alone; a purely
-numeric backend cannot. **Action item, not yet done: extend `nearest_poi` to also search
+numeric backend cannot. **Action item (DONE 2026-09-15, see §6.8 -- text below is the original finding): extend `nearest_poi` to also search
 lateral marks (`lateral_marks_points`) and named waterway lines, not just the `pois`
 table** — this would remove the single biggest source of misleading context in the current
 `context.json`.
@@ -542,11 +548,139 @@ It does mean any *future* review (and especially the still-untested `ClaudeBacke
 path, §6.5, which has no rendered tile to fall back on for context the way a session
 reading tiles directly does) will see substantially more accurate numbers.
 
+### 6.9 `LocalOpenAIBackend` — the local model path (`backends/local_openai.py`)
+
+The "local second" half of §6's plan: an OpenAI-compatible server (llama.cpp
+`llama-server`) at `POST <base>/chat/completions`, standard library only (`http.client`, no new
+dependency). Same inputs as `ClaudeBackend` (identical PNG bytes and `context.json`, in this
+API's message format): `prompt.txt` as the system message, then `chart.png`, `candidates.png`
+as base64 `data:image/png;base64,...` `image_url` parts (each preceded by a short text label),
+then `context.json` as text.
+
+```
+./review_region.py --db ... --input-dir ... --out-dir data/review/md \
+    --backend local --limit 3                    # smoke on 3 tiles first
+    # --local-url http://192.168.10.111:8000/v1  (default; or $LOCAL_LLM_URL)
+    # --model Qwen3.8-27B-GSQ-RCO-IQ3_S          (default; or $LOCAL_LLM_MODEL)
+    # --temperature 0.2 --max-tokens 4096 --timeout 300 --connect-timeout 10
+    # --max-consecutive-backend-errors 5  (0 = never abort)
+    # --prompt-label v2-tighter  --enable-thinking  --local-json-schema
+```
+
+Defaults: temperature 0.2, top_p 0.8, `max_tokens` 4096, read timeout 300 s, connect timeout 10 s (separate: a dead host fails fast, a slow generation
+is still allowed). **Thinking is off by
+default** via `chat_template_kwargs: {"enable_thinking": false}` in the request body
+(`--enable-thinking` to switch on). Measured on the server in use: with the default template
+the model still *generates* reasoning (a one-word answer cost 39 completion tokens instead of
+2, 3.0 s instead of 0.7 s) but llama.cpp returns it in a separate `reasoning_content` field,
+not in `content`; with `enable_thinking=false` neither is produced. `<think>...</think>`
+blocks in `content` are stripped anyway for servers that inline them.
+`--local-json-schema` additionally sends a per-tile `response_format: json_schema`
+(grammar-constrained decoding); it worked on the smoke test but is off by default.
+
+**Safety rule: whatever cannot be trusted becomes `unsure`, and `unsure` is `keep`.** The
+reply is parsed for exactly one JSON object (code fences, leading/trailing prose and think
+blocks tolerated); then validated strictly against the tile's own candidate numbers.
+
+| Situation | Result |
+|---|---|
+| reply unparseable; truncated (`finish_reason=length`) or `content_filter`; two *different* JSON objects anywhere (an unfenced one next to a fenced one included); a repeated key (`{"1":keep,"1":drop}`, any level); a top-level array; JSON that starts but does not parse while `"verdict"` entries follow (unbalanced wrapper, unclosed array, truncated: inner objects are never salvaged); a `<think>` that is never closed, even after a complete answer; `content` that is not text (a list of `text` parts is joined) | one resample (`parse_retries=1`), then every candidate of the tile `unsure`, and the tile is *degraded* (below) |
+| one candidate missing / not an object / verdict not exactly `keep`/`drop`/`unsure` | that candidate `unsure`; the others keep their verdicts |
+| numbers not in `context.json` | discarded (recorded) |
+| connection error (refused, DNS, reset, connect timeout, truncated/garbled HTTP response such as `IncompleteRead`/`BadStatusLine`) or HTTP 408/425/429/5xx, still failing after 2 retries (backoff 2 s, 4 s) | `BackendError` |
+| read timeout (server connected but silent for 300 s) or any other HTTP status (e.g. 4xx context overflow) | `BackendError` at once — **not** retried by the backend |
+
+A `BackendError` leaves the tile *unanswered* (no `answer.json`, no ops, picked up again on the
+next `--resume` run). Retries stack: `runner.run_tile` makes its own extra attempt
+(`max_retries=1`, i.e. 2 calls to `answer_tile`) after a `BackendError` as well as after an
+invalid answer, so a tile whose server accepts the connection but never answers costs about
+`2 x 300 s`, and a refused connection up to `2 x 3` connection attempts.
+
+**Circuit breakers.** `run_all` raises `BackendCircuitOpen` (exit code 2 in `review_region.py`)
+* after `--max-consecutive-backend-errors` (default 5, 0 = off) consecutive tiles that ended in a
+  `BackendError`; a tile that got any answer resets the count. **This default now also applies to
+  the Claude backend** (a missing credential or API outage used to grind through every tile);
+* after `--max-consecutive-degraded` (default 10, 0 = off) consecutive *degraded* tiles: a server
+  that answers HTTP 200 with garbage never raises `BackendError`, so the first breaker cannot see
+  it. A non-degraded answer resets this count.
+
+Tiles skipped because they already have a valid answer neither count nor reset either streak.
+Answers already written stay; fix the server/prompt and re-run with `--resume`.
+
+**Degraded answers.** When no reply was usable the backend returns the all-`unsure` fallback and
+reports the tile through `consume_degraded`. `run_all` records this in
+`<tile>/answer.meta.json` (`{"manifest_sha256": ..., "degraded": true}`; `answer.json` itself is
+unchanged so its schema and external batch collectors are unaffected). `--resume` treats a
+degraded answer as not done and asks the model again, and `--limit N` counts degraded and stale
+tiles as *pending* (it answers the first N tiles that are not `valid`); `answers_to_ops` never derives ops from one.
+
+**Round history (archive, not delete).** When a tile is re-run (`--no-resume`, or `--resume` of
+a degraded/stale tile) or re-prepared with a changed manifest, its previous results are *moved*,
+not deleted:
+
+```
+<tile>/answer.json, answer.meta.json, error.txt, manifest.json   current round (only these are read)
+<tile>/history/0001/{answer.json, answer.meta.json, [error.txt], [manifest.json]}   oldest round
+<tile>/history/0002/...                                           next superseded round
+<tile>/local_audit.jsonl                                          append-only, never moved
+```
+
+`manifest.json` in a history dir is a copy of the manifest the answer was made against (omitted
+when that answer was already stale). `answer_status`/`answers_to_ops` never look inside
+`history/`, so a failed or degraded re-run can never fall back to an older answer -- yet a
+backend outage during `--no-resume` no longer destroys paid-for work, and two rounds of a tuned
+prompt can be diffed (`jq -S . history/0001/answer.json` vs the current one, next to the
+per-round records in `local_audit.jsonl`). A lone `error.txt` (no answer) is simply deleted.
+
+**Integrity of the current round.**
+* `answer.json`, `answer.meta.json`, `error.txt`, `manifest.json` and `context.json` are written
+  atomically (temp file in the same directory, `fsync`, `os.replace`); the meta goes first, so a
+  crash leaves "no answer" (re-run), never a truncated or degraded-looking-valid one.
+* Every answer records the sha256 of the manifest that was current *when the tile was sent to
+  the backend*. If the manifest changes during the call (the tile was re-prepared), the answer is
+  discarded (tile counted `unanswered`, reason in `error.txt`) rather than stamped with the new
+  build.
+* `answers_to_ops` raises `StaleAnswerError` if an answer's recorded manifest is not the tile's
+  current one, or if its numbers are not exactly the manifest's. In `review_region.py` this
+  aborts with exit code 2 **and no ops file is written at all** -- kept deliberately: one
+  unverifiable tile means the whole batch is suspect, and the fix (`--no-resume` for that tile)
+  is cheap.
+* **Legacy limit:** an answer with no `answer.meta.json` (older version, external batch
+  collector) is still accepted, but it cannot be tied to a build -- candidate numbers are always
+  1..N, so a stale answer from another graph with the same tile id and candidate count is
+  indistinguishable. `answers_to_ops` prints a warning on stderr naming such tiles; re-run them
+  with `--no-resume` to stamp them.
+
+**URL and transport.** The URL (`--local-url`, `$LOCAL_LLM_URL`) is validated up front
+(`http://` or `https://`, a host, a numeric port); a scheme-less `192.168.10.111:8000/v1` or a
+bad port is rejected before any graph is loaded or tile rendered (`review_region.py` exits 2).
+`urllib_transport` maps everything else (bad URL, `InvalidURL`, ...) to the normal error path.
+
+Only an exact `"drop"` on a validated entry can produce an op. The backend is thread-safe and
+caps in-flight requests at 4 (the server's slot count) via a semaphore, but `runner.run_all`
+is sequential, so today's run uses one slot.
+
+**Per-round audit artefacts.** Every `answer_tile` call appends one JSON line to
+`<tile>/local_audit.jsonl` (append-only: later rounds never overwrite earlier ones): UTC
+timestamp, `model`, sampling `params`, `prompt_sha256` (first 12 hex of `prompt.txt`, changes
+whenever the prompt does) and the optional `--prompt-label`; per sample the `latency_s`,
+server `usage` (prompt/completion tokens), `finish_reason`, the **raw model output verbatim**
+(plus `reasoning_content` when thinking is on) and any error; and `outcome` with the final
+per-candidate verdicts and a `problems` map naming each candidate that was downgraded to
+`unsure` and why. Comparing two rounds of a prompt is `jq` over these files. The run ends with
+a one-line summary (calls, total latency, tokens, fallback tiles, downgraded candidates).
+
+**Not validated as a reviewer.** The backend was smoke-tested for transport, image
+understanding and JSON output on synthetic input only; how well the model judges real tiles
+(and whether it clears the §6 bar of matching Sonnet's gold set) is unmeasured.
+
 ## 7. Known limits / follow-ups
 
 - The skeleton wobble between junctions (§2.3) is untouched and needs Pass B/C or a
   generation-time fix.
-- `NAVMESH_BOUNDARY_SIMPLIFY_M` is still a hardcoded 5.0 (§4.4).
+- `NAVMESH_BOUNDARY_SIMPLIFY_M` is now the default of `--navmesh-boundary-simplify-m`
+  (built 2026-09-21, see `SPEC-GRAPH-DENSITY.md` §10.6 item 1), but no real build has
+  yet been run at a raised tolerance (§4.4).
 - `drop_redundant_edges` finds only 2,161 provably-redundant edges against the 33.7% that
   are merely unused — the weaker criterion is a Pass-B candidate generator, not a deletion
   proof.

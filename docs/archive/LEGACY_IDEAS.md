@@ -1,5 +1,10 @@
 # Legacy idea backlog (moved from routeiq's old todo.md)
 
+> **Moved to `docs/archive/` on 2026-09-21: nothing left to say here; every item is done, superseded or
+> tracked in `docs/ROADMAP.md`.** Other docs named below are at the repo root (`PHASE_3_DESIGN.md`,
+> `PHASE_4_DESIGN.md`) and `NEXT_PHASES.md` is now split: open items in the root `NEXT_PHASES.md`,
+> the finished log in `docs/archive/NEXT_PHASES_LOG.md`.
+
 `routeiq/todo.md` used to mix plugin-side (TypeScript runtime) planning
 with routing-database/pipeline design, and had drifted out of date — the
 pipeline-related brainstorm ideas below were pulled out verbatim-in-spirit

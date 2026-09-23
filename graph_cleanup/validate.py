@@ -131,8 +131,18 @@ def check(g: RoutingGraph, baseline: Baseline,
           max_component_loss_pp: float = 0.5,
           max_route_cost_increase: float = 0.05,
           max_hub_degree: int = 30,
-          max_snap_drift_m: float = 50.0) -> GateReport:
-    """Run every gate against a cleaned graph. See the module docstring."""
+          max_snap_drift_m: float = 50.0,
+          max_edge_growth: int = 0) -> GateReport:
+    """Run every gate against a cleaned graph. See the module docstring.
+
+    ``max_edge_growth`` is an explicit opt-in for changes that legitimately ADD
+    edges (e.g. the channel-axis dead-end stitch, builds #45-#50): the ``counts``
+    gate then tolerates up to that many extra edges over the baseline. The default
+    of 0 keeps the gate strictly shrink-only, exactly as before. Node growth is
+    never tolerated.
+    """
+    if max_edge_growth < 0:
+        raise ValueError(f"max_edge_growth must be >= 0 (got {max_edge_growth})")
     rep = GateReport()
 
     # 1. crosses_land stays 0 (or at least never grows).
@@ -172,14 +182,19 @@ def check(g: RoutingGraph, baseline: Baseline,
         f"{len(drifted)} POIs snap >{max_snap_drift_m:g}m further than before"
         + (f", worst {worst[1]} +{worst[0]:.0f}m" if drifted else "")))
 
-    # 4. Counts moved in the expected direction and only downward.
-    grew = len(g.nodes) > baseline.nodes or len(g.edges) > baseline.edges
+    # 4. Counts moved in the expected direction and only downward. Edges may
+    #    grow by at most the explicitly declared ``max_edge_growth`` (default 0);
+    #    nodes may never grow.
+    edge_growth = len(g.edges) - baseline.edges
+    grew = len(g.nodes) > baseline.nodes or edge_growth > max_edge_growth
     dn = 100.0 * (baseline.nodes - len(g.nodes)) / baseline.nodes if baseline.nodes else 0
     de = 100.0 * (baseline.edges - len(g.edges)) / baseline.edges if baseline.edges else 0
     rep.gates.append(Gate(
         "counts", not grew,
         f"nodes {baseline.nodes} -> {len(g.nodes)} (-{dn:.1f}%), "
-        f"edges {baseline.edges} -> {len(g.edges)} (-{de:.1f}%)"))
+        f"edges {baseline.edges} -> {len(g.edges)} (-{de:.1f}%)"
+        + (f", edge growth {edge_growth:+d} vs allowed {max_edge_growth}"
+           if max_edge_growth else "")))
 
     # 5. No new hubs. Splicing joins neighbours, so it can raise a degree.
     hubs = [n for n in g.adj if g.degree(n) > max_hub_degree]

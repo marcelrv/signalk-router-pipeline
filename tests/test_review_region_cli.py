@@ -151,3 +151,175 @@ def test_bbox_filters_candidates(tmp_path, capsys):
     out = capsys.readouterr().out
     assert "restricts to 0/" in out
     assert "nothing to review" in out
+
+
+def test_local_backend_end_to_end_with_faked_http(tmp_path, monkeypatch, capsys):
+    """`--backend local` wires through the CLI: request goes to the given URL
+    with the given model/temperature, a `drop` becomes an op, and the audit
+    file exists. (The unusable-reply path is exercised by
+    `test_local_backend_garbage_reply_is_degraded_no_ops_and_retried_on_resume`.)"""
+    from graph_cleanup.backends import local_openai
+
+    db = tmp_path / "g.sqlite"
+    _make_db(db)
+    input_dir = tmp_path / "geo"
+    _make_geojson(input_dir)
+    out_dir = tmp_path / "tiles"
+    ops_out = tmp_path / "ai.ops.jsonl"
+    seen = []
+
+    def fake_post(url, payload, headers, timeout):
+        seen.append((url, payload))
+        ctx_text = payload["messages"][1]["content"][-1]["text"]
+        ctx = json.loads(ctx_text[len("context.json:\n"):])
+        ans = {str(c["n"]): {"verdict": "drop", "why": "fake"} for c in ctx["candidates"]}
+        return {"choices": [{"message": {"content": json.dumps(ans)},
+                             "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 5, "completion_tokens": 7}}
+
+    monkeypatch.setattr(local_openai, "urllib_transport", fake_post)
+    rc = review_region.main(["--db", str(db), "--input-dir", str(input_dir),
+                             "--out-dir", str(out_dir), "--backend", "local",
+                             "--local-url", "http://fake:1/v1", "--model", "m1",
+                             "--temperature", "0.1", "--ops-out", str(ops_out)])
+    assert rc == 0
+    assert seen and seen[0][0] == "http://fake:1/v1/chat/completions"
+    assert seen[0][1]["model"] == "m1" and seen[0][1]["temperature"] == 0.1
+    out = capsys.readouterr().out
+    assert "backend: local" in out and "local backend:" in out
+    tile_dirs = review_region._find_tile_dirs(str(out_dir))
+    assert all(os.path.exists(os.path.join(d, "local_audit.jsonl")) for d in tile_dirs)
+    from graph_cleanup import ops as ops_mod
+    written = list(ops_mod.read_ops(str(ops_out)))
+    assert written and all(op.author == "ai:m1" for op in written)
+
+
+def _ctx(payload):
+    text = payload["messages"][1]["content"][-1]["text"]
+    return json.loads(text[len("context.json:\n"):])
+
+
+def _cli(tmp_path, *extra):
+    return review_region.main(["--db", str(tmp_path / "g.sqlite"),
+                               "--input-dir", str(tmp_path / "geo"),
+                               "--out-dir", str(tmp_path / "tiles"),
+                               "--backend", "local", "--local-url", "http://fake:1/v1",
+                               *extra])
+
+
+def _setup(tmp_path):
+    _make_db(tmp_path / "g.sqlite")
+    _make_geojson(tmp_path / "geo")
+
+
+def test_local_backend_garbage_reply_is_degraded_no_ops_and_retried_on_resume(
+        tmp_path, monkeypatch):
+    """An unusable reply becomes an all-`unsure` answer (no op), the answer is
+    marked degraded, and a plain re-run (--resume is the default) asks again
+    instead of trusting it; a good reply then produces the drop op."""
+    from graph_cleanup import ops as ops_mod
+    from graph_cleanup.backends import local_openai
+
+    _setup(tmp_path)
+    ops_out = tmp_path / "ai.ops.jsonl"
+    mode = {"reply": "I refuse to answer in JSON."}
+    calls = []
+
+    def fake_post(url, payload, headers, timeout):
+        calls.append(1)
+        reply = mode["reply"]
+        if reply is None:
+            ans = {str(c["n"]): {"verdict": "drop", "why": "fake"}
+                   for c in _ctx(payload)["candidates"]}
+            reply = json.dumps(ans)
+        return {"choices": [{"message": {"content": reply}, "finish_reason": "stop"}]}
+
+    monkeypatch.setattr(local_openai, "urllib_transport", fake_post)
+    assert _cli(tmp_path, "--ops-out", str(ops_out)) == 0
+    assert list(ops_mod.read_ops(str(ops_out))) == []
+    (tile_dir,) = review_region._find_tile_dirs(str(tmp_path / "tiles"))
+    answer = json.loads(open(os.path.join(tile_dir, "answer.json")).read())
+    assert {v["verdict"] for v in answer.values()} == {"unsure"}
+    assert json.loads(open(os.path.join(tile_dir, "answer.meta.json")).read())["degraded"]
+    n_first = len(calls)
+
+    mode["reply"] = None                          # server recovers; same command again
+    assert _cli(tmp_path, "--ops-out", str(ops_out), "--limit", "1") == 0
+    assert len(calls) > n_first                   # retried, not skipped
+    assert list(ops_mod.read_ops(str(ops_out)))   # now the drop is real
+
+    n_second = len(calls)
+    assert _cli(tmp_path, "--ops-out", str(ops_out)) == 0
+    assert len(calls) == n_second                 # a good answer is resumed
+
+
+def test_backend_circuit_breaker_flag_aborts_with_nonzero_exit(tmp_path, monkeypatch, capsys):
+    from graph_cleanup.backends import local_openai
+
+    _setup(tmp_path)
+    monkeypatch.setattr(local_openai, "urllib_transport",
+                        lambda *a: (_ for _ in ()).throw(
+                            local_openai.LocalHTTPError(400, "bad")))
+    ops_out = tmp_path / "ai.ops.jsonl"
+    rc = _cli(tmp_path, "--max-consecutive-backend-errors", "1", "--ops-out", str(ops_out))
+    assert rc == 2
+    assert "consecutive" in capsys.readouterr().err
+    assert not ops_out.exists()
+    # 0 disables the breaker: the run finishes (unanswered) and exits normally
+    assert _cli(tmp_path, "--max-consecutive-backend-errors", "0") == 0
+
+
+def test_answers_to_ops_refuses_an_answer_recorded_for_another_build(tmp_path, capsys):
+    _setup(tmp_path)
+    assert review_region.main(["--db", str(tmp_path / "g.sqlite"),
+                               "--input-dir", str(tmp_path / "geo"),
+                               "--out-dir", str(tmp_path / "tiles"),
+                               "--backend", "mock"]) == 0
+    (tile_dir,) = review_region._find_tile_dirs(str(tmp_path / "tiles"))
+    meta_path = os.path.join(tile_dir, "answer.meta.json")
+    meta = json.load(open(meta_path))
+    meta["manifest_sha256"] = "0" * 64                       # recorded for another build
+    json.dump(meta, open(meta_path, "w"))
+    from graph_cleanup import runner
+    with pytest.raises(runner.StaleAnswerError):
+        runner.answers_to_ops([tile_dir], "t")
+
+
+def test_stale_answer_makes_the_cli_exit_2_and_write_no_ops(tmp_path, monkeypatch, capsys):
+    from graph_cleanup import runner
+    _setup(tmp_path)
+    args = ["--db", str(tmp_path / "g.sqlite"), "--input-dir", str(tmp_path / "geo"),
+            "--out-dir", str(tmp_path / "tiles"), "--backend", "mock"]
+    assert review_region.main(args) == 0
+    (tile_dir,) = review_region._find_tile_dirs(str(tmp_path / "tiles"))
+    meta_path = os.path.join(tile_dir, "answer.meta.json")
+    meta = json.load(open(meta_path))
+    meta["manifest_sha256"] = "0" * 64
+    json.dump(meta, open(meta_path, "w"))
+    # run_all would just re-answer a stale tile; stub it to reach answers_to_ops
+    monkeypatch.setattr(review_region.runner, "run_all", lambda *a, **k: runner.RunStats())
+    ops_out = tmp_path / "ai.ops.jsonl"
+    assert review_region.main(args + ["--ops-out", str(ops_out)]) == 2
+    assert "different manifest" in capsys.readouterr().err
+    assert not ops_out.exists()
+
+
+@pytest.mark.parametrize("url", ["192.168.10.111:8000/v1", "ftp://h/v1", "http://h:abc/v1"])
+def test_bad_local_url_is_rejected_before_any_work(tmp_path, url, capsys):
+    with pytest.raises(SystemExit) as ei:
+        review_region.main(["--db", str(tmp_path / "missing.sqlite"),
+                            "--input-dir", str(tmp_path), "--out-dir", str(tmp_path / "o"),
+                            "--backend", "local", "--local-url", url])
+    assert ei.value.code == 2
+    assert "--local-url" in capsys.readouterr().err
+    assert not (tmp_path / "o").exists()          # nothing was loaded or rendered
+
+
+def test_consecutive_degraded_flag_aborts_the_cli(tmp_path, monkeypatch, capsys):
+    from graph_cleanup.backends import local_openai
+    _setup(tmp_path)
+    monkeypatch.setattr(local_openai, "urllib_transport", lambda *a: {
+        "choices": [{"message": {"content": "garbage"}, "finish_reason": "stop"}]})
+    assert _cli(tmp_path, "--max-consecutive-degraded", "1") == 2
+    assert "unusable" in capsys.readouterr().err
+    assert _cli(tmp_path, "--max-consecutive-degraded", "0") == 0

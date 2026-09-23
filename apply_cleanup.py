@@ -71,12 +71,23 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     p.add_argument("--probe", type=_parse_probe, action="append", default=None,
                    metavar="LAT1,LON1,LAT2,LON2",
                    help="route probe to gate on (repeatable)")
+    p.add_argument("--max-edge-growth", type=int, default=0, metavar="N",
+                   help="opt-in: let the `counts` gate tolerate up to N extra edges "
+                        "over the baseline, for edge-adding changes only (default 0 = "
+                        "shrink-only; node growth is never tolerated, so the node-count "
+                        "check stays strict). NOTE: the ops this CLI applies "
+                        "(drop_node/splice_node/drop_edge/move_node) cannot add edges, so "
+                        "today this cannot change a result here; it exists for future "
+                        "edge-adding ops. Baseline-vs-candidate comparisons of separate "
+                        "builds call validate.check(max_edge_growth=N) directly")
     p.add_argument("--force", action="store_true",
                    help="save even if a gate fails (say why in the BUILD_LOG entry)")
     args = p.parse_args(argv)
 
     if not args.dry_run and not args.out:
         p.error("--out is required unless --dry-run")
+    if args.max_edge_growth < 0:
+        p.error(f"--max-edge-growth must be >= 0 (got {args.max_edge_growth})")
     if args.replay and not os.path.exists(args.ops):
         p.error(f"--replay needs an existing ops file: {args.ops}")
 
@@ -123,7 +134,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print(f"  by author: {result.by_author}")
 
     print("gates:")
-    report = validate.check(g, baseline)
+    report = validate.check(g, baseline, max_edge_growth=args.max_edge_growth)
     for gate in report.gates:
         print(f"  {gate}")
 

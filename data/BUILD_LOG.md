@@ -12,9 +12,24 @@ is for.
 Baseline reference (SPEC-GRAPH-DENSITY.md §1, pre-any-density-fix): **48,553 nodes /
 137,718 edges** on `data/zeeland_full.sqlite`.
 
-Deployed live db as of 2026-09-04 (`signalk-routeiq/data/zeeland.sqlite`, exact build
-command unknown/unreproduced — flagged in #1 below): **64,717 nodes / 203,582 edges /
-5 hub nodes (out-degree>30, max 33) / 0 crosses_land**.
+**Currently installed on the dev server (as of 2026-09-21; NOTHING is shipped/released — graph quality is not yet good enough, owner decision):** Maryland = `us_east_md_channel_axes.sqlite` (build #49,
+`--channel-axis-deadend-stitch-m 1500.0`, 3 connections per dead end); Zeeland = build #50,
+`zeeland_deadend_stitch_v3.sqlite`; the other 18 US East Coast regions run the Zeeland tuning
+config, builds #13-#32 (`*_stitched_v2.sqlite`). (Live-file names are as stated by the repo owner;
+verify against `signalk-routeiq/data` if in doubt.)
+
+Historical note (2026-09-04, no longer live): the deployed `signalk-routeiq/data/zeeland.sqlite` at
+the time (exact build command unknown/unreproduced, flagged in #1 below) had **64,717 nodes /
+203,582 edges / 5 hub nodes (out-degree>30, max 33) / 0 crosses_land**. Rows still marked "YES
+(currently live)" in the table below (#1, #10) are historical; the "Installed live?" column reflects
+the state at the time each row was written, not today.
+
+**Provenance note (owner confirmed 2026-09-21: nothing has been shipped, so "which set is deployed" is only about the dev server; the remaining open question is which build produced which file):** `STITCHING_DESIGN.md` §10.7
+("Full East Coast rebuild with the tolerance fix", 2026-08-01) describes a 9-region rebuild
+(~67 min, 10,004 seam nodes) that is **not logged in this file**, and builds #13-#32 above produced
+`us_east_*_stitched_v2.sqlite` files. Their provenance relative to each other (whether the §10.7
+rebuilds are the `*_stitched_v2` set, which set is installed on the dev server, and whether §10.7 predates or
+was replaced by the #13-#32 tuning rollout) has not been confirmed and is deliberately not logged here.
 
 ## Table
 
@@ -57,6 +72,12 @@ Nodes/Edges delta.
 | 30 | 2026-09-07 | `273b563` | `data/geojson/sc_ga_reclip` (re-derived via `data/raw/us-east-coast/SC,GA`) | same tuning config as #13, applied to `us_east_sc_ga_stitched` | Roll out Zeeland's tuning config, region 18/19 | 35,438 | 87,245 | 0 | 15 | 0 | **YES** |
 | 31 | 2026-09-07 | `eeb3fed` | `data/geojson/va_reclip` (re-derived via `data/raw/us-east-coast/VA`) | same tuning config as #13, applied to `us_east_va_stitched` | Roll out Zeeland's tuning config, region 19/19 (final) | 59,443 | 143,046 | 0 | 17 | 0 | **YES** |
 | 32 | 2026-09-07 | `453586c` (PR #22, `_safe_negative_buffer` fix) | `data/geojson/fl_atl_n1a_reclip` (re-derived via `data/raw/us-east-coast/FL`) | same tuning config as #13, run under `ulimit -v 11GB` | `fl_atl_n1a` retry after root-causing and fixing its OOM (see Details) | 12,207 | 31,491 | 0 | 16 | 0 | **YES** |
+| 33 | 2026-09-08 (date of log commit; build date not in Details) | not recorded | `data/geojson/us-east-md-stitched-v3_clipped` (`./build_region.sh us-east-md-stitched-v3`, MD, `--stitch-registry`) | Zeeland tuning config plus `--narrow-fragment-reclass-max-fraction 0.5 --pass0-fanin-cap 6 --pass0-cross-type-first` | SPEC-GRAPH-DENSITY.md §8 -- try the narrow-fragment fold-back and Pass 0 fan-in cap on the Potomac/Coltons Point bowtie | 55,074 | 129,976 | 0 | 16 | 0 | no -- added as an ADDITIONAL file (`us_east_md_stitched_v3.sqlite`) for visual comparison only; INEFFECTIVE for the target location, superseded by #34 |
+| 34 | 2026-09-08 (log commit date) | not recorded (PR #23) | `data/geojson/us-east-md-stitched-v3_clipped` (same clip as #33) | same as #33 plus `--skeleton-boundary-simplify-m 20.0` | SPEC-GRAPH-DENSITY.md §9 -- the real fix for the Coltons Point bowtie (unsimplified water-polygon boundary noise inflating medial-axis junctions) | 51,519 | 121,168 | 0 | 16 | 0 | ADDITIONAL file (`us_east_md_stitched_v4.sqlite`), not replacing `us_east_md_stitched.sqlite`; later superseded by #37/#39 for MD |
+| 35 | 2026-09-08 (log commit date) | not recorded (PR #23) | `data/zeeland_fresh_clip` | same as #10 plus `--narrow-fragment-reclass-max-fraction 0.5 --pass0-fanin-cap 6 --pass0-cross-type-first --skeleton-boundary-simplify-m 20.0` (combined; not an isolated ablation) | Apply #34's tuning to Zeeland as a regression check and to measure the new flag | 40,433 | 120,485 | 0 | 14 | 0 | ADDITIONAL file (`zeeland_skeletonsimplify_v2.sqlite`), not replacing the live `zeeland.sqlite` |
+| 36 | 2026-09-09 or earlier (build date not in Details; #37/#38 were logged 2026-09-09) | on top of `2af61ca`, branch `channel-axes`, uncommitted at build time | `data/geojson/us-east-md-v5_clipped` (125 NOAA cells, new buoy layers) | same tuning as #34 plus `--channel-axes` (run 2: `derive_channel_axes.py --simplify-m 5`, axes excluded from the navmesh carve; no `--stitch-registry`) | SPEC-CHANNEL-AXES.md -- first build with derived marked-channel axes. Potomac buoy 13 to 33 route share within 100 m of an axis 2% to 95% | 62,309 | 162,482 | 0 | 15 | 0 | no (not deployed; run 1 kept as `us_east_md_v5_channel_axes_run1.sqlite` for reference) |
+| 37 | 2026-09-09 (log commit date) | `0d5ffe0` (branch `channel-axes`) | `data/geojson/us-east-md-v5_clipped` (same as #36) | same as #36 | Replicate #36 on committed code (bare-number mark parser); byte-for-byte reproduction of #36 run 2's gate numbers | 62,309 | 162,482 | 0 | 15 | 0 | ADDITIONAL file (`us_east_md_channel_axes.sqlite`); superseded by #39 |
+| 38 | 2026-09-09 (log commit date) | `2d18544` (branch `channel-axes`) | `data/geojson/nl-v5-zeeland-build_clipped` (`nl-v5` clipped to `3.13,51.21,4.62,51.95`, matching #35's extent) | same tuning as #35 plus `--channel-axes` | First Zeeland build with `--channel-axes` (496 derived axes). Not an isolated ablation: `nl-v5` is a fresher, denser extraction than #35's clip | 54,761 | 159,783 | 0 | 13 | 0 | ADDITIONAL file (`zeeland_channel_axes.sqlite`); its clip/flags were the base for #44 |
 | 39 | 2026-09-11 | `8a7eaad` (`main`, PR #24 merged) | `data/geojson/us-east-md-v5_clipped` (same clip as #37) | same as #37 | Rebuild #37 on the final merged PR #24 code (picks up the post-#37 CodeRabbit fixes: tier-2 component length floor, navmesh-carve fast path) so the deployed MD channel-axes db reflects what actually merged | 62,904 | 164,468 | 0 | 15 | 0 | **YES (replaces #37)** |
 | 40 | 2026-09-12 | `graph-cleanup` branch | n/a — post-processes #39's `.sqlite`, not a rebuild | `apply_cleanup.py` Pass A (`--tolerance-m 20`, smooth + contract + redundant) | First deterministic post-build cleanup: measure how much of the graph comes out with no model at all | 53,930 | 142,196 | 0 | 13 | 0 | no (test build) |
 | 41 | 2026-09-14 | `graph-cleanup` branch | n/a — post-processes #40's `.sqlite` | AI review Pass B, Coltons Point bbox only (16 tiles, 104 candidates), reviewer = this session (Sonnet 5) reading tiles directly, no API | First real Pass B review: 63 keep / 35 drop / 6 unsure -> 40 drop ops applied | 53,890 | 142,116 | 0 | 13 | 0 | no (pilot only) |

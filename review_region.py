@@ -15,6 +15,10 @@
     ./review_region.py --db ... --input-dir ... --out-dir data/review/md \
         --backend claude --limit 3
 
+    # A local OpenAI-compatible server (llama.cpp); free, LAN only
+    ./review_region.py --db ... --input-dir ... --out-dir data/review/md \
+        --backend local --limit 3
+
     # The full gold-set run
     ./review_region.py --db ... --input-dir ... --out-dir data/review/md \
         --backend claude --ops-out data/md_ai_review.ops.jsonl
@@ -66,12 +70,45 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                    help="seed for --sample-tiles, for a reproducible sample")
     p.add_argument("--prepare-only", action="store_true",
                    help="write tiles and stop -- look at them yourself first")
-    p.add_argument("--backend", choices=("mock", "claude"), default="mock",
+    p.add_argument("--backend", choices=("mock", "claude", "local"), default="mock",
                    help="mock costs nothing and proves the harness works; "
-                        "claude is real money (default: %(default)s)")
+                        "claude is real money; local is an OpenAI-compatible "
+                        "server (llama.cpp), see --local-url (default: %(default)s)")
     p.add_argument("--model", default=None, help="override the backend's default model")
     p.add_argument("--effort", default=None,
                    help="claude backend: low/medium/high/xhigh/max")
+    p.add_argument("--local-url", default=None,
+                   help="local backend: base URL incl. /v1 (default: $LOCAL_LLM_URL, "
+                        "else http://192.168.10.111:8000/v1); $LOCAL_LLM_MODEL and "
+                        "$LOCAL_LLM_API_KEY are honoured too")
+    p.add_argument("--temperature", type=float, default=None,
+                   help="local backend sampling temperature (default 0.2)")
+    p.add_argument("--max-tokens", type=int, default=None,
+                   help="local backend max completion tokens (default 4096)")
+    p.add_argument("--timeout", type=float, default=None,
+                   help="local backend per-request timeout in seconds (default 300)")
+    p.add_argument("--connect-timeout", type=float, default=None,
+                   help="local backend connect timeout in seconds (default 10); "
+                        "separate from --timeout so a dead host fails fast")
+    p.add_argument("--max-consecutive-backend-errors", type=int,
+                   default=runner.DEFAULT_MAX_CONSECUTIVE_BACKEND_ERRORS,
+                   help="abort the run after this many tiles in a row fail with a "
+                        "backend error (dead/wedged server); 0 disables "
+                        "(default: %(default)s)")
+    p.add_argument("--max-consecutive-degraded", type=int,
+                   default=runner.DEFAULT_MAX_CONSECUTIVE_DEGRADED,
+                   help="abort after this many tiles in a row whose reply was unusable "
+                        "(all-unsure fallback; HTTP 200 garbage never counts as a "
+                        "backend error); 0 disables (default: %(default)s)")
+    p.add_argument("--enable-thinking", action="store_true",
+                   help="local backend: let a Qwen3-style model think before answering "
+                        "(off by default; raise --max-tokens if you use this)")
+    p.add_argument("--local-json-schema", action="store_true",
+                   help="local backend: send a JSON-schema response_format so the "
+                        "server constrains decoding to a valid answer")
+    p.add_argument("--prompt-label", default=None,
+                   help="local backend: free-text prompt version recorded in the "
+                        "per-tile local_audit.jsonl (the prompt's sha256 is always recorded)")
     p.add_argument("--limit", type=int, default=None,
                    help="only answer the first N unanswered tiles -- use this "
                         "before trusting --backend claude with a full run")
@@ -81,6 +118,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     p.add_argument("--author", default=None,
                    help="op author tag; default is ai:<backend's model>")
     args = p.parse_args(argv)
+    if args.backend == "local":
+        from graph_cleanup.backends.local_openai import normalize_url
+        try:  # fail before loading the graph / rendering tiles
+            normalize_url(args.local_url)
+        except ValueError as exc:
+            p.error(f"--local-url/$LOCAL_LLM_URL: {exc}")
 
     print(f"loading {args.db}")
     g = RoutingGraph.load(args.db)
@@ -135,6 +178,22 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         from graph_cleanup.backends.mock import MockBackend
         backend = MockBackend()
         model_name = "mock"
+    elif args.backend == "local":
+        from graph_cleanup.backends.local_openai import LocalOpenAIBackend
+        kwargs = {"enable_thinking": args.enable_thinking,
+                  "json_schema": args.local_json_schema,
+                  "prompt_label": args.prompt_label}
+        for key, val in (("base_url", args.local_url), ("model", args.model),
+                         ("temperature", args.temperature),
+                         ("max_tokens", args.max_tokens), ("timeout", args.timeout),
+                         ("connect_timeout", args.connect_timeout)):
+            if val is not None:
+                kwargs[key] = val
+        backend = LocalOpenAIBackend(**kwargs)
+        model_name = backend.model
+        print(f"backend: local, url={backend.url}, model={model_name}, "
+              f"temperature={backend.temperature}, thinking={backend.enable_thinking}")
+        print("raw model output is audited per tile in <tile>/local_audit.jsonl")
     else:
         from graph_cleanup.backends.claude import ClaudeBackend, DEFAULT_MODEL, DEFAULT_EFFORT
         kwargs = {}
@@ -150,18 +209,33 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     tile_dirs = current_tile_dirs
     if args.limit:
+        # a degraded (all-unsure fallback) or stale answer counts as pending
         pending = tile_dirs if args.no_resume else [
-            d for d in tile_dirs if not os.path.exists(os.path.join(d, "answer.json"))]
+            d for d in tile_dirs if runner.answer_status(d) != "valid"]
         tile_dirs = pending[:args.limit]
         print(f"--limit {args.limit}: this run will answer {len(tile_dirs)} tile(s)")
 
     print(f"answering {len(tile_dirs)} tiles...")
-    stats = runner.run_all(backend, tile_dirs, resume=not args.no_resume)
+    try:
+        stats = runner.run_all(
+            backend, tile_dirs, resume=not args.no_resume,
+            max_consecutive_backend_errors=args.max_consecutive_backend_errors,
+            max_consecutive_degraded=args.max_consecutive_degraded)
+    except runner.BackendCircuitOpen as exc:
+        print(f"  {exc.stats.summary()}")
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
     print(f"  {stats.summary()}")
+    if hasattr(backend, "summary"):
+        print(f"  {backend.summary()}")
 
     if args.ops_out:
         author = args.author or f"ai:{model_name}"
-        result_ops = runner.answers_to_ops(current_tile_dirs, author=author)
+        try:
+            result_ops = runner.answers_to_ops(current_tile_dirs, author=author)
+        except runner.StaleAnswerError as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            return 2
         n = ops_mod.write_ops(args.ops_out, result_ops, append=False)
         print(f"wrote {n} drop ops to {args.ops_out} (author={author})")
 

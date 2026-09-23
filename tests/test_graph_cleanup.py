@@ -434,6 +434,85 @@ def test_gates_pass_on_a_clean_simplification(tmp_path):
     assert report.passed, str(report)
 
 
+def _add_edge(g, a, b):
+    """Add one extra undirected edge between two existing nodes (graph is
+    undirected in memory: one EdgeRec per edge_key)."""
+    from dataclasses import replace
+    tmpl = next(iter(g.edges.values()))
+    g.edges[edge_key(a, b)] = replace(tmpl)
+    g.adj[a].add(b)
+    g.adj[b].add(a)
+
+
+def _counts_gate(report):
+    return next(gate for gate in report.gates if gate.name == "counts")
+
+
+def test_counts_gate_default_fails_on_edge_growth(tmp_path):
+    coords = _straight(12)
+    db = _db_with_pois(tmp_path, coords, [("start", 52.0, 4.0), ("end", 52.0, 4.011)])
+    g = RoutingGraph.load(db)
+    base = validate.Baseline.measure(g, db)
+    _add_edge(g, 1, 12)
+    assert len(g.edges) == base.edges + 1
+    assert not _counts_gate(validate.check(g, base)).passed
+
+
+def test_counts_gate_opt_in_passes_within_bound_and_fails_beyond(tmp_path):
+    coords = _straight(12)
+    db = _db_with_pois(tmp_path, coords, [("start", 52.0, 4.0), ("end", 52.0, 4.011)])
+    g = RoutingGraph.load(db)
+    base = validate.Baseline.measure(g, db)
+    _add_edge(g, 1, 12)
+    _add_edge(g, 2, 11)                            # +2 edges
+    assert _counts_gate(validate.check(g, base, max_edge_growth=2)).passed
+    assert _counts_gate(validate.check(g, base, max_edge_growth=5)).passed
+    assert not _counts_gate(validate.check(g, base, max_edge_growth=1)).passed
+
+
+def test_counts_gate_opt_in_never_tolerates_node_growth(tmp_path):
+    coords = _straight(12)
+    db = _db_with_pois(tmp_path, coords, [("start", 52.0, 4.0), ("end", 52.0, 4.011)])
+    g = RoutingGraph.load(db)
+    base = validate.Baseline.measure(g, db)
+    from dataclasses import replace
+    g.nodes[13] = replace(g.nodes[12], id=13)
+    g.adj[13] = set()
+    assert not _counts_gate(validate.check(g, base, max_edge_growth=100)).passed
+
+
+def test_counts_gate_shrink_passes_with_and_without_opt_in(tmp_path):
+    coords = _straight(12)
+    db = _db_with_pois(tmp_path, coords, [("start", 52.0, 4.0), ("end", 52.0, 4.011)])
+    g = RoutingGraph.load(db)
+    base = validate.Baseline.measure(g, db)
+    ops_mod.apply(g, simplify.contract_chains(g, tolerance_m=20.0, max_spacing_m=0))
+    assert len(g.edges) < base.edges
+    assert _counts_gate(validate.check(g, base)).passed
+    assert _counts_gate(validate.check(g, base, max_edge_growth=10)).passed
+
+
+def test_negative_edge_growth_bound_is_rejected(tmp_path):
+    coords = _straight(12)
+    db = _db_with_pois(tmp_path, coords, [("start", 52.0, 4.0), ("end", 52.0, 4.011)])
+    g = RoutingGraph.load(db)
+    base = validate.Baseline.measure(g, db)
+    with pytest.raises(ValueError):
+        validate.check(g, base, max_edge_growth=-1)
+
+
+def test_apply_cleanup_cli_rejects_negative_edge_growth_early(tmp_path, capsys):
+    """A negative --max-edge-growth is a usage error (argparse exit 2) raised
+    before the DB is even loaded, not a ValueError traceback after the cleanup ran."""
+    import apply_cleanup
+    with pytest.raises(SystemExit) as exc:
+        apply_cleanup.main(["--db", str(tmp_path / "does_not_exist.sqlite"),
+                            "--ops", str(tmp_path / "ops.jsonl"), "--dry-run",
+                            "--max-edge-growth", "-1"])
+    assert exc.value.code == 2
+    assert "--max-edge-growth must be >= 0" in capsys.readouterr().err
+
+
 def test_reachability_gate_catches_a_severed_graph(tmp_path):
     coords = _straight(12)
     db = _db_with_pois(tmp_path, coords, [("start", 52.0, 4.0), ("end", 52.0, 4.011)])

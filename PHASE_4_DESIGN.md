@@ -1,13 +1,25 @@
 # Phase 4 Design — Dynamic Database Loading, AI-Vision-Assisted Path Resolution, Bridge/Lock Wait Data
 
+## Status (2026-09-21)
+
+Consolidated status for the whole project lives in `docs/ROADMAP.md`. Per sub-phase:
+
+| Sub-phase | Status | Note |
+|---|---|---|
+| 4a dynamic database loading | done (routeiq side) | §4a.1 (stitching interplay) is **superseded by `STITCHING_DESIGN.md`** |
+| 4b AI-vision ambiguity resolution | open (not started) | candidate: fold into `docs/SPEC-GRAPH-CLEANUP.md` as Pass C (whose only artifact today is `graph_cleanup/prompts/trace.md`) or keep separate |
+| 4c bridge/lock wait data | lock marker done; wait columns open | `requires_lock`, `lock_id` and `is_lock_transit_edge` exist (`_add_lock_crossing_edges`); `typical_wait_minutes` / `opening_schedule` columns and Zeeland manual values not built |
+
+The status column above is authoritative; the sections below are the original design text.
+
 ## Scope and how this document relates to the others
 
 This is the forward design for open threads that came up after
 `PHASE_3_DESIGN.md` was written and aren't actually covered by it, despite
 one of them (4b) sounding at first like it might be. It assumes Phase
 0-2, Phase 2 Hardening, and Phase 3 (3a-3f) are either done or already
-designed — see `PHASE_3_DESIGN.md` for that work and `NEXT_PHASES.md` for
-the tactical bug-tracking log. Nothing here is a re-litigation of Phase 3;
+designed — see `PHASE_3_DESIGN.md` for that work and `docs/archive/NEXT_PHASES_LOG.md` for
+the (now archived) tactical log; open items are in `NEXT_PHASES.md` and `docs/ROADMAP.md`. Nothing here is a re-litigation of Phase 3;
 every sub-phase below was checked against it directly (see each section's
 "Relationship to Phase 3" note) rather than assumed independent.
 
@@ -220,7 +232,7 @@ anomaly queue doesn't detect at all, and (2) the actual mechanics of what
 "an AI agent with satellite imagery" means in practice — inputs, outputs,
 and where the human sign-off gate sits.
 
-**The gap in 3c's anomaly queue**: every trigger it lists (`NEXT_PHASES.md`-
+**The gap in 3c's anomaly queue**: every trigger it lists (`NEXT_PHASES.md`, moved to `docs/archive/NEXT_PHASES_LOG.md` -
 style: missing through-edge near a lock/bridge, disconnected-but-nearby
 components, a tier-3/4-only bottleneck with no corroboration) is a
 **connectivity/data-quality** problem — something is structurally broken
@@ -374,6 +386,8 @@ attributes:
   final — validate against real Rijkswaterstaat/USACE lock schedule data
   (both already-ingested source authorities, per `LICENSE-DATA.md`)
   before treating it as settled.
+
+> **Status (2026-09-21): the gap described in this paragraph is CLOSED.** `requires_lock`, `lock_id` and `is_lock_transit_edge` exist (see `_add_lock_crossing_edges` in `nautical_routing_pipeline.py`). Original text kept below.
 
 **A real, separate, smaller gap this surfaced**: bridges already get a
 precise opening-point edge (`_add_opening_bridge_edges`,
