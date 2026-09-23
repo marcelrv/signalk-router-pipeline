@@ -228,12 +228,21 @@ axes + 64 chain axes (101 km; 28 further chains dropped as duplicates of charted
 
 ## 9. Known limits / follow-ups
 
-- Unparseable names (4 % US, 13 % NL) **IMPLEMENTED**: grouped by `CATLAM` hand +
-  spatial proximity under `SPATIAL_KEY` (reusing the existing `cluster_link_m` 8 km
-  single-linkage knob), ordered by nearest-neighbour walk from a PCA-picked start
-  (`order_marks_spatial`), and given a lower confidence baseline (-0.2) than the
-  existing bare-number fallback (-0.1) since it has neither a parsed channel name
-  nor a bare number to order by.
+- Unparseable names (4 % US, 13 % NL) **IMPLEMENTED**: lateral marks (a usable
+  `CATLAM`; safe-water marks are excluded -- no hand/channel evidence) with an
+  unparseable `OBJNAM` are grouped under `SPATIAL_KEY` and clustered by spatial
+  proximity alone (reusing the existing `cluster_link_m` 8 km single-linkage
+  knob; `CATLAM` is used afterward, same as any other chain, for anchor gating
+  and wall placement -- it does not partition the clustering itself), ordered
+  by nearest-neighbour walk from a PCA-picked start (`order_marks_spatial`),
+  and given a lower confidence baseline (-0.2) than the existing bare-number
+  fallback (-0.1) since it has neither a parsed channel name nor a bare number
+  to order by. Because that walk order has no relation to true buoyage
+  direction, `center_chain`/`build_corridor`'s direction-dependent same-hand
+  offset and shoal wall are both skipped for `SPATIAL_KEY` chains
+  (`reliable_direction=False`) rather than risk guessing the wrong side.
+  Deduplication buckets `SPATIAL_KEY` marks by charted name instead of the
+  shared placeholder identity, so distinct nearby aids aren't merged.
 - A chain whose walls disconnect the corridor is rejected, not repaired.
 - `M_NSYS.ORIENT` is extracted but not yet used to cross-check direction of buoyage.
 - `_extract_buoyage_direction` could read `direction_deg` from an axis to light up the

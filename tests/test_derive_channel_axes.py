@@ -23,6 +23,7 @@ from derive_channel_axes import (
     dedupe_marks,
     center_chain,
     default_half_width_m,
+    load_marks,
     order_marks_spatial,
     parse_mark_name,
     polygon_skeleton,
@@ -395,6 +396,64 @@ class TestSpatialChainingFallback:
         ordered = order_marks_spatial(marks)
         xs = [m.pt.x for m in ordered]
         assert xs == sorted(xs)
+
+    def test_safe_water_marks_are_excluded_from_the_spatial_fallback(self):
+        # safe-water marks carry no CATLAM/hand -- they aren't lateral-channel
+        # evidence and must not enter SPATIAL_KEY chaining, only lateral marks
+        # (buoy/beacon) with an unparseable name should.
+        lateral = gpd.GeoDataFrame(
+            {"OBJNAM": ["Radar Reflector"], "CATLAM": [CATLAM_PORT], "src_objl": ["BOYLAT"], "src_cscl": [12000]},
+            geometry=[Point(0, 0)])
+        safe = gpd.GeoDataFrame(
+            {"OBJNAM": ["Historic Wreck"], "src_objl": ["BOYSAW"], "src_cscl": [12000]},
+            geometry=[Point(10, 10)])
+        marks, unparsed, unnamed = load_marks(lateral, safe)
+        assert unparsed == 2  # both names failed parsing and are counted
+        assert unnamed == 0
+        assert [m.name for m in marks] == ["Radar Reflector"]  # only the lateral one is chainable
+        assert marks[0].key == SPATIAL_KEY
+
+    def test_dedupe_keeps_distinct_named_spatial_marks_close_together(self):
+        # all SPATIAL_KEY marks share the placeholder (SPATIAL_KEY, 0, "") identity;
+        # dedupe must not collapse two different, unrelated aids just because
+        # they happen to sit within tol_m of each other (e.g. opposite banks of
+        # a narrow channel) -- only genuine same-name duplicates should merge.
+        a = Mark("Rock Ledge", SPATIAL_KEY, 0, "", CATLAM_PORT, "buoy", 12000, Point(0, 0))
+        b = Mark("Reef Marker", SPATIAL_KEY, 0, "", CATLAM_STARBOARD, "buoy", 12000, Point(30, 0))
+        out = dedupe_marks([a, b], tol_m=60.0)
+        assert len(out) == 2
+
+    def test_dedupe_still_merges_same_named_spatial_marks(self):
+        # the same real aid charted twice (overlapping cell coverage) shares a name
+        # and must still collapse to one, same as the parsed-name path does.
+        a = Mark("Rock Ledge", SPATIAL_KEY, 0, "", CATLAM_PORT, "buoy", 40000, Point(0, 0))
+        b = Mark("Rock Ledge", SPATIAL_KEY, 0, "", CATLAM_PORT, "buoy", 12000, Point(5, 5))
+        out = dedupe_marks([a, b], tol_m=60.0)
+        assert out == [b]  # smaller src_cscl (larger-scale cell) wins
+
+    def test_reliable_direction_false_skips_the_same_hand_offset(self):
+        # a walk order with no relation to true buoyage direction must not guess
+        # a side: same-hand pairs stay at the raw midpoint instead of being offset.
+        seq = [_mark(i * 300, 100, CATLAM_PORT, 2 * i + 1) for i in range(4)]
+        anchors = center_chain(seq, default_half_width_m(seq), reliable_direction=False)
+        assert all(a.pt.y == pytest.approx(100.0) for a in anchors)
+
+    def test_reliable_direction_false_skips_the_shoal_wall(self):
+        # mirrors TestCorridor.test_wrong_side_water_is_walled_off: that test's
+        # water sits only on the "wrong" (shoal) side of a reliable chain, and the
+        # wall there cuts it off entirely, leaving no valid corridor. With an
+        # unreliable direction, no wall is cut, so a route through that same
+        # water becomes possible again.
+        water = box(-200, 100, 3000, 400)
+        anchors = _straight_chain()
+        reliable, _, _ = build_corridor(anchors, water, _r_fn, wall_buffer_m=30.0)
+        unreliable, naive, radii = build_corridor(anchors, water, _r_fn, wall_buffer_m=30.0,
+                                                   reliable_direction=False)
+        assert unreliable is not None
+        if reliable is not None:
+            assert unreliable.area > reliable.area
+        line, reason = corridor_centerline(unreliable, anchors, naive, radii, hug=1.0)
+        assert reason is None and line is not None
 
     def test_parsed_and_bare_number_paths_unaffected(self, synthetic_dir):
         # regression: the existing named-channel path in the shared fixture (which

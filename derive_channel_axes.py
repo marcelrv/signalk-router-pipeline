@@ -478,7 +478,10 @@ def load_marks(lateral: gpd.GeoDataFrame, safe: gpd.GeoDataFrame) -> Tuple[List[
             if parsed is None:
                 if name and isinstance(name, str) and name.strip():
                     unparsed += 1
-                    marks.append(Mark(str(name).strip(), SPATIAL_KEY, 0, "", catlam, kind, cscl, pt, SPATIAL_KEY))
+                    # Safe-water marks carry no CATLAM/hand and aren't lateral-channel
+                    # evidence -- the spatial fallback is scoped to lateral marks only.
+                    if kind != "safe_water":
+                        marks.append(Mark(str(name).strip(), SPATIAL_KEY, 0, "", catlam, kind, cscl, pt, SPATIAL_KEY))
                 else:
                     unnamed += 1
                 continue
@@ -490,10 +493,20 @@ def load_marks(lateral: gpd.GeoDataFrame, safe: gpd.GeoDataFrame) -> Tuple[List[
 def dedupe_marks(marks: List[Mark], tol_m: float = 60.0) -> List[Mark]:
     """One mark per (channel, number, suffix) within ``tol_m``: keep the largest-scale
     cell's copy (smallest src_cscl). Overlapping usage bands and seasonal ("Ice")
-    replacements chart the same aid more than once."""
+    replacements chart the same aid more than once.
+
+    SPATIAL_KEY marks all share the placeholder identity ``(SPATIAL_KEY, 0, "")``,
+    so bucketing on that alone would collapse distinct, unrelated aids that merely
+    happen to sit within ``tol_m`` of each other (e.g. two different-named marks
+    on opposite banks of a narrow channel). Bucket those by their charted name
+    instead -- the same stand-in identity used for the same reason everywhere
+    else in this function -- so only genuine same-name duplicates (the same aid
+    charted twice across overlapping cell coverage) merge.
+    """
     by = collections.defaultdict(list)
     for m in marks:
-        by[(m.key, m.num, m.suf)].append(m)
+        key = (m.key, m.name) if m.key == SPATIAL_KEY else (m.key, m.num, m.suf)
+        by[key].append(m)
     out: List[Mark] = []
     for group in by.values():
         group.sort(key=lambda m: (m.cscl if m.cscl is not None else 10**9, m.name))
@@ -563,7 +576,8 @@ def _unit(p: Point, q: Point) -> Tuple[float, float]:
     return (dx / L, dy / L) if L > 0 else (0.0, 0.0)
 
 
-def center_chain(seq: List[Mark], default_half_width_m: float) -> List[Anchor]:
+def center_chain(seq: List[Mark], default_half_width_m: float,
+                 reliable_direction: bool = True) -> List[Anchor]:
     """Channel-centre estimate from an ordered mark sequence.
 
     Consecutive lateral marks of opposite hand straddle the channel: their midpoint
@@ -574,6 +588,14 @@ def center_chain(seq: List[Mark], default_half_width_m: float) -> List[Anchor]:
     (safe-water, preferred-channel) are centre points as they are. Directions come
     from the centre sequence itself, so an alternating-side chain (marks 3-4 km
     apart in a wide river) yields a straight centre line, not a zigzag.
+
+    ``reliable_direction`` must be False when ``seq``'s order isn't known to run
+    in the direction of increasing buoy number (e.g. a SPATIAL_KEY chain ordered
+    only by nearest-neighbour geometry): the same-hand offset below pushes toward
+    the channel using ``direction(i)``'s sign, and a walk order unrelated to real
+    buoyage direction can push a mark's centre point toward the wrong (shoal)
+    side just as easily as the right one. When unreliable, same-hand pairs are
+    left as the raw midpoint instead of guessing a side.
     """
     raw: List[Tuple[Point, List[Mark], bool]] = []
     prev: Optional[Mark] = None
@@ -615,7 +637,7 @@ def center_chain(seq: List[Mark], default_half_width_m: float) -> List[Anchor]:
         if hw is None:
             near = [widths[j] for j in range(max(0, i - 3), min(n, i + 4)) if widths[j] is not None]
             hw = float(np.median(near)) if near else chain_default
-        if len(marks) == 2 and not gate:
+        if len(marks) == 2 and not gate and reliable_direction:
             sx, sy = shoal_normal(direction(i), marks[0].catlam)
             pt = Point(pt.x - sx * hw, pt.y - sy * hw)
         anchors.append(Anchor(pt, list(marks), gate, hw))
@@ -672,12 +694,22 @@ def shoal_normal(direction: Tuple[float, float], catlam: int) -> Tuple[float, fl
     return left if catlam == CATLAM_PORT else right
 
 
-def build_corridor(chain: List[Anchor], water: Polygon | MultiPolygon, r_fn, wall_buffer_m: float
+def build_corridor(chain: List[Anchor], water: Polygon | MultiPolygon, r_fn, wall_buffer_m: float,
+                   reliable_direction: bool = True
                    ) -> Tuple[Optional[Polygon], LineString, List[float]]:
     """Corridor polygon for one chain: per-segment buffer of the centre polyline
     (radius from the local half width), clipped to charted water, minus a wall on
     the shoal side of every lateral mark so the axis passes each mark on its
     correct side. Returns (corridor, centre line, per-segment radius list).
+
+    ``reliable_direction`` must be False when the chain's walk order isn't known
+    to run in the direction of increasing buoy number (see ``center_chain``): the
+    wall goes on the shoal side as determined by ``shoal_normal(chain_direction(...),
+    catlam)``, and a walk order unrelated to real buoyage direction can place that
+    wall on the correct side of the corridor just as easily as the wrong one --
+    which would then force the derived axis past the mark on the wrong side. When
+    unreliable, no walls are cut; the corridor is the plain buffered, water-clipped
+    strip with no per-mark side constraint.
     """
     pts = [a.pt for a in chain]
     naive = LineString([(p.x, p.y) for p in pts])
@@ -693,16 +725,17 @@ def build_corridor(chain: List[Anchor], water: Polygon | MultiPolygon, r_fn, wal
         corridor = corridor.intersection(water)
     walls = []
     done = set()
-    for i, a in enumerate(chain):
-        r_local = max(radii[max(0, i - 1)], radii[min(len(radii) - 1, i)]) if radii else 100.0
-        d = chain_direction(chain, i)
-        for m in a.marks:
-            if not m.lateral or id(m) in done:
-                continue
-            done.add(id(m))
-            nx_, ny_ = shoal_normal(d, m.catlam)
-            far = (m.pt.x + nx_ * (r_local + 50.0), m.pt.y + ny_ * (r_local + 50.0))
-            walls.append(LineString([(m.pt.x, m.pt.y), far]).buffer(wall_buffer_m))
+    if reliable_direction:
+        for i, a in enumerate(chain):
+            r_local = max(radii[max(0, i - 1)], radii[min(len(radii) - 1, i)]) if radii else 100.0
+            d = chain_direction(chain, i)
+            for m in a.marks:
+                if not m.lateral or id(m) in done:
+                    continue
+                done.add(id(m))
+                nx_, ny_ = shoal_normal(d, m.catlam)
+                far = (m.pt.x + nx_ * (r_local + 50.0), m.pt.y + ny_ * (r_local + 50.0))
+                walls.append(LineString([(m.pt.x, m.pt.y), far]).buffer(wall_buffer_m))
     if walls:
         corridor = corridor.difference(unary_union(walls))
     polys = _flatten_polygons(corridor)
@@ -1127,9 +1160,10 @@ class ChannelAxisDeriver:
         km = 0.0
         reasons = collections.Counter()
         for key, group in by_key.items():
+            reliable_direction = key != SPATIAL_KEY
             for cluster in cluster_marks(group, p.cluster_link_m):
                 seq = order_marks_spatial(cluster) if key == SPATIAL_KEY else order_marks(cluster)
-                anchors = center_chain(seq, default_half_width_m(seq))
+                anchors = center_chain(seq, default_half_width_m(seq), reliable_direction=reliable_direction)
                 for chain in split_anchors(anchors, p.max_mark_gap_m, p.max_turn_deg):
                     n_chains += 1
                     chain_marks = list({id(m): m for a in chain for m in a.marks}.values())
@@ -1141,7 +1175,8 @@ class ChannelAxisDeriver:
                                          else chain[0].pt.buffer(1).exterior, 3, name, "too_few_marks",
                                          {"n_marks": len(chain_marks)})
                         continue
-                    ok, reason = self._derive_one_chain(chain, chain_marks, name, convention_odd_port)
+                    ok, reason = self._derive_one_chain(chain, chain_marks, name, convention_odd_port,
+                                                        reliable_direction=reliable_direction)
                     if ok:
                         n_ok += ok[0]
                         km += ok[1]
@@ -1154,7 +1189,7 @@ class ChannelAxisDeriver:
                     n_chains, n_ok, km, n_rej, dict(reasons), time.time() - t0)
 
     def _derive_one_chain(self, chain: List[Anchor], chain_marks: List[Mark], name: str,
-                          convention_odd_port: bool):
+                          convention_odd_port: bool, reliable_direction: bool = True):
         p = self.p
 
         def r_fn(half_width):
@@ -1173,7 +1208,8 @@ class ChannelAxisDeriver:
         depth_ref = float(np.median(mark_depths)) if mark_depths else None
         tightened = False
         try:
-            corridor, naive, radii = build_corridor(chain, water, r_fn, wall_buffer)
+            corridor, naive, radii = build_corridor(chain, water, r_fn, wall_buffer,
+                                                    reliable_direction=reliable_direction)
             if corridor is None:
                 self._reject(naive_line, 3, name, "corridor_empty", {"n_marks": len(chain_marks)})
                 return None, "corridor_empty"
