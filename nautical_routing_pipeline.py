@@ -3515,7 +3515,7 @@ class NauticalRoutingPipeline:
         if geom is None or geom.is_empty:
             return None
         try:
-            hits = channel_axes_gdf.sindex.query(geom, predicate="intersects")
+            hits = sorted(channel_axes_gdf.sindex.query(geom, predicate="intersects"))
             candidates = channel_axes_gdf.iloc[hits]
         except Exception:
             candidates = channel_axes_gdf[channel_axes_gdf.intersects(geom)]

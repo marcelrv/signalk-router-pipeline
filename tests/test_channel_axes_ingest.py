@@ -198,6 +198,17 @@ class TestExtractBuoyageDirection:
                                 crs="EPSG:4326")
         assert NauticalRoutingPipeline._extract_buoyage_direction(row, axes) is None
 
+    def test_two_intersecting_axes_pick_first_gdf_row_deterministically(self):
+        # sindex.query() may return hit positions in spatial-index (not GeoDataFrame)
+        # order; the result must still match the first row of channel_axes_gdf,
+        # not whatever order the R-tree happens to traverse.
+        row = self._fairway_row(self._fairway_poly())
+        axes = gpd.GeoDataFrame({"direction_deg": [45.0, 200.0]},
+                                geometry=[LineString([(3.706, 51.446), (3.707, 51.447)]),
+                                          LineString([(3.705, 51.445), (3.7055, 51.4455)])],
+                                crs="EPSG:4326")
+        assert NauticalRoutingPipeline._extract_buoyage_direction(row, axes) == 45
+
 
 class TestNavmeshCarveFastPath:
     """CodeRabbit (PR #24): when derived axes are excluded from the navmesh carve, a

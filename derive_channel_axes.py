@@ -830,7 +830,12 @@ class NavSystemsIndex:
             self.tree = STRtree(self.geoms)
 
     def orient_near(self, geom) -> Optional[float]:
-        """Median ORIENT of nav-system polygons overlapping ``geom``, or None."""
+        """Circular-mean ORIENT of nav-system polygons overlapping ``geom``, or None.
+
+        A plain median treats bearings as linear, so 350 deg and 10 deg would
+        average to 180 deg instead of ~0 deg; average unit vectors instead so
+        wraparound near north doesn't produce a bogus mismatch.
+        """
         if not self.ok:
             return None
         vals = []
@@ -839,7 +844,10 @@ class NavSystemsIndex:
             v = self.orients[i]
             if not np.isnan(v) and self.geoms[i].intersects(geom):
                 vals.append(v)
-        return float(np.median(vals)) if vals else None
+        if not vals:
+            return None
+        rad = np.radians(vals)
+        return float(np.degrees(np.arctan2(np.mean(np.sin(rad)), np.mean(np.cos(rad))))) % 360.0
 
 
 class LayerIndex:
