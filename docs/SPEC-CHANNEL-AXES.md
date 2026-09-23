@@ -10,8 +10,8 @@ Deployment caveat: `channel_axis_deadend_stitch_m` (`--channel-axis-deadend-stit
 opt-in `--channel-axis-deadend-stitch-m <m>`, which requires `--channel-axes`); the deployed builds
 (MD #49, Zeeland #50) pass `--channel-axis-deadend-stitch-m 1500.0` explicitly on the command
 line (see BUILD_LOG). A build without that flag has no dead-end stitching.
-Still open (not built): `_extract_buoyage_direction` (stub), spatial-chaining fallback for
-unparseable buoy names; see `docs/ROADMAP.md`.
+Still open (not built): `_extract_buoyage_direction` (stub); see `docs/ROADMAP.md`.
+Spatial-chaining fallback for unparseable buoy names (§9) is implemented.
 Supersedes the mechanism sketched in `docs/archive/SPEC-FAIRWAY-DEDUP.md` (moved to docs/archive/ 2026-09-21) (whose measurements
 of fairway/skeleton duplication remain valid and are reused here).
 Complements: `SPEC-GRAPH-DENSITY.md` §4.3/§6.3 (axis-dedup, carve-reconnect),
@@ -228,8 +228,12 @@ axes + 64 chain axes (101 km; 28 further chains dropped as duplicates of charted
 
 ## 9. Known limits / follow-ups
 
-- Unparseable names (4 % US, 13 % NL) are not chained; a spatial-chaining fallback at
-  low confidence is a natural extension.
+- Unparseable names (4 % US, 13 % NL) **IMPLEMENTED**: grouped by `CATLAM` hand +
+  spatial proximity under `SPATIAL_KEY` (reusing the existing `cluster_link_m` 8 km
+  single-linkage knob), ordered by nearest-neighbour walk from a PCA-picked start
+  (`order_marks_spatial`), and given a lower confidence baseline (-0.2) than the
+  existing bare-number fallback (-0.1) since it has neither a parsed channel name
+  nor a bare number to order by.
 - A chain whose walls disconnect the corridor is rejected, not repaired.
 - `M_NSYS.ORIENT` is extracted but not yet used to cross-check direction of buoyage.
 - `_extract_buoyage_direction` could read `direction_deg` from an axis to light up the
