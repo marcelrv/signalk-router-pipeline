@@ -17,7 +17,9 @@ from derive_channel_axes import (
     CATLAM_STARBOARD,
     ChannelAxisDeriver,
     Mark,
+    NavSystemsIndex,
     Params,
+    _angle_diff_deg,
     build_corridor,
     corridor_centerline,
     dedupe_marks,
@@ -117,6 +119,46 @@ class TestPolygonSkeleton:
 
 def _mark(x, y, catlam, num, key="test channel", kind="buoy", cscl=12000, suf=""):
     return Mark(f"Test Channel Buoy {num}{suf}", key, num, suf, catlam, kind, cscl, Point(x, y))
+
+
+class TestNavSystemsIndex:
+    def test_angle_diff_wraps_across_north(self):
+        assert _angle_diff_deg(10.0, 350.0) == pytest.approx(20.0)
+        assert _angle_diff_deg(90.0, 100.0) == pytest.approx(10.0)
+        assert _angle_diff_deg(0.0, 180.0) == pytest.approx(180.0)
+
+    def test_orient_near_returns_none_without_orient_column(self):
+        idx = NavSystemsIndex(gpd.GeoDataFrame(geometry=[box(0, 0, 100, 100)]))
+        assert idx.orient_near(box(10, 10, 20, 20)) is None
+
+    def test_orient_near_returns_none_when_empty(self):
+        idx = NavSystemsIndex(gpd.GeoDataFrame(geometry=[]))
+        assert idx.orient_near(box(10, 10, 20, 20)) is None
+
+    def test_orient_near_matches_overlapping_polygon_only(self):
+        gdf = gpd.GeoDataFrame({"ORIENT": [90.0, 200.0]},
+                               geometry=[box(0, 0, 100, 100), box(1000, 1000, 1100, 1100)])
+        idx = NavSystemsIndex(gdf)
+        assert idx.orient_near(box(10, 10, 20, 20)) == pytest.approx(90.0)
+        assert idx.orient_near(box(5000, 5000, 5010, 5010)) is None
+
+    def test_orient_near_wraps_across_north_instead_of_a_linear_median(self):
+        # a plain median of [350, 10] is 180 -- exactly opposite both inputs.
+        # The circular mean must land near 0/360 instead.
+        gdf = gpd.GeoDataFrame({"ORIENT": [350.0, 10.0]},
+                               geometry=[box(0, 0, 100, 100), box(0, 0, 100, 100)])
+        idx = NavSystemsIndex(gdf)
+        result = idx.orient_near(box(10, 10, 20, 20))
+        assert result == pytest.approx(0.0, abs=1e-6) or result == pytest.approx(360.0, abs=1e-6)
+
+    def test_orient_near_returns_none_for_opposing_orientations(self):
+        # 0 and 180 cancel to a near-zero resultant vector -- arctan2 on that is
+        # numerically meaningless (could return ~90 despite neither input saying
+        # so), so this must be treated as unavailable, not averaged.
+        gdf = gpd.GeoDataFrame({"ORIENT": [0.0, 180.0]},
+                               geometry=[box(0, 0, 100, 100), box(0, 0, 100, 100)])
+        idx = NavSystemsIndex(gdf)
+        assert idx.orient_near(box(10, 10, 20, 20)) is None
 
 
 class TestMarkHelpers:
@@ -323,6 +365,62 @@ class TestEndToEnd:
         axes = gpd.read_file(d / dca.OUTPUT_AXES)
         assert list(axes["axis_kind"]) == ["polygon_centerline"]
         assert os.path.exists(d / dca.OUTPUT_REJECTED)
+
+
+class TestOrientCrossCheck:
+    """SPEC-CHANNEL-AXES.md §9: a tier-3 mark-chain axis overlapping an M_NSYS
+    (nav_systems) polygon whose ORIENT disagrees with the axis's own derived
+    direction_deg takes the same -0.1 confidence penalty as a parity mismatch."""
+
+    UTM = "EPSG:32631"
+    X0, Y0 = 550000.0, 5700000.0
+
+    def _make_dir(self, tmp_path, synthetic_dir, orient_deg, name):
+        d = tmp_path / name
+        d.mkdir()
+        for f in ("coastal_water_polygons.geojson", "land_polygons.geojson",
+                  "depare_polygons.geojson", "fairways_polygons.geojson",
+                  "lateral_marks_points.geojson"):
+            (d / f).write_bytes((synthetic_dir / f).read_bytes())
+        nav_poly = box(self.X0, self.Y0, self.X0 + 6000, self.Y0 + 3000)
+        _to_wgs(gpd.GeoDataFrame({"ORIENT": [orient_deg]}, geometry=[nav_poly], crs=self.UTM)
+               ).to_file(d / "nav_systems_polygons.geojson", driver="GeoJSON")
+        return d
+
+    def _chain_row(self, d):
+        axes = gpd.read_file(d / dca.OUTPUT_AXES)
+        return axes[axes["axis_kind"] == "mark_chain"].iloc[0]
+
+    def test_matching_orient_no_penalty(self, tmp_path, synthetic_dir):
+        # the synthetic chain runs west->east (bearing ~90 deg); 95 deg is well within
+        # ORIENT_MISMATCH_TOLERANCE_DEG.
+        d = self._make_dir(tmp_path, synthetic_dir, orient_deg=95.0, name="orient_match")
+        ChannelAxisDeriver(str(d), str(d), Params()).run()
+        row = self._chain_row(d)
+        assert bool(row["orient_mismatch"]) is False
+        assert row["confidence"] >= 0.8
+
+    def test_mismatched_orient_lowers_confidence(self, tmp_path, synthetic_dir):
+        matched = self._make_dir(tmp_path, synthetic_dir, orient_deg=95.0, name="orient_ok")
+        ChannelAxisDeriver(str(matched), str(matched), Params()).run()
+        matched_row = self._chain_row(matched)
+
+        mismatched = self._make_dir(tmp_path, synthetic_dir, orient_deg=270.0, name="orient_bad")
+        ChannelAxisDeriver(str(mismatched), str(mismatched), Params()).run()
+        mismatched_row = self._chain_row(mismatched)
+
+        assert bool(matched_row["orient_mismatch"]) is False
+        assert bool(mismatched_row["orient_mismatch"]) is True
+        assert mismatched_row["confidence"] == pytest.approx(matched_row["confidence"] - 0.1, abs=1e-6)
+
+    def test_no_nav_systems_layer_defaults_no_mismatch(self, synthetic_dir):
+        # synthetic_dir (the base fixture used throughout this file) carries no
+        # nav_systems_polygons.geojson at all -- must stay a no-op, same discipline
+        # as every other optional-layer path in this deriver.
+        out = synthetic_dir / "out_no_nav"
+        ChannelAxisDeriver(str(synthetic_dir), str(out), Params()).run()
+        row = self._chain_row(out)
+        assert bool(row["orient_mismatch"]) is False
 
 
 class TestCli:

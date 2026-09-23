@@ -86,6 +86,19 @@ CATLAM_STARBOARD = 2
 CATLAM_PREF_STARBOARD = 3   # preferred channel to starboard (junction mark)
 CATLAM_PREF_PORT = 4        # preferred channel to port (junction mark)
 
+# S-57 M_NSYS.ORIENT: direction of buoyage, degrees. A tier-3 axis whose own
+# derived direction_deg disagrees with an overlapping nav-system polygon's ORIENT
+# by more than this is flagged (SPEC-CHANNEL-AXES.md §9) -- generous enough that
+# one ORIENT value covering a whole system and a locally-hugging axis don't
+# spuriously disagree.
+ORIENT_MISMATCH_TOLERANCE_DEG = 45.0
+
+
+def _angle_diff_deg(a: float, b: float) -> float:
+    """Smallest angle between two compass bearings, 0..180."""
+    d = abs(a - b) % 360.0
+    return min(d, 360.0 - d)
+
 # US Coast Guard naming: "<channel> [Lighted] [Ice] <Buoy|Daybeacon|Light|...> <num>[suffix]".
 _US_MARK_RE = re.compile(
     r"^(?P<chan>.+?)\s+(?:Lighted\s+)?(?:Ice\s+)?(?:Seasonal\s+)?"
@@ -805,6 +818,42 @@ class DepthSampler:
         return (float(np.median(have)) if have else None), miss
 
 
+class NavSystemsIndex:
+    """Bbox-indexed access to M_NSYS (navigation-system) polygons carrying ORIENT
+    (direction of buoyage, degrees) -- SPEC-CHANNEL-AXES.md §9 ORIENT cross-check."""
+
+    def __init__(self, gdf_m: Optional[gpd.GeoDataFrame]):
+        self.ok = gdf_m is not None and not gdf_m.empty and "ORIENT" in gdf_m.columns
+        if self.ok:
+            self.geoms = list(gdf_m.geometry.values)
+            self.orients = pd.to_numeric(gdf_m["ORIENT"], errors="coerce").to_numpy()
+            self.tree = STRtree(self.geoms)
+
+    def orient_near(self, geom) -> Optional[float]:
+        """Circular-mean ORIENT of nav-system polygons overlapping ``geom``, or None.
+
+        A plain median treats bearings as linear, so 350 deg and 10 deg would
+        average to 180 deg instead of ~0 deg; average unit vectors instead so
+        wraparound near north doesn't produce a bogus mismatch.
+        """
+        if not self.ok:
+            return None
+        vals = []
+        for i in self.tree.query(geom):
+            i = int(i)
+            v = self.orients[i]
+            if not np.isnan(v) and self.geoms[i].intersects(geom):
+                vals.append(v)
+        if not vals:
+            return None
+        rad = np.radians(vals)
+        mean_sin = float(np.mean(np.sin(rad)))
+        mean_cos = float(np.mean(np.cos(rad)))
+        if np.hypot(mean_sin, mean_cos) < 1e-12:
+            return None
+        return float(np.degrees(np.arctan2(mean_sin, mean_cos))) % 360.0
+
+
 class LayerIndex:
     """Bbox-indexed access to big polygon layers (coastal_water, land)."""
 
@@ -960,6 +1009,7 @@ class ChannelAxisDeriver:
         self.water = LayerIndex(self.gdfs["coastal_water"])
         self.land = LayerIndex(self.gdfs["land"])
         self.depth = DepthSampler(self.gdfs["depth_areas"])
+        self.nav_systems = NavSystemsIndex(self.gdfs["nav_systems"])
         self.tier1_lines: List[LineString] = []
         for g in self.gdfs["inland_waterways"].geometry.values:
             self.tier1_lines.extend(_flatten_lines(g))
@@ -1210,6 +1260,8 @@ class ChannelAxisDeriver:
                 continue
             depth_med, miss = self.depth.along(wp, p.sample_step_m)
             depth_checked = depth_med is not None and miss <= 0.5
+            orient_val = self.nav_systems.orient_near(wp) if tier == 3 else None
+            orient_mismatch = orient_val is not None and _angle_diff_deg(direction, orient_val) > ORIENT_MISMATCH_TOLERANCE_DEG
             conf = confidence
             if tier == 3:
                 if not depth_checked:
@@ -1219,6 +1271,8 @@ class ChannelAxisDeriver:
                                  {**extra, "depth_axis": depth_med, "depth_marks": depth_ref})
                     reasons["shallower_than_marks"] += 1
                     continue
+                if orient_mismatch:
+                    conf -= 0.1
             conf = float(np.clip(conf, 0.0, 1.0))
             cov: List[LineString] = []
             if 1 in coverage_tiers:
@@ -1246,6 +1300,7 @@ class ChannelAxisDeriver:
                     corridor_width_m=round(width_m, 1),
                     depth_median_m=None if depth_med is None else round(depth_med, 2),
                     depth_checked=bool(depth_checked), dedup_removed_m=round(removed, 1),
+                    orient_mismatch=bool(orient_mismatch),
                 )
                 for k, v in extra.items():
                     props[k] = None if v is None or (isinstance(v, float) and math.isnan(v)) else v
