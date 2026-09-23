@@ -123,7 +123,7 @@ router are aware of it:
 | 5 | Human/AI-curated override, after human sign-off | Tier-1-equivalent for that specific location |
 | 6 | AIS/vessel-density–derived candidate track | Soft preference / anomaly signal only, never a hard safety constraint on its own |
 
-A region ships as soon as tiers 1–4 connect it, with lower-tier stretches
+**Future policy target** (tiers 3–4 are not implemented yet, see table above): a region ships as soon as tiers 1–4 connect it, with lower-tier stretches
 clearly marked so a consumer can render or weight them differently — a
 graph that's honest about its gaps and improves over time, rather than one
 that looks equally confident everywhere and occasionally isn't.

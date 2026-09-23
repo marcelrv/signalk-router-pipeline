@@ -50,10 +50,12 @@ the server ignores it.
 import base64
 import hashlib
 import http.client
+import ipaddress
 import json
 import os
 import re
 import socket
+import sys
 import threading
 import time
 import urllib.parse
@@ -404,6 +406,15 @@ class LocalOpenAIBackend:
         self.audit = audit
         api_key = api_key or os.environ.get("LOCAL_LLM_API_KEY")
         self.headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+        if api_key:
+            host, _, https, _ = _split_url(self.url)
+            try:
+                is_loopback = ipaddress.ip_address(host).is_loopback
+            except ValueError:
+                is_loopback = host == "localhost"
+            if not https and not is_loopback:
+                print(f"warning: bearer API key is sent in cleartext to {host}; "
+                      "use https:// to protect it", file=sys.stderr)
         self._transport = transport or urllib_transport
         self._sleep = sleep
         self.max_concurrency = max(1, min(MAX_CONCURRENCY, max_concurrency))
@@ -565,6 +576,11 @@ class LocalOpenAIBackend:
                 attempt["error"] = last_reason
                 continue
             verdicts, problems = validate_answer(parsed, context)
+            if verdicts and all(n in problems for n in verdicts):
+                last_reason = ("no candidate of this tile has a usable verdict "
+                               f"in the reply: {problems}")[:MAX_WHY_CHARS]
+                attempt["error"] = last_reason
+                continue
             return verdicts, problems
         return None, {"_reply": last_reason}
 

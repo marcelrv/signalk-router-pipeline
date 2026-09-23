@@ -2121,23 +2121,7 @@ In priority order, by measured impact:
    - The depth-margin cost the original 5.0m tuning note quantified
      (navmesh-boundary edges <3.0m: 0.9% no-pass → 3.9% at 5.0m → 6.0% at 15.0m)
      has NOT been re-measured for this algorithm; that needs a real regional build
-     (§10.7, ROADMAP item 9). **Recommended first arm: 15m.** Still open: items 2–3.] Primary fix — navmesh boundary ring simplification, mirroring §9's proven
-   pattern.** `NAVMESH_BOUNDARY_SIMPLIFY_M` (originally a fixed constant, 5.0m, not
-   a CLI flag) is the direct analogue of `skeleton_boundary_simplify_m`. Either (a)
-   raise the constant, or (b) parameterize it as a new CLI flag
-   (`--navmesh-boundary-simplify-m`), defaulting to today's 5.0m for byte-identical
-   output, tunable upward for real builds. **Caveat, flagged explicitly**: unlike
-   skeleton edges, navmesh-boundary (`EDGE_KIND_NAVMESH_BOUNDARY`) edges are in the
-   *lenient* bucket of `_sanity_check_no_land_crossings` (confirmed directly,
-   ~line 6322: "Navmesh fallback edges... don't set `is_placeholder`, so they fall
-   into the lenient 'skeleton' bucket... never stripped") — there is **no
-   automatic strip-on-land-crossing safety net** for these edges, unlike skeleton
-   edges' rasterize+land-mask re-intersection. Any tolerance increase needs its own
-   land-crossing validation on real extracted geometry before shipping (same
-   discipline as §9.2, not synthetic fixtures alone). The original 5.0m tuning note
-   (line 696-703) already found navmesh-boundary edges under 3.0m rose from 0.9%
-   (no-pass) to 3.9% (5.0m) to 6.0% (15.0m) — a real, quantified, non-zero
-   depth-safety-margin cost that needs re-measuring at whatever tolerance is tried.
+     (§10.7, ROADMAP item 9). **Recommended first arm: 15m.** Still open: items 2–3.]
 2. **Alternative/complementary — direct chain-contraction post-process**, exactly
    as simulated in §10.4.4: after `build_navmesh_region` registers ring
    nodes/edges (and after `_stitch_component_pieces` adds any cross-type

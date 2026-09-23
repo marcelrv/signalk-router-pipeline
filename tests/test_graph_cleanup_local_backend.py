@@ -115,6 +115,24 @@ def test_json_schema_and_thinking_flags(tmp_path):
         ["keep", "drop", "unsure"]
 
 
+def test_api_key_over_cleartext_http_warns(capsys):
+    LocalOpenAIBackend(base_url="http://192.168.10.111:8000/v1", api_key="sekret",
+                       transport=FakeTransport({}))
+    assert "cleartext" in capsys.readouterr().err
+
+
+def test_api_key_over_https_does_not_warn(capsys):
+    LocalOpenAIBackend(base_url="https://example.com/v1", api_key="sekret",
+                       transport=FakeTransport({}))
+    assert capsys.readouterr().err == ""
+
+
+def test_api_key_over_loopback_http_does_not_warn(capsys):
+    LocalOpenAIBackend(base_url="http://127.0.0.1:8000/v1", api_key="sekret",
+                       transport=FakeTransport({}))
+    assert capsys.readouterr().err == ""
+
+
 def test_concurrency_is_clamped_to_server_slots():
     assert _backend(FakeTransport({}), max_concurrency=99).max_concurrency == MAX_CONCURRENCY
     assert _backend(FakeTransport({}), max_concurrency=0).max_concurrency == 1
@@ -348,6 +366,23 @@ def test_duplicate_key_reply_falls_back_to_all_unsure_after_one_resample(tmp_pat
 
 def test_duplicate_key_reply_can_recover_on_the_resample(tmp_path):
     t = FakeTransport(_resp(DUP), _resp(json.dumps(GOOD)))
+    assert _answer(_backend(t), _tile(tmp_path)) == GOOD
+
+
+def test_reply_wrapped_with_no_candidate_keys_is_retried_not_trusted(tmp_path):
+    wrapped = json.dumps({"answer": "GOOD"})
+    tile = _tile(tmp_path)
+    t = FakeTransport(_resp(wrapped))
+    b = _backend(t)
+    out = _answer(b, tile)
+    assert {v["verdict"] for v in out.values()} == {"unsure"}
+    assert len(t.calls) == 2
+    assert b.consume_degraded(tile) is True
+
+
+def test_reply_wrapped_with_no_candidate_keys_can_recover_on_the_resample(tmp_path):
+    wrapped = json.dumps({"answer": "GOOD"})
+    t = FakeTransport(_resp(wrapped), _resp(json.dumps(GOOD)))
     assert _answer(_backend(t), _tile(tmp_path)) == GOOD
 
 

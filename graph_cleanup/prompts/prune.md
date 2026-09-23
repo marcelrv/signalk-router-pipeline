@@ -64,13 +64,23 @@ merely nearby:
   leaves it genuinely undecidable.
 - If two answers seem equally good, answer `unsure`. `unsure` is treated as
   `keep`, so it is always the safe choice. Do not guess.
+- For a `small_component`, judge it by whether it sits in a separately
+  charted, real body of water (a cove, a side creek, a distinct pond) versus
+  having no visible water feature under it at all -- the latter is `drop`,
+  the former is `keep` even though it looks disconnected from the rest of
+  the graph shown (a missing connecting edge is not evidence the water itself
+  is fake).
 
 Your `why` must cite at least one concrete number from this candidate's
-`context.json` entry (`length_m`, `min_depth_m`, or `nearest_poi_m`) AND
-describe the specific geometry you see at THIS tip: which direction it points,
-what is immediately beyond the end of the line (open water, a named cove,
-solid land, a mudflat corner), and what makes its shape different from the
-stubs near it. A reason that does not name a number is not acceptable.
+`context.json` entry (`length_m`, `min_depth_m`, or `nearest_poi_m` for a
+`dead_end_stub`; `n_nodes` or `total_length_m` for a `small_component`) AND
+describe the specific geometry you see at THIS candidate: for a stub, which
+direction its tip points and what is immediately beyond the end of the line
+(open water, a named cove, solid land, a mudflat corner); for a component,
+the water body it sits in and whether that body looks real or like a
+rendering artifact. What you describe should make its shape different from
+other candidates near it. A reason that does not name a number is not
+acceptable.
 
 Do not restate a rule from this prompt as your reason. Sentences like "ends at
 a distinct, separately-shaped widening (a pocket/cove) of charted water, not
