@@ -151,6 +151,15 @@ class TestNavSystemsIndex:
         result = idx.orient_near(box(10, 10, 20, 20))
         assert result == pytest.approx(0.0, abs=1e-6) or result == pytest.approx(360.0, abs=1e-6)
 
+    def test_orient_near_returns_none_for_opposing_orientations(self):
+        # 0 and 180 cancel to a near-zero resultant vector -- arctan2 on that is
+        # numerically meaningless (could return ~90 despite neither input saying
+        # so), so this must be treated as unavailable, not averaged.
+        gdf = gpd.GeoDataFrame({"ORIENT": [0.0, 180.0]},
+                               geometry=[box(0, 0, 100, 100), box(0, 0, 100, 100)])
+        idx = NavSystemsIndex(gdf)
+        assert idx.orient_near(box(10, 10, 20, 20)) is None
+
 
 class TestMarkHelpers:
     def test_shoal_normal_port_is_left_of_buoyage_direction(self):
