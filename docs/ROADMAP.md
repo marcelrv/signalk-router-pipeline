@@ -98,7 +98,7 @@ the exact live commands are in `data/BUILD_LOG.md`.
 | Item | Doc / section | Status | Owner | Note |
 |---|---|---|---|---|
 | `_extract_buoyage_direction` (stub, `nautical_routing_pipeline.py:3064`) and `M_NSYS.ORIENT` | `docs/SPEC-CHANNEL-AXES.md` | open | pipeline | |
-| Spatial-chaining fallback for unparseable buoy names (4% US / 13% NL) | `docs/SPEC-CHANNEL-AXES.md` | open | pipeline | |
+| Spatial-chaining fallback for unparseable buoy names (4% US / 13% NL) | `docs/SPEC-CHANNEL-AXES.md` §9 | done | pipeline | lateral marks clustered by proximity (`SPATIAL_KEY`, `CATLAM` used afterward, not to partition), ordered by nearest-neighbour walk, no direction-dependent offset/wall, confidence -0.2 (lower than the existing bare-number fallback's -0.1) |
 | USACE IENC ingest (phases A/B/C), then National Channel Framework polygons | `docs/SPEC-USACE-IENC.md` | open | pipeline | Draft, not started |
 | Recommended-track probe (Great Lakes/NY) gating Option B, or close as "Option A stays" | `docs/SPEC-RECOMMENDED-TRACK.md` | open | pipeline | Draft |
 
