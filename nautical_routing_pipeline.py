@@ -5,6 +5,7 @@ import bisect
 import inspect
 import json
 import sqlite3
+import time
 import hashlib
 import logging
 import argparse
@@ -212,6 +213,39 @@ def _depare_candidate_beats(val, candidate_cscl, candidate_upper,
     return (_depare_candidate_sort_key(val, candidate_cscl, candidate_upper)
             > _depare_candidate_sort_key(best, best_cscl, best_upper))
 
+def _depare_point_depth(candidates, pt):
+    """Charted DEPARE depth at one point, shared by _edge_attr_worker (edge min_depth) and the hazard tiering
+    (_depare_depth_fn) so both use the same number. candidates: DEPARE rows (GeoDataFrame, DRVAL1 and optional
+    DRVAL2/src_cscl) near the point. Among the polygons containing pt the scale-aware winner is picked
+    (_depare_candidate_beats); an implausible drying DRVAL1 (< DRYING_BAND_IMPLAUSIBLE_DRVAL1_M) with a plausible
+    DRVAL2 is replaced by DRVAL2. Returns (depth, drval2, src_cscl) or None when no polygon with a DRVAL1 contains pt."""
+    best = None
+    best_upper = None
+    best_cscl = None
+    for _, row in candidates.iterrows():
+        geom = row.geometry
+        if geom is not None and geom.contains(pt):
+            val = row['DRVAL1']
+            if pd.notna(val):
+                val = float(val)
+                cscl = row['src_cscl'] if 'src_cscl' in row else None
+                row_cscl = int(cscl) if pd.notna(cscl) else None
+                upper = row['DRVAL2'] if 'DRVAL2' in row else None
+                row_upper = float(upper) if pd.notna(upper) else None
+                if _depare_candidate_beats(val, row_cscl, row_upper, best, best_cscl, best_upper):
+                    best = val
+                    best_upper = row_upper
+                    best_cscl = row_cscl
+    # See DRYING_BAND_IMPLAUSIBLE_DRVAL1_M: an implausibly extreme DRVAL1 (e.g. -50) with a plausible
+    # DRVAL2 is a coarse-band placeholder on the drying side, not a real reading -- the upper bound is
+    # the trustworthy one.
+    if (best is not None and best_upper is not None
+            and best < DRYING_BAND_IMPLAUSIBLE_DRVAL1_M
+            and best_upper >= DRYING_BAND_IMPLAUSIBLE_DRVAL1_M):
+        best = best_upper
+    return None if best is None else (best, best_upper, best_cscl)
+
+
 def _edge_attr_worker(edge_chunk):
     geod = _EDGE_ATTR_GEOD
     gdfs = _EDGE_ATTR_GDFS
@@ -223,8 +257,6 @@ def _edge_attr_worker(edge_chunk):
     bridges_gdf = gdfs.get('bridges', gpd.GeoDataFrame())
     fairways_gdf = gdfs.get('fairways', gpd.GeoDataFrame())
     locks_gdf = gdfs.get('locks', gpd.GeoDataFrame())
-    obstacles_gdf = gdfs.get('obstacles', gpd.GeoDataFrame())
-    obstacles_soft_gdf = gdfs.get('obstacles_soft', gpd.GeoDataFrame())
 
     results = {}
     for (u, v, u_lon, u_lat, v_lon, v_lat, edge_type, is_opening_bridge_edge,
@@ -265,34 +297,7 @@ def _edge_attr_worker(edge_chunk):
                         for i in range(5):
                             f = i / 4.0
                             pt = Point(u_lon + f*(v_lon-u_lon), u_lat + f*(v_lat-u_lat))
-                            best = None
-                            best_upper = None
-                            best_cscl = None
-                            for _, row in candidates.iterrows():
-                                geom = row.geometry
-                                if geom is not None and geom.contains(pt):
-                                    val = row['DRVAL1']
-                                    if pd.notna(val):
-                                        val = float(val)
-                                        cscl = row['src_cscl'] if 'src_cscl' in row else None
-                                        row_cscl = int(cscl) if pd.notna(cscl) else None
-                                        upper = row['DRVAL2'] if 'DRVAL2' in row else None
-                                        row_upper = float(upper) if pd.notna(upper) else None
-                                        if _depare_candidate_beats(val, row_cscl, row_upper,
-                                                                   best, best_cscl, best_upper):
-                                            best = val
-                                            best_upper = row_upper
-                                            best_cscl = row_cscl
-                            # See DRYING_BAND_IMPLAUSIBLE_DRVAL1_M: an implausibly
-                            # extreme DRVAL1 (e.g. -50) with a plausible DRVAL2 is a
-                            # coarse-band placeholder on the drying side, not a real
-                            # reading -- the upper bound is the trustworthy one.
-                            if (best is not None and best_upper is not None
-                                    and best < DRYING_BAND_IMPLAUSIBLE_DRVAL1_M
-                                    and best_upper >= DRYING_BAND_IMPLAUSIBLE_DRVAL1_M):
-                                best = best_upper
-                            sampled.append((best, best_upper, best_cscl) if best is not None
-                                           else (99.0, None, None))
+                            sampled.append(_depare_point_depth(candidates, pt) or (99.0, None, None))
                         min_val = min(d1 for d1, _, _ in sampled)
                         # A DRVAL1 of 0 is only meaningful when the band is tight.
                         # Offshore, the sole containing band is routinely
@@ -473,52 +478,15 @@ def _edge_attr_worker(edge_chunk):
                 closest_geom = land_metric.iloc[closest_idx].geometry
                 attrs['distance_to_land'] = round(edge_geom_metric.distance(closest_geom), 2)
 
-        # Obstacle crossing check — skipped for opening-bridge AND lock-crossing
-        # edges (same exemption already applied to crosses_land at edge-creation
-        # time in _add_opening_bridge_edges / _add_lock_crossing_edges): these are
-        # precise, deliberately-computed crossings of a bridge's actual navigable
-        # opening, or a lock chamber's actual gate positions, via fairway/waterway
-        # centerline intersection, not generic geometry. A broad obstacle polygon
-        # (e.g. a mariculture/marine-farm area) incidentally overlapping the
-        # bridge's/lock's footprint must not hard-block the one crossing point
-        # that exists specifically so vessels CAN pass through — that's the
-        # confirmed cause of a real Zeelandbrug regression (opening never
-        # explored at all, not merely deprioritized) that the lock case could
-        # equally suffer from.
+        # crosses_obstacle / hazard min_depth are NOT computed here: hazard
+        # classification and linking is one pass over the final edge set
+        # (NauticalRoutingPipeline._apply_hazards, shared hazards.py rules).
         attrs['crosses_obstacle'] = 0
-        if not is_opening_bridge_edge and not requires_lock and not obstacles_gdf.empty:
-            obs_candidates = _candidates_by_bounds_static(obstacles_gdf, edge_geom)
-            if not obs_candidates.empty:
-                intersecting = obs_candidates[obs_candidates.intersects(edge_geom)]
-                if not intersecting.empty:
-                    attrs['crosses_obstacle'] = 1
-
-        # Soft obstruction-point depth constraint (Round 18 Fix 2) — the
-        # VALSOU/WATLEV-downgraded subset of obstructions_points that
-        # _build_obstacle_layer routed to "obstacles_soft" instead of the hard
-        # "obstacles" layer above. These aren't dropped from routing consideration
-        # entirely: fold the charted sounding (or the conservative WATLEV==3/4
-        # default of 0.0m — see _obstruction_depth_disposition) into min_depth,
-        # same exemption for opening-bridge/lock-crossing edges as the hard check.
-        if not is_opening_bridge_edge and not requires_lock and not obstacles_soft_gdf.empty:
-            soft_candidates = _candidates_by_bounds_static(obstacles_soft_gdf, edge_geom)
-            if not soft_candidates.empty:
-                soft_intersecting = soft_candidates[soft_candidates.intersects(edge_geom)]
-                if not soft_intersecting.empty:
-                    soft_min = float(soft_intersecting['_depth_constraint'].min())
-                    # A charted sounding always wins over UNKNOWN_DEPTH: a plain
-                    # min() would keep UNKNOWN_DEPTH and silently discard the
-                    # constraint, since it sorts below any real (or drying) depth.
-                    # Compare by identity, not `< 0` -- a genuine drying height is
-                    # also negative and must still take part in the min() below.
-                    attrs['min_depth'] = (soft_min if attrs['min_depth'] == UNKNOWN_DEPTH
-                                          else min(attrs['min_depth'], soft_min))
 
         results[(u, v)] = attrs
     return results
 
 COORD_SPACE = 36000000
-OBSTACLE_BUFFER_METERS = 5
 # The fairway cost-factor test below (_edge_attr_worker) checks a bare
 # `intersects()` between each final graph edge's straight chord and the
 # fairway/inland-waterway reference layer. inland_waterways entries are
@@ -578,6 +546,9 @@ UNKNOWN_DEPTH = -999.0
 # depth_unknown_sentinel column, not itself load-bearing for depth semantics
 # (see UNKNOWN_DEPTH above; do not let a consumer start gating on it again).
 DEPTH_SENTINEL_SCHEMA_VERSION = 2
+# Schema 3 = schema 2 + notices / edge_notices / node_notices (docs/SPEC-HAZARDS-AND-NOTICES.md); written only when
+# the build ran with --hazard-cells-dir. The router ignores unknown tables and does not gate on schema_version.
+HAZARDS_SCHEMA_VERSION = 3
 # A DEPARE band of DRVAL1=0 with an upper bound at least this deep carries no
 # usable minimum -- it is a coarse "0 to X" band, not a survey saying 0m.
 COARSE_DEPTH_BAND_DRVAL2_M = 10.0
@@ -1484,91 +1455,127 @@ def _s57_get_val(attrs, *candidates):
         return val[0] if len(val) > 0 else None
     return val
 
-def _is_entry_prohibited(row):
-    restrn = _s57_col(row, 'restrn')
-    if _is_valid(restrn):
-        vals = restrn if isinstance(restrn, (list, tuple, np.ndarray)) else [restrn]
-        for v in vals:
-            try:
-                if int(v) == 1:
-                    return True
-            except (ValueError, TypeError):
-                pass
-    for col in ('OBJNAM', 'NOBJNM', 'INFORM'):
-        val = _s57_col(row, col)
-        if val is not None and isinstance(val, str):
-            lower = val.lower()
-            if any(phrase in lower for phrase in ('entry prohibited', 'toegang verboden', 'passage prohibited')):
-                return True
-    return False
+def _depth_area_fn(depth_gdf):
+    """depth_fn(lon, lat) for hazards.tier_records: the same per-point charted DEPARE depth the edge min_depth
+    uses (_depare_point_depth: scale-aware candidate choice, implausible drying DRVAL1 -> DRVAL2). A coarse
+    zero band (DRVAL1 == 0 with a wide DRVAL2 or a coarse source scale), which the edges report as
+    UNKNOWN_DEPTH, and points no polygon covers give None (unknown)."""
+    if depth_gdf is None or depth_gdf.empty or "DRVAL1" not in depth_gdf.columns:
+        return lambda lon, lat: None
+    from shapely import STRtree
+    geoms = list(depth_gdf.geometry)
+    tree = STRtree(geoms)
 
-def _obstruction_depth_disposition(row):
-    """S-57-grounded classification of a single feature from the raw
-    `obstructions_points` layer (OBJL 86) into hard-block vs depth-constraint.
+    def depth_at(lon, lat):
+        pt = Point(lon, lat)
+        idx = tree.query(pt, predicate="intersects").tolist()
+        if not idx:
+            return None
+        res = _depare_point_depth(depth_gdf.iloc[sorted(idx)], pt)
+        if res is None:
+            return None
+        d1, d2, cs = res
+        if d1 == 0.0 and ((d2 is not None and d2 >= COARSE_DEPTH_BAND_DRVAL2_M)
+                          or (cs is not None and cs > TRUSTED_SURVEY_CSCL_MAX)):
+            return None
+        return d1
+    return depth_at
 
-    NOAA-scale charts carry thousands of these (2,835 for the Puerto Rico
-    build vs 3 genuine obstructions in the Zeeland pilot) -- hard-blocking
-    every one of them (the pre-Round-18 behavior) shreds coastal
-    connectivity (1,161 obstacle-blocked edges, San Juan<->Fajardo
-    unroutable) for features that a shallow-draft vessel can often safely
-    cross.
 
-    - `VALSOU` (charted least depth over the obstruction) present, any
-      `WATLEV`: not a hard block -- fold the sounding into the edge's
-      `min_depth` (`min(min_depth, VALSOU)`) so a deep-draft ship is
-      stopped but a shallow-draft one is not. This is the normal case for
-      a swept/surveyed wreck or obstruction and takes priority over WATLEV
-      below (a feature with a real sounding is by definition not "always
-      dry" -- soundings aren't taken on land).
-    - No `VALSOU` and `WATLEV == 3` (always under water): still a real
-      hazard -- this is the dominant case in the PR data (1,928 of 2,835
-      features, unswept rocks/wrecks with no sounding) -- but hard-
-      blocking every single one is exactly the connectivity-shredding
-      defect this function exists to fix. Route around it via a
-      conservative default depth constraint instead (0.0m) rather than a
-      hard block: deep-draft routing avoids the edge (min_depth=0 fails
-      any real draft check) while the edge stays usable for the warning
-      system instead of vanishing from the graph outright.
-    - No `VALSOU` and `WATLEV` in {1 (partly submerged), 2 (always dry),
-      5 (awash)}, or `WATLEV` missing/unrecognized (e.g. 7="floating" —
-      not covered by the brief's dry/awash/underwater/covers-uncovers
-      set, so treated with the same conservative fallback as unknown):
-      keep the existing hard block -- there is no depth number to route
-      around, and the feature is a genuine surface/near-surface hazard
-      that isn't well modeled as "min_depth=0 but otherwise passable".
-    - No `VALSOU` and `WATLEV == 4` (covers/uncovers): same conservative
-      depth-constraint treatment as WATLEV==3, not a hard block. This is
-      not explicitly called out in the WATLEV list above, but it matches
-      this codebase's own established precedent for exactly this
-      situation -- charted DEPARE drying/intertidal bands (DRVAL1 < 0.0)
-      are handled elsewhere as a depth constraint (clamped to 0.0 in
-      min_depth), never a hard block (see the Round 9 "DEPARE-drying gap"
-      fix referenced in NEXT_PHASES.md) -- and "covers and uncovers" is
-      the same tidal-varying category as a drying flat, not a permanent
-      surface obstruction like "always dry"/"awash". 887 of PR's 2,835
-      obstruction points (31%) carry WATLEV==4, so this reading matters
-      materially; verified against the route probes, not just asserted.
+def link_graph_hazards(graph, records, axes=None):
+    """Link tiered hazard records (hazards.tier_records) to the final graph and apply their effects in place.
 
-    Returns (is_hard_block: bool, depth_constraint_m: float | None).
+    One undirected geometry per node pair (the two directed edges of a pair share it, so each pair is linked once).
+    Effects per directed edge, mirroring navline_agent/navlines_to_db.py:
+      - effective severity 3 -> crosses_obstacle = 1; severity 2 -> min_depth = min(min_depth, hazard depth)
+        (record depth None -> 0.0; an UNKNOWN_DEPTH min_depth is replaced by the hazard depth). Opening-bridge and
+        lock-crossing edges (either direction) are exempt from both: their crossing is deliberate. Their notices
+        are still linked.
+      - a time-limited prohibited area (hazards.is_time_limited: period/validity in the chart or an accepted override)
+        is linked with severity 3, reason 'seasonal', but neither blocks nor changes cost_factor: the time-aware
+        router applies its window. Unreviewed chart text that mentions time (record text_review) stays blocked.
+    Returns {"edge_notices": [(source, target, notice_id, severity, reason)], "node_notices": [(node, notice_id,
+    severity)], "notices": {notice_id: record}, "stats": {...}}. edge_notices has a row for every directed edge
+    that exists in the graph.
     """
-    valsou = _s57_get_val(row, 'VALSOU')
-    if _is_valid(valsou):
-        try:
-            return False, float(valsou)
-        except (TypeError, ValueError):
-            pass  # not a real number -- fall through to WATLEV handling
+    import hazards as hz
+    t0 = time.time()
+    seen, uniq = set(), []
+    for r in records:           # one record per notice id (the same chart object read twice keeps the first)
+        r["id"] = hz.notice_id(r)
+        if r["id"] not in seen:
+            seen.add(r["id"])
+            uniq.append(r)
+    records = uniq
+    stats = {"blocked": 0, "folded": 0, "time_limited": 0, "unreviewed_text": 0, "edges": 0,
+             "records": len(records)}
+    out = {"edge_notices": [], "node_notices": [], "notices": {}, "stats": stats}
+    if not records:
+        return out
+    pairs, geoms = {}, []
+    for u, v in graph.edges():
+        key = (min(u, v), max(u, v))
+        if key in pairs:
+            continue
+        a, b = graph.nodes[key[0]], graph.nodes[key[1]]
+        if (a["lon"], a["lat"]) == (b["lon"], b["lat"]):
+            continue
+        pairs[key] = None
+        geoms.append((key, LineString([(a["lon"], a["lat"]), (b["lon"], b["lat"])])))
+    stats["edges"] = len(geoms)
+    axes = [a for a in (axes or []) if a is not None and not a.is_empty and len(a.coords) >= 2]
+    # axis_per_edge: in a mesh graph the edges inside an area form one web, so the chain-level axis test never
+    # passes; judge each edge against the charted axes instead (the graze test stays per chain).
+    links = hz.link_edges(records, geoms, axes, axis_per_edge=True)
+    reasons = hz.downgrade_reasons(records, geoms, links, axes, axis_per_edge=True)
+    per_edge = {}
+    for l in links:
+        d = per_edge.setdefault(l.edge_key, {})
+        cur = d.get(l.record["id"])
+        if cur is None or l.severity > cur[1]:
+            d[l.record["id"]] = (l.record, l.severity,
+                                 hz.edge_reason(l.record, l.severity, reasons.get((l.edge_key, l.index))))
+    for (lo, hi), linked in per_edge.items():
+        dirs = [(a, b) for a, b in ((lo, hi), (hi, lo)) if graph.has_edge(a, b)]
+        exempt = any(graph.edges[a, b].get("is_opening_bridge_edge") or graph.edges[a, b].get("requires_lock")
+                     for a, b in dirs)
+        prohibited, hazard_depth, timed, unreviewed = False, None, False, False
+        for nid, (rec, sev, reason) in linked.items():
+            out["notices"].setdefault(nid, rec)
+            if hz.blocks(rec, sev):
+                prohibited = True
+                unreviewed = unreviewed or bool(rec.get("text_review"))
+            elif sev == hz.SEV_PROHIBITED:
+                timed = True
+            elif sev == hz.SEV_DEPTH:
+                d = 0.0 if rec.get("depth_m") is None else float(rec["depth_m"])
+                hazard_depth = d if hazard_depth is None else min(hazard_depth, d)
+            for a, b in dirs:
+                out["edge_notices"].append((int(a), int(b), nid, sev, reason))
+        block = prohibited and not exempt
+        fold = hazard_depth is not None and not exempt
+        stats["blocked"] += 1 if block else 0
+        stats["folded"] += 1 if fold else 0
+        stats["time_limited"] += 1 if timed and not block else 0
+        stats["unreviewed_text"] += 1 if block and unreviewed else 0
+        for a, b in dirs:
+            data = graph.edges[a, b]
+            if block:
+                data["crosses_obstacle"] = 1
+            if fold:
+                cur = data.get("min_depth", 99.0)
+                data["min_depth"] = hazard_depth if cur == UNKNOWN_DEPTH else min(cur, hazard_depth)
+    nodes = [(n, (d["lon"], d["lat"])) for n, d in graph.nodes(data=True)]
+    nn = {}
+    for l in hz.link_nodes(records, nodes):
+        out["notices"].setdefault(l.record["id"], l.record)
+        k = (int(l.node_key), l.record["id"])
+        nn[k] = max(l.severity, nn.get(k, 0))
+    out["node_notices"] = [(n, nid, sev) for (n, nid), sev in sorted(nn.items())]
+    stats.update(notices=len(out["notices"]), edge_notices=len(out["edge_notices"]),
+                 node_notices=len(out["node_notices"]), link_seconds=round(time.time() - t0, 1))
+    return out
 
-    watlev = _s57_get_val(row, 'WATLEV')
-    try:
-        watlev_i = int(float(watlev)) if _is_valid(watlev) else None
-    except (TypeError, ValueError):
-        watlev_i = None
-
-    if watlev_i in (3, 4):
-        return False, 0.0
-    # 1 (partly submerged), 2 (always dry), 5 (awash), or missing/unrecognized
-    # (including 7="floating"): conservative default, unchanged hard block.
-    return True, None
 
 class NauticalRoutingPipeline:
     def __init__(self, data_paths: Dict[str, str], db_path: str, *,
@@ -1603,7 +1610,9 @@ class NauticalRoutingPipeline:
                  channel_axes_min_confidence: float = 0.5,
                  channel_axes_navmesh_carve: bool = False,
                  channel_axis_deadend_stitch_m: float = 0.0,
-                 channel_axis_deadend_max_connections: int = 3):
+                 channel_axis_deadend_max_connections: int = 3,
+                 hazard_cells_dir: Optional[str] = None,
+                 hazard_overrides: Optional[str] = None):
         self.data_paths = data_paths
         self.db_path = db_path
         self.country = country
@@ -1637,6 +1646,13 @@ class NauticalRoutingPipeline:
                                                            channel_axis_deadend_stitch_m=channel_axis_deadend_stitch_m,
                                                            channel_axis_deadend_max_connections=channel_axis_deadend_max_connections)
         self.channel_axes_stats = None
+        # hazards.py rules on the raw S-57 cells (--hazard-cells-dir); None = no hazard blocking / notices.
+        self.hazard_cells_dir = hazard_cells_dir
+        # reviewed text overrides (hazard_overrides.json); None = data/hazard_overrides.json when it exists
+        self.hazard_overrides = hazard_overrides
+        self.hazard_axes = []
+        self.hazard_result = None
+        self.hazard_stats = None
         if max_segment_m is not None:
             self.classification_config.max_segment_m = float(max_segment_m)
         self._validate_classification_overrides(axis_dedup_cap, axis_dedup_fraction,
@@ -1764,6 +1780,7 @@ class NauticalRoutingPipeline:
         for u, v, data in self.graph.edges(data=True):
             if data.get("is_opening_bridge_edge"):
                 data["max_air_draft"] = 999.0
+        self._apply_hazards()
         self._compute_node_depths(adopted_ids)
         # Publish pass runs after node depths are final, right before export,
         # so the registry gets each boundary node's real computed depth
@@ -1789,6 +1806,7 @@ class NauticalRoutingPipeline:
             else:
                 logger.warning(f"File not found for '{layer_name}': {path}. Using empty fallback.")
                 self.gdfs[layer_name] = gpd.GeoDataFrame(geometry=[], crs=self.CRS_WGS84)
+        self._capture_charted_axes()
         self._merge_channel_axes()
         if "inland_waterways" in self.gdfs:
             self.gdfs["inland_waterways"] = self._densify_inland_waterways(self.gdfs["inland_waterways"])
@@ -1797,7 +1815,20 @@ class NauticalRoutingPipeline:
         self.gdfs_metric = {
             name: gdf.to_crs(self.CRS_METRIC) for name, gdf in self.gdfs.items()
         }
-        self._build_obstacle_layer()
+
+    def _capture_charted_axes(self):
+        """The CHARTED axes for hazards.link_edges (waterway axis / recommended track / navigation line lines of
+        the inland_waterways layer, as loaded), taken before --channel-axes merges DERIVED axes into that layer.
+        MultiLineStrings are exploded. Independent of --channel-axes."""
+        inland = self.gdfs.get("inland_waterways")
+        out = []
+        if inland is not None and not inland.empty:
+            for g in inland.geometry:
+                if g is None or g.is_empty:
+                    continue
+                parts = list(g.geoms) if g.geom_type == "MultiLineString" else [g]
+                out += [x for x in parts if x.geom_type == "LineString" and len(x.coords) >= 2]
+        self.hazard_axes = out
 
     def _merge_channel_axes(self):
         """docs/SPEC-CHANNEL-AXES.md: append derived channel axes to inland_waterways.
@@ -2160,100 +2191,6 @@ class NauticalRoutingPipeline:
         out = inland_gdf.copy()
         out["geometry"] = new_geoms
         return out
-
-    def _build_obstacle_layer(self):
-        logger.info("Building obstacle layer from restricted areas, hulks, obstructions...")
-        obstacle_parts = []
-        resare = self.gdfs.get("restricted_areas", gpd.GeoDataFrame())
-        if not resare.empty:
-            ep_mask = resare.apply(_is_entry_prohibited, axis=1)
-            entry_prohibited = resare[ep_mask].copy()
-            if not entry_prohibited.empty:
-                entry_prohibited["_layer"] = "restricted_areas"
-                obstacle_parts.append(entry_prohibited)
-
-        hulks = self.gdfs.get("hulks", gpd.GeoDataFrame())
-        if not hulks.empty:
-            hulks = hulks.copy()
-            hulks["_layer"] = "hulks"
-            obstacle_parts.append(hulks)
-
-        # Same entry-prohibited-only filter as restricted_areas above — a
-        # mariculture/marine-farm concession (S-57 MARCUL, e.g. a mussel or
-        # oyster plot) is a fishing-rights designation, not automatically a
-        # navigational hard-stop. Blanket-blocking every mariculture polygon
-        # regardless of RESTRN was a real, confirmed bug: an unrestricted
-        # marine-farm area near Zeelandbrug happened to overlap the bridge's
-        # navigable opening corridor and silently made the entire crossing
-        # (and the boundary-ring edges leading to it) unreachable, with no
-        # warning — a plain data area, not a genuine obstruction, was hard-
-        # excluding a route that should only have been soft-penalized (if
-        # even that) via cost_factor, same as any other area vessels are
-        # merely asked to avoid absent an explicit restriction.
-        marcult = self.gdfs.get("mariculture", gpd.GeoDataFrame())
-        if not marcult.empty:
-            mc_mask = marcult.apply(_is_entry_prohibited, axis=1)
-            mc_prohibited = marcult[mc_mask].copy()
-            if not mc_prohibited.empty:
-                mc_prohibited["_layer"] = "mariculture"
-                obstacle_parts.append(mc_prohibited)
-
-        # The raw obstructions_points layer is loaded under the CLI key "obstacles"
-        # (obstructions_points.geojson). Read it from there — the old code read a
-        # non-existent "obstructions" key, so obstructions never entered the layer.
-        # This method then overwrites self.gdfs["obstacles"] with the merged result.
-        #
-        # Round 18: a NOAA-scale build carries thousands of these points (2,835 for
-        # Puerto Rico vs Zeeland's 3 genuine obstructions), each of which previously
-        # hard-blocked (crosses_obstacle=1) every edge it touched — 1,161
-        # obstacle-blocked edges, enough to make San Juan<->Fajardo unroutable.
-        # Split into a hard-block subset (kept in this "obstacles" hard layer,
-        # unchanged behavior) and a soft depth-constraint subset (a separate
-        # "obstacles_soft" layer consumed in _edge_attr_worker to fold into
-        # min_depth instead of hard-blocking) via _obstruction_depth_disposition's
-        # S-57-grounded VALSOU/WATLEV rules — see that function's docstring.
-        soft_obstacle_gdf = gpd.GeoDataFrame(geometry=[], crs=self.CRS_WGS84)
-        obstrn = self.gdfs.get("obstacles", gpd.GeoDataFrame())
-        if not obstrn.empty:
-            disposition = obstrn.apply(_obstruction_depth_disposition, axis=1)
-            is_hard = disposition.apply(lambda t: t[0])
-            depth_constraint = disposition.apply(lambda t: t[1])
-
-            hard_obstrn = obstrn[is_hard].copy()
-            if not hard_obstrn.empty:
-                buf_metric = hard_obstrn.to_crs(self.CRS_METRIC)
-                buf_metric["geometry"] = buf_metric.geometry.buffer(OBSTACLE_BUFFER_METERS)
-                buf_wgs84 = buf_metric.to_crs(self.CRS_WGS84)
-                buf_wgs84["_layer"] = "obstructions"
-                obstacle_parts.append(buf_wgs84)
-
-            soft_obstrn = obstrn[~is_hard].copy()
-            if not soft_obstrn.empty:
-                soft_obstrn["_depth_constraint"] = depth_constraint[~is_hard]
-                buf_metric = soft_obstrn.to_crs(self.CRS_METRIC)
-                buf_metric["geometry"] = buf_metric.geometry.buffer(OBSTACLE_BUFFER_METERS)
-                soft_obstacle_gdf = buf_metric.to_crs(self.CRS_WGS84)
-                soft_obstacle_gdf["_layer"] = "obstructions_soft"
-            logger.info(
-                f"  Obstruction points: {len(obstrn)} total, "
-                f"{len(hard_obstrn)} hard-block, {len(soft_obstrn)} depth-constrained"
-            )
-        self.gdfs["obstacles_soft"] = soft_obstacle_gdf
-        self.gdfs_metric["obstacles_soft"] = soft_obstacle_gdf.to_crs(self.CRS_METRIC) if not soft_obstacle_gdf.empty else gpd.GeoDataFrame(geometry=[], crs=self.CRS_METRIC)
-
-        if not obstacle_parts:
-            self.gdfs["obstacles"] = gpd.GeoDataFrame(geometry=[], crs=self.CRS_WGS84)
-            self.gdfs_metric["obstacles"] = gpd.GeoDataFrame(geometry=[], crs=self.CRS_METRIC)
-            return
-
-        merged = gpd.pd.concat(obstacle_parts, ignore_index=True)
-        merged["geometry"] = merged["geometry"].make_valid()
-        merged = merged[merged.geometry.notnull()]
-        if not merged.empty:
-            merged = merged[merged.geometry.is_valid]
-        logger.info(f"  Combined obstacle layer: {len(merged)} features")
-        self.gdfs["obstacles"] = merged
-        self.gdfs_metric["obstacles"] = merged.to_crs(self.CRS_METRIC)
 
     def build_network(self):
         logger.info("Building base network topology...")
@@ -8079,8 +8016,6 @@ class NauticalRoutingPipeline:
             "fairways": highways_gdf,
             "dredged_areas": self.gdfs.get("dredged_areas", gpd.GeoDataFrame()),
             "locks": self.gdfs.get("locks", gpd.GeoDataFrame()),
-            "obstacles": self.gdfs.get("obstacles", gpd.GeoDataFrame()),
-            "obstacles_soft": self.gdfs.get("obstacles_soft", gpd.GeoDataFrame()),
         }
         for gdf in worker_gdfs.values():
             if not gdf.empty:
@@ -8131,6 +8066,57 @@ class NauticalRoutingPipeline:
 
         geom_json = json.dumps(poly.__geo_interface__)
         return (bbox, geom_json)
+
+    def _apply_hazards(self):
+        """--hazard-cells-dir: extract hazards from the raw S-57 cells with hazards.py, tier them with the DEPARE
+        depth, link them to the FINAL edge set and fold their effects into the graph (crosses_obstacle, min_depth,
+        notices only for time-limited areas). self.hazard_result carries the notice rows for export_to_sqlite. Without the flag
+        nothing is blocked and no notices are written (one warning)."""
+        self.hazard_result = None
+        if not self.hazard_cells_dir:
+            logger.warning("No --hazard-cells-dir: restricted areas, wrecks, obstructions and rocks are NOT "
+                           "classified (crosses_obstacle stays 0, no notices tables, schema_version unchanged).")
+            return
+        import hazards as hz
+        bbox = self._get_coverage_bbox()
+        if bbox is None:
+            logger.warning("--hazard-cells-dir: no coverage bbox available; hazards skipped.")
+            return
+        t0 = time.time()
+        cells = hz.latest_cells(self.hazard_cells_dir, bbox)
+        if not cells:
+            msg = (f"--hazard-cells-dir {self.hazard_cells_dir}: no S-57 cells (*.000) found overlapping bbox "
+                   f"{tuple(round(x, 4) for x in bbox)} (missing/empty dir or wrong bbox). Fix the path, or pass "
+                   f"--no-hazards to build without hazard classification.")
+            logger.error(msg)
+            raise SystemExit(msg)
+        logger.info(f"Hazards: {len(cells)} cells under {self.hazard_cells_dir} overlap {tuple(round(b, 4) for b in bbox)}")
+        try:
+            from osgeo import gdal
+            gdal.PushErrorHandler("CPLQuietErrorHandler")   # the 'UNKNOWN' VALSOU warning, once per feature
+        except ImportError:
+            gdal = None
+        try:
+            records = hz.extract_hazards(cells, tuple(bbox))
+        finally:
+            if gdal is not None:
+                gdal.PopErrorHandler()
+        n_ov = hz.apply_overrides(records, hz.resolve_overrides(self.hazard_overrides))
+        if n_ov:
+            logger.info(f"Hazards: {n_ov} reviewed text overrides applied from "
+                        f"{self.hazard_overrides or hz.DEFAULT_OVERRIDES_PATH}")
+        hz.tier_records(records, _depth_area_fn(self.gdfs.get("depth_areas")))
+        tiers = {}
+        for r in records:
+            tiers[hz.SEVERITY_NAMES[r["severity"]]] = tiers.get(hz.SEVERITY_NAMES[r["severity"]], 0) + 1
+        logger.info(f"Hazards: {len(records)} objects extracted+tiered in {time.time() - t0:.1f}s: {tiers}")
+        self.hazard_result = link_graph_hazards(self.graph, records, self.hazard_axes)
+        st = self.hazard_result["stats"]
+        self.hazard_stats = dict(st, objects=len(records), tiers=tiers)
+        logger.info(f"Hazards: {st['blocked']} edge pairs blocked (crosses_obstacle), {st['unreviewed_text']} of them on "
+                    f"unreviewed chart text, {st['time_limited']} time-limited (linked, not blocked), "
+                    f"{st['folded']} depth-folded; {st['notices']} notices, {st['edge_notices']} edge_notices, "
+                    f"{st['node_notices']} node_notices (linking {st['link_seconds']}s over {st['edges']} edges)")
 
     def export_to_sqlite(self):
         logger.info(f"Exporting data to SQLite database at '{self.db_path}'...")
@@ -8305,7 +8291,9 @@ class NauticalRoutingPipeline:
                    (country, name, description, last_update_date, tags, bounding_box, boundary_geometry, schema_version, depth_unknown_sentinel, contributor, url, license, copyright, architecture, dataset_version)
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                  (self.country, self.region_name, self.description, now_utc,
-                 self.tags, bbox_json, boundary_json, DEPTH_SENTINEL_SCHEMA_VERSION, UNKNOWN_DEPTH,
+                 self.tags, bbox_json, boundary_json,
+                 HAZARDS_SCHEMA_VERSION if self.hazard_result is not None else DEPTH_SENTINEL_SCHEMA_VERSION,
+                 UNKNOWN_DEPTH,
                  self.contributor, self.url,
                  self.license, self.copyright, self.architecture, self.dataset_version)
             )
@@ -8349,6 +8337,20 @@ class NauticalRoutingPipeline:
                 (source, target, distance, min_depth, drval1, max_air_draft, min_width, cost_factor, distance_to_land, edge_type_id, traffic_mode, crosses_land, crosses_obstacle, edge_kind_id, source_tier, source_id, width_profile, requires_lock, lock_id)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, edges_data)
+
+            if self.hazard_result is not None:
+                import hazards as hz
+                cursor.executescript(hz.NOTICES_DDL)
+                for nid, rec in self.hazard_result["notices"].items():
+                    row = hz.notice_row(rec, rec["severity"], rec.get("depth_m"))
+                    row["id"] = nid
+                    cols = list(row)
+                    cursor.execute(f"INSERT OR IGNORE INTO notices ({','.join(cols)}) "
+                                   f"VALUES ({','.join('?' * len(cols))})", [row[k] for k in cols])
+                cursor.executemany("INSERT OR IGNORE INTO edge_notices VALUES (?,?,?,?,?)",
+                                   self.hazard_result["edge_notices"])
+                cursor.executemany("INSERT OR IGNORE INTO node_notices VALUES (?,?,?)",
+                                   self.hazard_result["node_notices"])
 
             navmesh_regions_data = [(
                 region_id,
@@ -8684,6 +8686,19 @@ if __name__ == "__main__":
                              "fragment-to-fragment candidates are then rejected for free by the "
                              "existing already-connected check instead of firing. Default: off, "
                              "identical call order to today's (Pass 0, then Pass 0b).")
+    parser.add_argument("--hazard-cells-dir", default=None,
+                        help="Directory of raw S-57 cells (*.000, edition subdirs allowed; the latest edition per "
+                             "cell name is used). Enables hazards.py classification of restricted areas, wrecks, "
+                             "obstructions and rocks: crosses_obstacle, hazard min_depth (time-limited areas are linked, not blocked), and "
+                             "the notices/edge_notices/node_notices tables (schema_version 3). Without it nothing "
+                             "is blocked and no notices are written. See docs/SPEC-HAZARDS-AND-NOTICES.md.")
+    parser.add_argument("--hazard-overrides", default=None, metavar="PATH",
+                        help="Reviewed hazard text overrides (scripts/review_hazard_text.py); only 'accepted' entries "
+                             "apply. Default: data/hazard_overrides.json when it exists.")
+    parser.add_argument("--no-hazards", action="store_true",
+                        help="Explicitly build WITHOUT hazard classification (no --hazard-cells-dir): no "
+                             "crosses_obstacle from restricted areas/wrecks/obstructions, no notices tables, "
+                             "schema_version 2. Without this flag a missing --hazard-cells-dir is an error.")
     parser.add_argument("--channel-axes", action="store_true",
                         help="Merge derive_channel_axes.py's channel_axes_lines.geojson (centerlines of "
                              "FAIRWY/DRGARE polygons and of lateral buoy/beacon chains) into the "
@@ -8812,6 +8827,13 @@ if __name__ == "__main__":
                         help="Adopt pass: max distance (m) from an adopted seam node to a native "
                              "graph node it may connect to (default 500).")
     args = parser.parse_args()
+    if args.hazard_overrides and not os.path.exists(args.hazard_overrides):
+        parser.error(f"--hazard-overrides {args.hazard_overrides}: file not found")
+    if args.hazard_cells_dir and args.no_hazards:
+        parser.error("--hazard-cells-dir and --no-hazards are mutually exclusive")
+    if not args.hazard_cells_dir and not args.no_hazards:
+        parser.error("--hazard-cells-dir DIR is required (raw S-57 cells for restricted areas, wrecks, obstructions "
+                     "and rocks); pass --no-hazards to build without hazard blocking and notices")
 
     try:
         NauticalRoutingPipeline._validate_connector_merge_m(args.connector_merge_m)
@@ -8935,5 +8957,7 @@ if __name__ == "__main__":
                                        channel_axes_min_confidence=args.channel_axes_min_confidence,
                                        channel_axes_navmesh_carve=args.channel_axes_navmesh_carve,
                                        channel_axis_deadend_stitch_m=args.channel_axis_deadend_stitch_m,
-                                       channel_axis_deadend_max_connections=args.channel_axis_deadend_max_connections)
+                                       channel_axis_deadend_max_connections=args.channel_axis_deadend_max_connections,
+                                       hazard_cells_dir=args.hazard_cells_dir,
+                                       hazard_overrides=args.hazard_overrides)
     pipeline.run_pipeline()

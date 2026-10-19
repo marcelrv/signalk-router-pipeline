@@ -61,6 +61,12 @@ class ENCToGeoJSONPreprocessor:
             # S-57 layers for navigational hazards and restricted areas (no-go zones)
             'RESARE': 'restricted_areas_polygons.geojson',
             'OBSTRN': 'obstructions_points.geojson',
+            # Wrecks (points or areas) and underwater/awash rocks: tiered by
+            # hazards.py (docs/SPEC-HAZARDS-AND-NOTICES.md). Mixed Point/Polygon
+            # geometry is written as-is, like OBSTRN. Note GDAL reads a VALSOU of
+            # 'UNKNOWN' as 0.0; hazards.py treats VALSOU 0.0 with WATLEV 3 as unknown.
+            'WRECKS': 'wrecks_points.geojson',
+            'UWTROC': 'rocks_points.geojson',
             'HULKES': 'hulks_polygons.geojson',
             'MARCUL': 'mariculture_polygons.geojson',
             'CTNARE': 'caution_areas_polygons.geojson',

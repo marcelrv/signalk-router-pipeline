@@ -23,3 +23,31 @@ class TestUsageBand:
 
     def test_unrecognized_pattern_returns_none(self):
         assert _usage_band("readme.txt") is None
+
+
+class TestHazardLayers:
+    def test_wrecks_and_rocks_mapped(self, tmp_path):
+        from enc_preprocessor import ENCToGeoJSONPreprocessor
+        m = ENCToGeoJSONPreprocessor(str(tmp_path), str(tmp_path)).layer_mapping
+        assert m["WRECKS"] == "wrecks_points.geojson"
+        assert m["UWTROC"] == "rocks_points.geojson"
+
+    def test_existing_hazard_layers_unchanged(self, tmp_path):
+        from enc_preprocessor import ENCToGeoJSONPreprocessor
+        m = ENCToGeoJSONPreprocessor(str(tmp_path), str(tmp_path)).layer_mapping
+        assert m["OBSTRN"] == "obstructions_points.geojson"
+        assert m["RESARE"] == "restricted_areas_polygons.geojson"
+        assert m["HULKES"] == "hulks_polygons.geojson"
+
+    def test_mixed_point_and_area_wrecks_export(self, tmp_path):
+        import json
+        import geopandas as gpd
+        from shapely.geometry import Point, box
+        from enc_preprocessor import ENCToGeoJSONPreprocessor
+        pre = ENCToGeoJSONPreprocessor(str(tmp_path), str(tmp_path))
+        gdf = gpd.GeoDataFrame({"VALSOU": [1.5, 0.0], "WATLEV": [3, 3]},
+                               geometry=[Point(3.5, 51.5), box(3.5, 51.5, 3.501, 51.501)], crs="EPSG:4326")
+        pre.extracted_data["wrecks_points.geojson"].append(gdf)
+        pre._merge_and_export()
+        data = json.load(open(tmp_path / "wrecks_points.geojson"))
+        assert sorted(f["geometry"]["type"] for f in data["features"]) == ["Point", "Polygon"]

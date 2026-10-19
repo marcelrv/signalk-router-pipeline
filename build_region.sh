@@ -17,7 +17,7 @@
 #                      [--channel-axis-deadend-stitch-m 1500.0]
 #                      [--stitch-registry data/seam_registry.sqlite]
 #                      [--extra-pipeline-args "--sagitta-cap 250.0 --node-merge-m 5.0"]
-#                      [--build-mem-limit-gb 11]
+#                      [--build-mem-limit-gb 11] [--no-hazards]
 #
 # Round 25 cross-database seam stitching: pass --stitch-registry to adopt/publish
 # shared seam nodes against a global-node registry SQLite (see STITCHING_DESIGN.md
@@ -26,6 +26,10 @@
 # by --overlap-deg -- the same expansion clip_pilot_data.py itself applies, so it
 # matches the actual clipped data extent. Omit --stitch-registry entirely for
 # unchanged single-region behavior.
+#
+# Hazards (docs/SPEC-HAZARDS-AND-NOTICES.md): step 3/3 always passes --hazard-cells-dir "$RAW_DIR" (the raw
+# NOAA cells; composed state dirs are symlinks and are followed). To build without hazard blocking and notices
+# anyway, pass --no-hazards to this script (it forwards --no-hazards instead of --hazard-cells-dir).
 #
 # --extra-pipeline-args "..." passes its value through verbatim (word-split) to
 # the nautical_routing_pipeline.py invocation in step 3/3, appended after this
@@ -85,6 +89,7 @@ STITCH_REGISTRY=""
 STITCH_BAND_M=""
 STITCH_RADIUS_M=""
 EXTRA_PIPELINE_ARGS=""
+NO_HAZARDS=""              # --no-hazards: build without hazard classification (schema 2, no notices)
 CHANNEL_AXES=""            # --channel-axes: derive marked-channel axes and feed them to the pipeline
 CHANNEL_AXES_ARGS=""       # --channel-axes-args "...": extra derive_channel_axes.py options
 DEADEND_STITCH_M=""        # --channel-axis-deadend-stitch-m <m>: opt-in dead-end stitch radius (needs --channel-axes)
@@ -108,6 +113,7 @@ while [ $# -gt 0 ]; do
         --stitch-registry) STITCH_REGISTRY="$2"; shift 2 ;;
         --stitch-band-m) STITCH_BAND_M="$2"; shift 2 ;;
         --stitch-radius-m) STITCH_RADIUS_M="$2"; shift 2 ;;
+        --no-hazards) NO_HAZARDS="1"; shift ;;
         --extra-pipeline-args) EXTRA_PIPELINE_ARGS="$2"; shift 2 ;;
         --channel-axes) CHANNEL_AXES="1"; shift ;;
         --channel-axes-args) CHANNEL_AXES_ARGS="$2"; shift 2 ;;
@@ -295,6 +301,16 @@ if [ -n "$BUILD_MEM_LIMIT_GB" ]; then
     BUILD_MEM_LIMIT_GB_NUM=$((10#$BUILD_MEM_LIMIT_GB))
 fi
 
+if [ -n "$NO_HAZARDS" ]; then
+    HAZARD_ARGS=(--no-hazards)
+else
+    if [ -z "$(find -L "$RAW_DIR" -name '*.000' -print -quit 2>/dev/null)" ]; then
+        echo "Error: no S-57 cells (*.000) under $RAW_DIR, needed for hazard classification. Download/compose the" \
+             "raw cells first, or pass --no-hazards to build without hazards." >&2
+        exit 1
+    fi
+    HAZARD_ARGS=(--hazard-cells-dir "$RAW_DIR")
+fi
 EXTRA_PIPELINE_ARGS_ARR=()
 if [ -n "$EXTRA_PIPELINE_ARGS" ]; then
     # Word-split on purpose (like $FORCE above) -- this is a plain space-
@@ -353,6 +369,7 @@ fi
         --license "Public Domain (NOAA)" \
         --copyright "NOAA Office of Coast Survey" \
         --depth-ceiling "$DEPTH_CEILING" \
+        "${HAZARD_ARGS[@]}" \
         "${STITCH_ARGS[@]}" \
         "${EXTRA_PIPELINE_ARGS_ARR[@]}"
 ) 2>&1 | tee "${LOG_PREFIX}_build.log"
