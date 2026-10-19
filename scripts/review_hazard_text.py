@@ -246,31 +246,32 @@ def cmd_review(overrides, ids, status, by):
 
 def main(argv=None, backend=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--overrides", default=hz.DEFAULT_OVERRIDES_PATH)
+    ap.add_argument("--overrides", default=hz.DEFAULT_OVERRIDES_PATH,
+                    help="Path of the reviewed-overrides JSON file (default %(default)s).")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     def source(p):
-        p.add_argument("--cells-dir")
+        p.add_argument("--cells-dir", help="directory of raw S-57 .000 cells to read hazard text from")
         p.add_argument("--bbox", help="lon0,lat0,lon1,lat1")
         p.add_argument("--db", help="a schema-3 routing DB")
 
     source(sub.add_parser("list"))
     pp = sub.add_parser("propose")
     source(pp)
-    pp.add_argument("--base-url", default=None)
-    pp.add_argument("--model", default=None)
-    pp.add_argument("--manual", metavar="ID")
-    pp.add_argument("--period-start")
-    pp.add_argument("--period-end")
-    pp.add_argument("--valid-from")
-    pp.add_argument("--valid-until")
-    pp.add_argument("--note", default="")
-    pp.add_argument("--text-sha1")
+    pp.add_argument("--base-url", default=None, help="local OpenAI-compatible server URL (AI proposal mode)")
+    pp.add_argument("--model", default=None, help="model name to ask on that server")
+    pp.add_argument("--manual", metavar="ID", help="propose by hand for this notice id instead of asking a model")
+    pp.add_argument("--period-start", help="manual: recurring window start, S-57 partial date (e.g. --1101)")
+    pp.add_argument("--period-end", help="manual: recurring window end, S-57 partial date (e.g. --0515; may wrap over New Year)")
+    pp.add_argument("--valid-from", help="manual: one-off validity start, S-57 date (CCYYMMDD, CCYYMM or CCYY)")
+    pp.add_argument("--valid-until", help="manual: one-off validity end, S-57 date (CCYYMMDD, CCYYMM or CCYY)")
+    pp.add_argument("--note", default="", help="manual: free-text reason recorded with the proposal")
+    pp.add_argument("--text-sha1", help="manual: sha1 of the chart text the proposal applies to")
     pp.add_argument("--by", default=None, help="who proposes (manual mode)")
     for name in ("accept", "reject"):
         p = sub.add_parser(name)
-        p.add_argument("ids", nargs="+")
-        p.add_argument("--by", required=True)
+        p.add_argument("ids", nargs="+", help="notice ids to %s" % name)
+        p.add_argument("--by", required=True, help="reviewer name recorded with the decision")
     argv = list(sys.argv[1:] if argv is None else argv)
     for i, tok in enumerate(argv[:-1]):     # '--period-start --1101': argparse would read '--1101' as an option
         if tok in ("--period-start", "--period-end") and re.match(r"^---?\d", argv[i + 1]):

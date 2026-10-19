@@ -1338,18 +1338,23 @@ def main(argv=None):
                     help="Split a mark chain at gaps longer than this (default %(default)s).")
     ap.add_argument("--max-turn-deg", type=float, default=d.max_turn_deg,
                     help="Split a mark chain at turns sharper than this (default %(default)s).")
-    ap.add_argument("--min-marks", type=int, default=d.min_marks)
-    ap.add_argument("--min-length-m", type=float, default=d.min_length_m)
+    ap.add_argument("--min-marks", type=int, default=d.min_marks,
+                    help="Minimum marks in a chain for it to yield an axis (default %(default)s).")
+    ap.add_argument("--min-length-m", type=float, default=d.min_length_m,
+                    help="Discard derived axes shorter than this many metres (default %(default)s).")
     ap.add_argument("--corridor-fraction", type=float, default=d.corridor_fraction,
                     help="Corridor radius = fraction × local half channel width + 50 m, clamped (default %(default)s).")
-    ap.add_argument("--corridor-min-r-m", type=float, default=d.corridor_min_r_m)
-    ap.add_argument("--corridor-max-r-m", type=float, default=d.corridor_max_r_m)
+    ap.add_argument("--corridor-min-r-m", type=float, default=d.corridor_min_r_m,
+                    help="Lower clamp of the corridor radius in metres (default %(default)s).")
+    ap.add_argument("--corridor-max-r-m", type=float, default=d.corridor_max_r_m,
+                    help="Upper clamp of the corridor radius in metres (default %(default)s).")
     ap.add_argument("--cluster-link-m", type=float, default=d.cluster_link_m,
                     help="Same-named marks farther apart than this are different channels.")
     ap.add_argument("--dedup-min-m", type=float, default=d.dedup_min_m,
                     help="Lower-tier axis parts within max(this, half the channel width, capped by --dedup-max-m) "
                          "of a higher-tier axis are dropped.")
-    ap.add_argument("--dedup-max-m", type=float, default=d.dedup_max_m)
+    ap.add_argument("--dedup-max-m", type=float, default=d.dedup_max_m,
+                    help="Cap on the lower-tier dedup distance in metres (default %(default)s).")
     ap.add_argument("--polygon-min-aspect", type=float, default=d.polygon_min_aspect,
                     help="Fairway polygons rounder than this (long/short edge) are skipped unless marks run through them.")
     ap.add_argument("--hug", type=float, default=d.hug,
@@ -1360,7 +1365,7 @@ def main(argv=None):
                     help="Douglas-Peucker tolerance applied to every output axis (default %(default)s; 0 = off).")
     ap.add_argument("--no-depth-tighten", action="store_true",
                     help="Do not restrict a mark-chain corridor to water at least as deep as the marks stand in.")
-    ap.add_argument("-v", "--verbose", action="store_true")
+    ap.add_argument("-v", "--verbose", action="store_true", help="Debug-level logging.")
     args = ap.parse_args(argv)
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,
                         format="%(asctime)s - %(levelname)s - %(message)s")

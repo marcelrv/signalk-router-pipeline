@@ -196,6 +196,14 @@ safety of navigation on its own). See
 for the full, per-source breakdown that applies to compiled output
 databases.
 
+## Command-line options
+
+Every tool has many options. All of them are documented in
+[docs/CLI-REFERENCE.md](docs/CLI-REFERENCE.md) (generated from each tool's
+`--help` by `scripts/gen_cli_reference.py`); the quickest start is
+`./build_region.sh <region>`, which runs download, extraction and graph build
+end to end.
+
 ## Database format
 
 The compiled `.sqlite.gz` schema — tables, node/POI ID hashing, source-tier
