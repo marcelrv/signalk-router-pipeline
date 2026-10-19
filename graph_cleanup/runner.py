@@ -10,7 +10,7 @@ default). A tile that never produces valid JSON after one retry is marked
 because a tile a weak backend could not judge must never silently become a
 deletion.
 
-Three guards keep an old or doubtful answer from ever becoming a drop:
+Four guards keep an old or doubtful answer from ever becoming a drop:
 
 * every answer is written together with `answer.meta.json` recording the
   sha256 of the tile's `manifest.json` (the candidate ids/nodes the numbers
@@ -24,7 +24,12 @@ Three guards keep an old or doubtful answer from ever becoming a drop:
   force, yet paid-for work survives an outage;
 * `run_all` aborts after N consecutive tiles that failed with `BackendError`
   (a dead or wedged server) or M consecutive all-unsure fallbacks, instead of
-  grinding through every tile.
+  grinding through every tile;
+* `repeats > 1` answers a tile more than once and `merge_verdicts` keeps a
+  verdict only where every repeat agreed, downgrading any disagreement to
+  `unsure` -- a single sample from a local model was measured to be too
+  noisy to trust for a real `drop` (`docs/ROADMAP.md` Step 2 item 16: an
+  identical prompt resampled on the same tiles flipped 19/130 verdicts).
 """
 import hashlib
 import json
@@ -213,7 +218,34 @@ def _attempt_tile(backend: Backend, tile_dir: str, max_retries: int):
     return None, last_error, backend_failed
 
 
-def run_tile(backend: Backend, tile_dir: str, max_retries: int = 1) -> Optional[Dict[str, dict]]:
+def merge_verdicts(samples: Sequence[Dict[str, dict]]) -> Dict[str, dict]:
+    """Combine `repeats` independently-sampled verdict dicts for one tile into
+    one (item 16, `docs/ROADMAP.md` Step 2): a candidate keeps its verdict
+    only if *every* sample agrees on it, since the local-model tuning pilot
+    measured that a single sample cannot be trusted for an actual `drop` --
+    re-running the identical prompt on the same tiles flipped 19/130 verdicts.
+
+    Any disagreement, including one that never involves `drop` (e.g.
+    `keep`/`unsure` split), downgrades the candidate to `unsure` -- already
+    safe, since `answers_to_ops` never turns `unsure` into an op. The kept
+    entry's `why` is always the first sample's, for readability; it is not
+    itself part of the agreement check."""
+    if len(samples) == 1:
+        return samples[0]
+    merged: Dict[str, dict] = {}
+    for n, first_entry in samples[0].items():
+        verdicts = {s[n]["verdict"] for s in samples}
+        if len(verdicts) == 1:
+            merged[n] = first_entry
+        else:
+            merged[n] = {"verdict": "unsure",
+                         "why": f"no agreement across {len(samples)} repeats: "
+                                f"{sorted(verdicts)}"}
+    return merged
+
+
+def run_tile(backend: Backend, tile_dir: str, max_retries: int = 1,
+            repeats: int = 1) -> Optional[Dict[str, dict]]:
     """Answer one tile, validating and retrying. Returns the validated verdict
     dict, or None if it never became valid.
 
@@ -222,18 +254,33 @@ def run_tile(backend: Backend, tile_dir: str, max_retries: int = 1) -> Optional[
     invalid answer. It multiplies with whatever retrying the backend does
     itself (the local backend already retries connection errors/5xx, and a
     timeout is not retried there, but is here -- so a timing-out tile costs
-    `(max_retries + 1) * timeout`)."""
+    `(max_retries + 1) * timeout`).
+
+    `repeats` (item 16) independently answers the *whole* tile this many
+    times (each with its own `max_retries` budget) and combines them with
+    `merge_verdicts` -- a `drop` only survives if every repeat agrees. If any
+    repeat never becomes valid, the tile as a whole is unanswered (same as a
+    single repeat failing today): a partial set of samples is not enough to
+    trust an agreement over, so this costs more but never trusts less."""
     error_path = os.path.join(tile_dir, ERROR_FILE)
     if os.path.exists(error_path):
         os.remove(error_path)  # an earlier round's error is not this round's
-    verdicts, last_error, _ = _attempt_tile(backend, tile_dir, max_retries)
-    if verdicts is None and last_error:
-        atomic_write_text(error_path, last_error)
-    return verdicts
+    samples = []
+    last_error = None
+    for _ in range(repeats):
+        verdicts, last_error, _ = _attempt_tile(backend, tile_dir, max_retries)
+        if verdicts is None:
+            break
+        samples.append(verdicts)
+    if len(samples) < repeats:
+        if last_error:
+            atomic_write_text(error_path, last_error)
+        return None
+    return merge_verdicts(samples)
 
 
 def run_all(backend: Backend, tile_dirs: Sequence[str], resume: bool = True,
-           max_retries: int = 1, sleep_between_s: float = 0.0,
+           max_retries: int = 1, repeats: int = 1, sleep_between_s: float = 0.0,
            max_consecutive_backend_errors: int = DEFAULT_MAX_CONSECUTIVE_BACKEND_ERRORS,
            max_consecutive_degraded: int = DEFAULT_MAX_CONSECUTIVE_DEGRADED
            ) -> RunStats:
@@ -244,6 +291,12 @@ def run_all(backend: Backend, tile_dirs: Sequence[str], resume: bool = True,
     `stale` answers are re-run. Without it everything is re-run. Either way the
     previous round's results are first *archived* under `<tile>/history/`
     (see `archive_results`), never deleted and never read back.
+
+    `repeats` (item 16, see `run_tile`/`merge_verdicts`) answers each tile
+    this many times and only keeps a `drop` (or any other verdict) that every
+    repeat agrees on; a tile where any repeat never becomes valid is
+    `unanswered`, same as today's single-repeat failure. A tile is `degraded`
+    for this round if *any* repeat was.
 
     Raises `BackendCircuitOpen` after `max_consecutive_backend_errors` tiles in
     a row ended in a `BackendError`, or after `max_consecutive_degraded` tiles
@@ -263,8 +316,18 @@ def run_all(backend: Backend, tile_dirs: Sequence[str], resume: bool = True,
             continue
         archive_results(tile_dir)
         digest = manifest_digest(tile_dir)     # the build the answer is *for*
-        verdicts, last_error, backend_failed = _attempt_tile(backend, tile_dir, max_retries)
-        degraded = bool(consume_degraded(tile_dir)) if consume_degraded else False
+        samples = []
+        degraded = False
+        last_error = None
+        backend_failed = False
+        for _ in range(repeats):
+            verdicts, last_error, backend_failed = _attempt_tile(backend, tile_dir, max_retries)
+            if consume_degraded:
+                degraded = degraded or bool(consume_degraded(tile_dir))
+            if verdicts is None:
+                break
+            samples.append(verdicts)
+        verdicts = merge_verdicts(samples) if len(samples) == repeats else None
         if verdicts is not None and manifest_digest(tile_dir) != digest:
             verdicts, backend_failed = None, False
             last_error = "tile was re-prepared while it was being answered; answer discarded"
@@ -284,8 +347,10 @@ def run_all(backend: Backend, tile_dirs: Sequence[str], resume: bool = True,
         consecutive = 0
         # meta first: a kill in between leaves "no answer" (re-run), never a
         # degraded answer that looks valid. Both writes are atomic.
-        atomic_write_text(os.path.join(tile_dir, META_FILE),
-                          json.dumps({"manifest_sha256": digest, "degraded": degraded}))
+        meta = {"manifest_sha256": digest, "degraded": degraded}
+        if repeats > 1:
+            meta["repeats"] = repeats
+        atomic_write_text(os.path.join(tile_dir, META_FILE), json.dumps(meta))
         atomic_write_text(os.path.join(tile_dir, ANSWER_FILE), json.dumps(verdicts, indent=2))
         stats.answered += 1
         stats.degraded += int(degraded)

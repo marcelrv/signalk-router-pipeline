@@ -109,6 +109,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     p.add_argument("--prompt-label", default=None,
                    help="local backend: free-text prompt version recorded in the "
                         "per-tile local_audit.jsonl (the prompt's sha256 is always recorded)")
+    p.add_argument("--repeats", type=int, default=1,
+                   help="answer each tile this many times and only keep a verdict "
+                        "every repeat agrees on, falling back to 'unsure' otherwise "
+                        "(item 16: a single sample was measured too noisy to trust "
+                        "for a real drop); default 1 (no repeat check)")
     p.add_argument("--limit", type=int, default=None,
                    help="only answer the first N unanswered tiles -- use this "
                         "before trusting --backend claude with a full run")
@@ -118,6 +123,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     p.add_argument("--author", default=None,
                    help="op author tag; default is ai:<backend's model>")
     args = p.parse_args(argv)
+    if args.repeats < 1:
+        p.error("--repeats must be >= 1")
     if args.backend == "local":
         from graph_cleanup.backends.local_openai import normalize_url
         try:  # fail before loading the graph / rendering tiles
@@ -218,7 +225,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     print(f"answering {len(tile_dirs)} tiles...")
     try:
         stats = runner.run_all(
-            backend, tile_dirs, resume=not args.no_resume,
+            backend, tile_dirs, resume=not args.no_resume, repeats=args.repeats,
             max_consecutive_backend_errors=args.max_consecutive_backend_errors,
             max_consecutive_degraded=args.max_consecutive_degraded)
     except runner.BackendCircuitOpen as exc:

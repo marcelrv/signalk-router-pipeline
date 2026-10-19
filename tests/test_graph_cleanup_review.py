@@ -776,3 +776,101 @@ def test_consecutive_degraded_tiles_trip_the_breaker(tmp_path):
     stats = runner.run_all(Alternating(UNSURE), tiles, resume=False, max_consecutive_degraded=3)
     assert stats.answered == 8
     assert runner.DEFAULT_MAX_CONSECUTIVE_DEGRADED == 10
+
+
+# --------------------------------------------------- repeat-agreement (item 16)
+
+def test_merge_verdicts_single_sample_is_unchanged():
+    sample = {"1": {"verdict": "drop", "why": "rubbish"}}
+    assert runner.merge_verdicts([sample]) is sample
+
+
+def test_merge_verdicts_keeps_a_unanimous_verdict():
+    samples = [{"1": {"verdict": "drop", "why": "a"}, "2": {"verdict": "keep", "why": "b"}}] * 3
+    merged = runner.merge_verdicts(samples)
+    assert merged["1"]["verdict"] == "drop"
+    assert merged["2"]["verdict"] == "keep"
+
+
+def test_merge_verdicts_downgrades_any_disagreement_to_unsure():
+    samples = [{"1": {"verdict": "drop", "why": "a"}},
+              {"1": {"verdict": "keep", "why": "b"}},
+              {"1": {"verdict": "drop", "why": "a"}}]
+    merged = runner.merge_verdicts(samples)
+    assert merged["1"]["verdict"] == "unsure"
+
+
+def test_merge_verdicts_disagreement_between_keep_and_unsure_still_downgrades():
+    """Even a disagreement that never touches `drop` is treated as noise, not
+    resolved by majority -- item 16 asks for *agreement*, not a vote."""
+    samples = [{"1": {"verdict": "keep", "why": "a"}},
+              {"1": {"verdict": "unsure", "why": "b"}}]
+    merged = runner.merge_verdicts(samples)
+    assert merged["1"]["verdict"] == "unsure"
+
+
+def test_run_tile_with_repeats_emits_drop_only_on_unanimous_agreement(tmp_path):
+    tile = _hand_tile(tmp_path)
+    verdicts = runner.run_tile(_Scripted(DROP), tile, repeats=3)
+    assert verdicts["1"]["verdict"] == "drop"
+
+
+def test_run_tile_with_repeats_downgrades_a_flip_to_unsure(tmp_path):
+    tile = _hand_tile(tmp_path)
+    # first call DROP, every call after (the script's last item repeats) KEEP
+    verdicts = runner.run_tile(_Scripted(DROP, KEEP), tile, repeats=2)
+    assert verdicts["1"]["verdict"] == "unsure"
+
+
+def test_run_tile_with_repeats_fails_the_whole_tile_if_any_repeat_never_answers(tmp_path):
+    tile = _hand_tile(tmp_path)
+    # succeeds once, then the backend is dead for every call after
+    backend = _Scripted(KEEP, BackendError("boom"))
+    assert runner.run_tile(backend, tile, max_retries=0, repeats=2) is None
+    assert os.path.exists(os.path.join(tile, "error.txt"))
+
+
+def test_run_all_with_repeats_writes_the_merged_answer_and_records_repeats(tmp_path):
+    tile = _hand_tile(tmp_path)
+    stats = runner.run_all(_Scripted(DROP, KEEP), [tile], repeats=2)
+    assert stats.answered == 1
+    with open(os.path.join(tile, "answer.json"), encoding="utf-8") as fh:
+        assert json.load(fh)["1"]["verdict"] == "unsure"
+    with open(os.path.join(tile, "answer.meta.json"), encoding="utf-8") as fh:
+        meta = json.load(fh)
+    assert meta["repeats"] == 2
+    assert runner.answers_to_ops([tile], "t") == []  # no drop survived
+
+
+def test_run_all_with_repeats_marks_the_tile_unanswered_if_a_repeat_fails(tmp_path):
+    tile = _hand_tile(tmp_path)
+    backend = _Scripted(KEEP, BackendError("boom"))
+    stats = runner.run_all(backend, [tile], repeats=2, max_retries=0,
+                           max_consecutive_backend_errors=0)
+    assert stats.unanswered == 1
+    assert not os.path.exists(os.path.join(tile, "answer.json"))
+
+
+def test_run_all_with_repeats_degraded_if_any_repeat_is(tmp_path):
+    tile = _hand_tile(tmp_path)
+
+    class OnceDegraded(_Scripted):
+        def __init__(self, *script):
+            super().__init__(*script)
+            self._calls_seen = 0
+
+        def consume_degraded(self, tile_dir):
+            self._calls_seen += 1
+            return self._calls_seen == 1   # only the first of the repeats
+
+    stats = runner.run_all(OnceDegraded(KEEP), [tile], repeats=2)
+    assert stats.answered == 1
+    assert stats.degraded == 1
+    with open(os.path.join(tile, "answer.meta.json"), encoding="utf-8") as fh:
+        assert json.load(fh)["degraded"] is True
+
+
+def test_run_tile_default_repeats_is_backward_compatible(tmp_path):
+    """repeats=1 (the default) must behave exactly as before item 16."""
+    tile = _hand_tile(tmp_path)
+    assert runner.run_tile(_Scripted(DROP), tile)["1"]["verdict"] == "drop"

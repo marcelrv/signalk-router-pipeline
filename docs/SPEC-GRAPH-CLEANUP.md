@@ -674,6 +674,39 @@ a one-line summary (calls, total latency, tokens, fallback tiles, downgraded can
 understanding and JSON output on synthetic input only; how well the model judges real tiles
 (and whether it clears the §6 bar of matching Sonnet's gold set) is unmeasured.
 
+### 6.10 Repeat-agreement before a real `drop` — IMPLEMENTED (item 16)
+
+§6.9's tuning round measured that a single sample from the identical prompt on the identical
+tiles is not stable: resampling flipped 19/130 verdicts (85% self-agreement) and introduced 2
+new hard-gate violations the first run didn't have (see `docs/ROADMAP.md` Step 2, "Pass B
+local-model tuning session"). That means no individual sample can be trusted for an actual
+`drop`, independent of which prompt version or model is in use.
+
+`review_region.py --repeats N` (`runner.run_tile`/`run_all`, default 1 = old behaviour)
+answers each tile `N` times — each repeat gets its own `max_retries` budget — and
+`runner.merge_verdicts` combines the samples: a candidate keeps its verdict only if *every*
+repeat agrees on it; any disagreement, including one that never involves `drop` (e.g. a
+`keep`/`unsure` split), is downgraded to `unsure`, which `answers_to_ops` already treats as
+"leave it". This is agreement, not a majority vote — the goal is refusing to trust a `drop`
+that isn't reproducible, not picking the most popular answer.
+
+If any one of the `N` repeats never becomes valid (backend error or bad JSON surviving
+`max_retries`), the whole tile is `unanswered`, same as a single-repeat failure today — a
+partial set of samples is not enough to call an agreement over. A tile is recorded
+`degraded` in `answer.meta.json` if *any* repeat was; `answer.meta.json` also records
+`repeats` when `> 1`, so a resumed or archived round can be told apart from a single-sample
+one. Cost scales linearly with `N` (each repeat is a full `answer_tile` call), so this is a
+knob to spend more compute for less noise, not a free win — the write-up above found
+temperature 0 fully deterministic but no more accurate, so repeats must use the model's
+normal sampling temperature to have anything to agree or disagree over.
+
+Not yet run against a real batch: like `ClaudeBackend`'s Batches path (§6.5) and the
+gold-set comparison itself, `--repeats` has unit-test coverage
+(`tests/test_graph_cleanup_review.py`, "repeat-agreement (item 16)") and an end-to-end CLI
+smoke test, but no measurement yet of what repeat count restores an acceptable `drop`
+precision on real tiles — that is what the still-open gold-set run (§6.5, §6.9's
+"Conclusion and recommendation") should measure before a real production run trusts it.
+
 ## 7. Known limits / follow-ups
 
 - The skeleton wobble between junctions (§2.3) is untouched and needs Pass B/C or a

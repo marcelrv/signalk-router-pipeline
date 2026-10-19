@@ -88,6 +88,34 @@ def test_mock_backend_end_to_end_writes_ops(tmp_path):
     assert ops_out.exists()
 
 
+def test_repeats_flag_end_to_end_with_a_deterministic_backend(tmp_path):
+    """The mock backend is deterministic, so --repeats must not change its
+    answer (every repeat agrees) -- proves the flag is wired through without
+    needing a backend whose answers actually vary."""
+    db = tmp_path / "g.sqlite"
+    _make_db(db)
+    input_dir = tmp_path / "geo"
+    _make_geojson(input_dir)
+    out_dir = tmp_path / "tiles"
+    ops_out = tmp_path / "ai.ops.jsonl"
+
+    rc = review_region.main(["--db", str(db), "--input-dir", str(input_dir),
+                             "--out-dir", str(out_dir), "--backend", "mock",
+                             "--repeats", "3", "--ops-out", str(ops_out)])
+    assert rc == 0
+    tile_dirs = review_region._find_tile_dirs(str(out_dir))
+    for d in tile_dirs:
+        with open(os.path.join(d, "answer.meta.json"), encoding="utf-8") as fh:
+            assert json.load(fh)["repeats"] == 3
+
+
+def test_repeats_below_one_is_rejected_before_any_work(tmp_path, capsys):
+    with pytest.raises(SystemExit):
+        review_region.main(["--db", "unused.sqlite", "--input-dir", "unused",
+                            "--out-dir", str(tmp_path / "tiles"), "--repeats", "0"])
+    assert "--repeats" in capsys.readouterr().err
+
+
 def test_reusing_out_dir_ignores_a_stale_tile_from_an_earlier_run(tmp_path):
     """A stale tile directory left in --out-dir by an earlier, differently-
     scoped run (a different --bbox or --sample-tiles) must not be answered or
