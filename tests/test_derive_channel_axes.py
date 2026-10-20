@@ -14,6 +14,7 @@ import derive_channel_axes as dca
 from derive_channel_axes import (
     Anchor,
     CATLAM_PORT,
+    CATLAM_PREF_STARBOARD,
     CATLAM_STARBOARD,
     ChannelAxisDeriver,
     Mark,
@@ -23,11 +24,14 @@ from derive_channel_axes import (
     dedupe_marks,
     center_chain,
     default_half_width_m,
+    load_marks,
+    order_marks_spatial,
     parse_mark_name,
     polygon_skeleton,
     shoal_normal,
     split_anchors,
     subtract_coverage,
+    SPATIAL_KEY,
 )
 
 
@@ -323,6 +327,221 @@ class TestEndToEnd:
         axes = gpd.read_file(d / dca.OUTPUT_AXES)
         assert list(axes["axis_kind"]) == ["polygon_centerline"]
         assert os.path.exists(d / dca.OUTPUT_REJECTED)
+
+
+# ----------------------------------------------------------------------------- spatial fallback
+
+def _mark_chain_dir(tmp_path, subdir, names):
+    """8 alternating-hand mark pairs, 400 m apart, water only (no fairway/depare, so
+    tier 2 yields nothing and the chain-level confidence isolates the tier 3 path)."""
+    utm = "EPSG:32631"
+    x0, y0 = 550000.0, 5700000.0
+    water = box(x0, y0, x0 + 6000, y0 + 3000)
+    marks = []
+    for i in range(8):
+        x = x0 + 2500 + i * 400
+        marks.append((names[2 * i], CATLAM_PORT, Point(x, y0 + 1650)))
+        marks.append((names[2 * i + 1], CATLAM_STARBOARD, Point(x, y0 + 1350)))
+    d = tmp_path / subdir
+    d.mkdir()
+    _to_wgs(gpd.GeoDataFrame({"DRVAL1": [2.0]}, geometry=[water], crs=utm)).to_file(
+        d / "coastal_water_polygons.geojson", driver="GeoJSON")
+    _to_wgs(gpd.GeoDataFrame({"OBJNAM": [m[0] for m in marks], "CATLAM": [m[1] for m in marks],
+                              "src_objl": ["BOYLAT"] * len(marks), "src_cscl": [12000] * len(marks)},
+                             geometry=[m[2] for m in marks], crs=utm)).to_file(
+        d / "lateral_marks_points.geojson", driver="GeoJSON")
+    return d
+
+
+# No trailing digits anywhere -- guaranteed to fail both _US_MARK_RE (needs a keyword
+# + number) and _EU_MARK_RE (needs a mandatory trailing number), unlike "O 12" or "Q1".
+_GARBAGE_NAMES = ["Radar Reflector", "Racon Site", "Historic Wreck", "Sunken Barge",
+                  "Old Piling", "Rock Ledge", "Reef Marker", "Shoal Post",
+                  "Ruin Stake", "Ballast Heap", "Ghost Light", "Broken Spar",
+                  "Mud Bank Post", "Weed Bed Stub", "Timber Snag", "Coral Head"]
+_BARE_NAMES = [str(n) for n in range(1, 17)]  # odd=port, even=starboard, per the loop above
+
+
+class TestSpatialChainingFallback:
+    def test_unparseable_names_are_chained_not_dropped(self, tmp_path):
+        d = _mark_chain_dir(tmp_path, "spatial", _GARBAGE_NAMES)
+        ChannelAxisDeriver(str(d), str(d), Params()).run()
+        axes = gpd.read_file(d / dca.OUTPUT_AXES)
+        assert list(axes["axis_kind"]) == ["mark_chain"]
+        assert axes.iloc[0]["n_marks"] == 16
+        stats = json.load(open(d / dca.OUTPUT_STATS))
+        assert stats["marks"]["unparsed_name"] == 16
+        assert stats["marks"]["spatial_fallback"] == 16
+
+    def test_spatial_chain_gets_a_distinct_channel_key(self, tmp_path):
+        d = _mark_chain_dir(tmp_path, "spatial_key", _GARBAGE_NAMES)
+        ChannelAxisDeriver(str(d), str(d), Params()).run()
+        axes = gpd.read_file(d / dca.OUTPUT_AXES)
+        assert axes.iloc[0]["channel_name"] == SPATIAL_KEY
+        assert SPATIAL_KEY != dca.BARE_NUMBER_KEY
+
+    def test_spatial_chain_confidence_lower_than_bare_number_chain(self, tmp_path):
+        spatial_dir = _mark_chain_dir(tmp_path, "spatial_conf", _GARBAGE_NAMES)
+        bare_dir = _mark_chain_dir(tmp_path, "bare_conf", _BARE_NAMES)
+        ChannelAxisDeriver(str(spatial_dir), str(spatial_dir), Params()).run()
+        ChannelAxisDeriver(str(bare_dir), str(bare_dir), Params()).run()
+        spatial_conf = gpd.read_file(spatial_dir / dca.OUTPUT_AXES).iloc[0]["confidence"]
+        bare_conf = gpd.read_file(bare_dir / dca.OUTPUT_AXES).iloc[0]["confidence"]
+        assert spatial_conf < bare_conf
+
+    def test_order_marks_spatial_walks_nearest_neighbour(self):
+        # SPATIAL_KEY marks have no (number, suffix) to sort by; ordering must come
+        # from geometry alone, via nearest-neighbour chaining from a PCA-picked end.
+        pts = [(0, 0), (1200, 5), (400, -5), (800, 0)]
+        marks = [_mark(x, y, CATLAM_PORT, 0, key=SPATIAL_KEY) for x, y in pts]
+        ordered = order_marks_spatial(marks)
+        xs = [m.pt.x for m in ordered]
+        assert xs == sorted(xs)
+
+    def test_safe_water_marks_are_excluded_from_the_spatial_fallback(self):
+        # safe-water marks carry no CATLAM/hand -- they aren't lateral-channel
+        # evidence and must not enter SPATIAL_KEY chaining, only lateral marks
+        # (buoy/beacon) with an unparseable name should.
+        lateral = gpd.GeoDataFrame(
+            {"OBJNAM": ["Radar Reflector"], "CATLAM": [CATLAM_PORT], "src_objl": ["BOYLAT"], "src_cscl": [12000]},
+            geometry=[Point(0, 0)])
+        safe = gpd.GeoDataFrame(
+            {"OBJNAM": ["Historic Wreck"], "src_objl": ["BOYSAW"], "src_cscl": [12000]},
+            geometry=[Point(10, 10)])
+        marks, unparsed, unnamed = load_marks(lateral, safe)
+        assert unparsed == 2  # both names failed parsing and are counted
+        assert unnamed == 0
+        assert [m.name for m in marks] == ["Radar Reflector"]  # only the lateral one is chainable
+        assert marks[0].key == SPATIAL_KEY
+
+    def test_marks_without_a_usable_catlam_are_excluded_from_the_spatial_fallback(self):
+        # a lateral-kind mark with a missing or junction-only CATLAM (not plain
+        # port/starboard) carries no hand evidence -- same rationale as excluding
+        # safe-water marks -- and must not be retained under SPATIAL_KEY either.
+        lateral = gpd.GeoDataFrame(
+            {"OBJNAM": ["Radar Reflector", "Racon Site", "Historic Wreck"],
+             "CATLAM": [None, CATLAM_PREF_STARBOARD, CATLAM_PORT],
+             "src_objl": ["BOYLAT"] * 3, "src_cscl": [12000] * 3},
+            geometry=[Point(0, 0), Point(1, 1), Point(2, 2)])
+        safe = gpd.GeoDataFrame(geometry=[])
+        marks, unparsed, unnamed = load_marks(lateral, safe)
+        assert unparsed == 3  # all three names failed parsing and are counted
+        assert [m.name for m in marks] == ["Historic Wreck"]  # only the port/starboard one chains
+
+    def test_dedupe_keeps_distinct_named_spatial_marks_close_together(self):
+        # all SPATIAL_KEY marks share the placeholder (SPATIAL_KEY, 0, "") identity;
+        # dedupe must not collapse two different, unrelated aids just because
+        # they happen to sit within tol_m of each other (e.g. opposite banks of
+        # a narrow channel) -- only genuine same-name duplicates should merge.
+        a = Mark("Rock Ledge", SPATIAL_KEY, 0, "", CATLAM_PORT, "buoy", 12000, Point(0, 0))
+        b = Mark("Reef Marker", SPATIAL_KEY, 0, "", CATLAM_STARBOARD, "buoy", 12000, Point(30, 0))
+        out = dedupe_marks([a, b], tol_m=60.0)
+        assert len(out) == 2
+
+    def test_dedupe_keeps_opposite_hand_marks_distinct_even_with_the_same_name(self):
+        # the generic descriptive names this fallback exists for can recur on
+        # both banks of the same channel; a shared name alone must not collapse
+        # two marks of opposite hand into one.
+        a = Mark("Radar Reflector", SPATIAL_KEY, 0, "", CATLAM_PORT, "buoy", 12000, Point(0, 0))
+        b = Mark("Radar Reflector", SPATIAL_KEY, 0, "", CATLAM_STARBOARD, "buoy", 12000, Point(30, 0))
+        out = dedupe_marks([a, b], tol_m=60.0)
+        assert len(out) == 2
+
+    def test_dedupe_still_merges_same_named_spatial_marks(self):
+        # the same real aid charted twice (overlapping cell coverage) shares a name
+        # and must still collapse to one, same as the parsed-name path does.
+        a = Mark("Rock Ledge", SPATIAL_KEY, 0, "", CATLAM_PORT, "buoy", 40000, Point(0, 0))
+        b = Mark("Rock Ledge", SPATIAL_KEY, 0, "", CATLAM_PORT, "buoy", 12000, Point(5, 5))
+        out = dedupe_marks([a, b], tol_m=60.0)
+        assert out == [b]  # smaller src_cscl (larger-scale cell) wins
+
+    def test_reliable_direction_false_skips_the_same_hand_offset(self):
+        # a walk order with no relation to true buoyage direction must not guess
+        # a side: same-hand pairs stay at the raw midpoint instead of being offset.
+        seq = [_mark(i * 300, 100, CATLAM_PORT, 2 * i + 1) for i in range(4)]
+        anchors = center_chain(seq, default_half_width_m(seq), reliable_direction=False)
+        assert all(a.pt.y == pytest.approx(100.0) for a in anchors)
+
+    def test_reliable_direction_false_skips_the_shoal_wall(self):
+        # mirrors TestCorridor.test_wrong_side_water_is_walled_off: that test's
+        # water sits only on the "wrong" (shoal) side of a reliable chain, and the
+        # wall there cuts it off entirely, leaving no valid corridor. With an
+        # unreliable direction, no wall is cut, so a route through that same
+        # water becomes possible again.
+        water = box(-200, 100, 3000, 400)
+        anchors = _straight_chain()
+        reliable, _, _ = build_corridor(anchors, water, _r_fn, wall_buffer_m=30.0)
+        unreliable, naive, radii = build_corridor(anchors, water, _r_fn, wall_buffer_m=30.0,
+                                                   reliable_direction=False)
+        assert unreliable is not None
+        if reliable is not None:
+            assert unreliable.area > reliable.area
+        line, reason = corridor_centerline(unreliable, anchors, naive, radii, hug=1.0)
+        assert reason is None and line is not None
+
+    def test_all_same_hand_spatial_chain_is_rejected_not_emitted_off_centre(self, tmp_path):
+        # no opposite-hand pair anywhere in this cluster -> reliable_direction=False
+        # leaves every anchor on the raw (port-only) mark line itself, which is a
+        # channel edge, not a centre; must be rejected, not emitted as an axis.
+        utm = "EPSG:32631"
+        x0, y0 = 550000.0, 5700000.0
+        water = box(x0, y0, x0 + 6000, y0 + 300)
+        pts = [Point(x0 + 2500 + i * 400, y0 + 150) for i in range(4)]
+        d = tmp_path / "spatial_no_gates"
+        d.mkdir()
+        _to_wgs(gpd.GeoDataFrame({"DRVAL1": [2.0]}, geometry=[water], crs=utm)).to_file(
+            d / "coastal_water_polygons.geojson", driver="GeoJSON")
+        _to_wgs(gpd.GeoDataFrame({"OBJNAM": _GARBAGE_NAMES[:4], "CATLAM": [CATLAM_PORT] * 4,
+                                  "src_objl": ["BOYLAT"] * 4, "src_cscl": [12000] * 4},
+                                 geometry=pts, crs=utm)).to_file(
+            d / "lateral_marks_points.geojson", driver="GeoJSON")
+        ChannelAxisDeriver(str(d), str(d), Params()).run()
+        axes = gpd.read_file(d / dca.OUTPUT_AXES)
+        assert len(axes) == 0
+        stats = json.load(open(d / dca.OUTPUT_STATS))
+        assert stats["tier3"]["reasons"].get("no_centre_evidence") == 1
+        assert stats["tier3"]["rejected"] == 1  # n_rej must count this rejection too
+
+    def test_single_gate_at_one_end_is_not_enough_centre_evidence(self, tmp_path):
+        # a walk that follows one bank for most of its length and only crosses to
+        # the other bank once, at the far end, has exactly one gate -- not zero --
+        # but the rest of the chain would still be edge-hugging same-hand anchors.
+        # A single gate must not be enough; gates need to be the majority.
+        utm = "EPSG:32631"
+        x0, y0 = 550000.0, 5700000.0
+        water = box(x0, y0, x0 + 6000, y0 + 300)
+        # 6 port marks along one bank, then 1 starboard mark at the far end: the
+        # nearest-neighbour walk follows the port bank in order and only gates once,
+        # at the final port->starboard step.
+        pts = [(Point(x0 + 2500 + i * 400, y0 + 150), CATLAM_PORT) for i in range(6)]
+        pts.append((Point(x0 + 2500 + 6 * 400, y0 + 200), CATLAM_STARBOARD))
+        d = tmp_path / "spatial_one_gate"
+        d.mkdir()
+        _to_wgs(gpd.GeoDataFrame({"DRVAL1": [2.0]}, geometry=[water], crs=utm)).to_file(
+            d / "coastal_water_polygons.geojson", driver="GeoJSON")
+        _to_wgs(gpd.GeoDataFrame({"OBJNAM": _GARBAGE_NAMES[:7], "CATLAM": [c for _, c in pts],
+                                  "src_objl": ["BOYLAT"] * 7, "src_cscl": [12000] * 7},
+                                 geometry=[p for p, _ in pts], crs=utm)).to_file(
+            d / "lateral_marks_points.geojson", driver="GeoJSON")
+        ChannelAxisDeriver(str(d), str(d), Params()).run()
+        axes = gpd.read_file(d / dca.OUTPUT_AXES)
+        assert len(axes) == 0
+        stats = json.load(open(d / dca.OUTPUT_STATS))
+        assert stats["tier3"]["reasons"].get("no_centre_evidence") == 1
+
+    def test_parsed_and_bare_number_paths_unaffected(self, synthetic_dir):
+        # regression: the existing named-channel path in the shared fixture (which
+        # also contains no unparseable names) is untouched by the new SPATIAL_KEY branch
+        out = synthetic_dir / "out_regress"
+        ChannelAxisDeriver(str(synthetic_dir), str(out), Params()).run()
+        axes = gpd.read_file(out / dca.OUTPUT_AXES)
+        chain_axes = axes[axes["axis_kind"] == "mark_chain"]
+        assert len(chain_axes) == 1
+        assert chain_axes.iloc[0]["channel_name"] == "Test Channel"
+        assert chain_axes.iloc[0]["confidence"] >= 0.8
+        stats = json.load(open(out / dca.OUTPUT_STATS))
+        assert stats["marks"]["unparsed_name"] == 0
+        assert stats["marks"]["spatial_fallback"] == 0
 
 
 class TestCli:
