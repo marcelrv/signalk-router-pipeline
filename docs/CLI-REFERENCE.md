@@ -704,8 +704,8 @@ options:
   --effort EFFORT       claude backend: low/medium/high/xhigh/max
   --local-url LOCAL_URL
                         local backend: base URL incl. /v1 (default: $LOCAL_LLM_URL, else
-                        http://localhost:8000/v1); $LOCAL_LLM_MODEL and $LOCAL_LLM_API_KEY
-                        are honoured too
+                        http://localhost:8000/v1); $LOCAL_LLM_MODEL and $LOCAL_LLM_API_KEY are
+                        honoured too
   --temperature TEMPERATURE
                         local backend sampling temperature (default 0.2)
   --max-tokens MAX_TOKENS

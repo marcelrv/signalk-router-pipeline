@@ -116,7 +116,7 @@ def test_json_schema_and_thinking_flags(tmp_path):
 
 
 def test_api_key_over_cleartext_http_warns(capsys):
-    LocalOpenAIBackend(base_url="http://localhost:8000/v1", api_key="sekret",
+    LocalOpenAIBackend(base_url="http://192.0.2.10:8000/v1", api_key="sekret",
                        transport=FakeTransport({}))
     assert "cleartext" in capsys.readouterr().err
 
