@@ -21,6 +21,7 @@ TOOLS = [
     ("add_pois_to_db.py", "Add points of interest to an existing routing DB."),
     ("review_region.py", "Graph cleanup: render tiles, have a reviewer (mock/claude/local) answer them, write ops."),
     ("apply_cleanup.py", "Apply (or replay) cleanup ops to a routing DB."),
+    ("scripts/run_gates.py", "Run the validation gates comparing a candidate build against the live baseline."),
     ("scripts/review_hazard_text.py", "Review chart text that implies time limits (list/propose/accept/reject)."),
     ("deploy_to_data_repo.py", "Publish a finished DB to the signalk-router-data repo."),
 ]

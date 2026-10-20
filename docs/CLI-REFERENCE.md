@@ -791,6 +791,28 @@ options:
   --force               save even if a gate fails (say why in the BUILD_LOG entry)
 ```
 
+## scripts/run_gates.py
+
+Run the validation gates comparing a candidate build against the live baseline.
+
+```text
+usage: run_gates.py [-h] --baseline BASELINE --candidate CANDIDATE
+                    [--max-edge-growth MAX_EDGE_GROWTH]
+
+Run graph_cleanup.validate's gates comparing a candidate build against the currently-live baseline
+it is meant to replace. Usage: .venv/bin/python3 scripts/run_gates.py --baseline OLD.sqlite
+--candidate NEW.sqlite [--max-edge-growth N] Exits 0 if every gate passes, 1 otherwise. Prints the
+GateReport either way.
+
+options:
+  -h, --help            show this help message and exit
+  --baseline BASELINE   Currently-live .sqlite to compare against
+  --candidate CANDIDATE
+                        Newly-built .sqlite being evaluated
+  --max-edge-growth MAX_EDGE_GROWTH
+                        Edges the candidate may add over baseline (default 0 = shrink-only)
+```
+
 ## scripts/review_hazard_text.py
 
 Review chart text that implies time limits (list/propose/accept/reject).
